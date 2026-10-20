@@ -31,5 +31,15 @@
 
 - 原生总量约 474 GiB，超过显存加内存的 383 GiB，所以 Engram 表放 NVMe。
 - **方案 A（推荐）**：专家量化到 3.0 bpw EXL3，用 vLLM TP2，预计 55–75 tok/s。公开配方需要约 250 GiB 空闲内存，要么改成从 NVMe 读 Engram，要么加内存。
-- **方案 B**：原生 MXFP4，用 mx-llama.cpp；第 0–21 层的专家放 GPU，第 22–39 层放 CPU，预计 12–45 tok/s；按本机双通道 3600 MT/s 估算只有约 12–15 tok/s（不开投机解码），待实测。
+- **方案 B**：原生 MXFP4，用 mx-llama.cpp；第 0–21 层的专家放 GPU，第 22–39 层放 CPU。2026-10-20 本机实测：解码 16.5 tok/s，预填充 307 tok/s（2048 token，ubatch 2048）。
+
+## 方案 B 运行要点（blackwell）
+
+- 模型在 `~/models/DeepSeek-V4.1-Flash-GGUF`（mxxm-t 的 MXFP4 GGUF，383 GiB），mx-llama.cpp 在 `~/src/mx-llama.cpp`（分支 `abyss-expert-stats`，基于 `c4d12e2`）
+- 必须设 `GGML_CUDA_Q8_1_CACHE=0`：分支的 q8_1 激活缓存按 FIFO 淘汰，和 CUDA VMM 内存池的 LIFO 释放冲突，会触发 `ggml_cuda_pool_vmm::free` 断言
+- 层切分用 `-ts 12/29`；`12/28` 会把 13 层分给 GPU0，放不下计算缓冲区
+- 参数：`-ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU"`
+- 这个分支对提示词也跑完 40 层（没有实现 CED 的只走编码器），所以预填充同样要经过 CPU 专家；Engram 随机读约占预填充时间的 37%
+- DSpark 投机解码在 V4.1 上还不支持
+- 专家热度统计：补丁在 `mx-llama.cpp/`，分析脚本是 `tools/expert_hotness.py`
 - Strata（https://github.com/Niko1221/Strata）只作设计参考，不直接依赖。
