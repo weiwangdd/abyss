@@ -6,6 +6,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -122,6 +124,27 @@ bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
+// a restart keeps adding to the counts already on disk instead of overwriting them
+void load_existing(expert_stats & s) {
+    FILE * f = fopen(s.path.c_str(), "r");
+    if (!f) {
+        return;
+    }
+    nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+    fclose(f);
+    if (j.is_discarded() || j.value("version", 0) != 1) {
+        LOG_WRN("abyss: %s is not a version 1 stats file, starting from zero\n", s.path.c_str());
+        return;
+    }
+    const char * names[2] = { "prefill", "decode" };
+    for (int ph = 0; ph < 2; ph++) {
+        s.phases[ph].tokens = j[names[ph]]["tokens"].get<std::vector<uint64_t>>();
+        s.phases[ph].hits   = j[names[ph]]["hits"].get<std::vector<std::vector<uint64_t>>>();
+        s.phases[ph].hits.resize(s.phases[ph].tokens.size());
+    }
+    LOG_INF("abyss: continuing from %s\n", s.path.c_str());
+}
+
 void flush_at_exit() {
     if (g_stats) {
         std::lock_guard<std::mutex> lock(g_stats->mu);
@@ -146,6 +169,7 @@ void abyss_expert_stats_install(common_params & params) {
     if (const char * sec = getenv("ABYSS_EXPERT_STATS_FLUSH_SEC")) {
         g_stats->flush_sec = std::max(1, atoi(sec));
     }
+    load_existing(*g_stats);
 
     params.cb_eval           = eval_cb;
     params.cb_eval_user_data = g_stats;
