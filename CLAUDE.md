@@ -37,9 +37,14 @@
 
 - 模型在 `~/models/DeepSeek-V4.1-Flash-GGUF`（mxxm-t 的 MXFP4 GGUF，383 GiB），mx-llama.cpp 在 `~/src/mx-llama.cpp`（分支 `abyss-expert-stats`，基于 `c4d12e2`）
 - 必须设 `GGML_CUDA_Q8_1_CACHE=0`：分支的 q8_1 激活缓存按 FIFO 淘汰，和 CUDA VMM 内存池的 LIFO 释放冲突，会触发 `ggml_cuda_pool_vmm::free` 断言
+- 必须设 `GGML_CUDA_MMQ_PREC=q8`：Blackwell 上 MXFP4 的 MMQ 默认用 W4A4（激活量化到 4 bit），只影响超过 8 个 token 的批次，也就是预填充。官方参考实现是 W4A8（`inference/model.py` 的 `linear`）。2026-10-21 对拍：W4A4 预填充对解码路径 KLD 0.044、top-1 91%；改 q8 后 KLD 0.012、top-1 95%，和数值底线相当；预填充只慢约 5%
+- 对拍的数值底线约 KLD 0.01（中位数约 0.005）：任何改变舍入顺序的改动（换内核、关融合、换 ubatch）都会到这个量级，同一配置重跑是 0。判断是否有问题要看是否明显超过这个底线
 - 层切分用 `-ts 12/29`；`12/28` 会把 13 层分给 GPU0，放不下计算缓冲区
 - 参数：`-ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU"`
 - 这个分支对提示词也跑完 40 层（没有实现 CED 的只走编码器），所以预填充同样要经过 CPU 专家；Engram 随机读约占预填充时间的 37%
 - DSpark 投机解码在 V4.1 上还不支持
+- 工具调用：V4.1 的 DSML 标签名带前导空格（`<｜DSML｜ calls>`、` invoke`、` parameter`，见官方 `encoding/encoding.py`），GGUF 内嵌的是 V4 模板。要用 `mx-llama.cpp/0002` 补丁加 `--chat-template-file mx-llama.cpp/deepseek-v4.1.jinja`
+- server 用 `~/abyss-stats/restart.sh` 重启（仓库副本是 `tools/restart-server.sh`；编译产物在 `build-v41`，会先备份统计文件）；不要用 `pkill -f llama-server`，它会匹配到 ssh 命令自身
 - 专家热度统计：补丁在 `mx-llama.cpp/`，分析脚本是 `tools/expert_hotness.py`
+- 对拍和测速：`tools/eval/`（`kl.sh` 存基准 logits 并比 KLD，`bench.sh` 测速），复制到 blackwell 的 `~/abyss-tools/eval` 运行，结果在 `~/abyss-eval`；运行前要先停 server
 - Strata（https://github.com/Niko1221/Strata）只作设计参考，不直接依赖。
