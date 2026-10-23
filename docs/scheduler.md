@@ -185,6 +185,14 @@ mx-llama.cpp 已有实验性的 `--moe-cache-mib`（`src/llama-moe-cache.{h,cpp}
 - 做法：按参考代码补上第 20 层的 Full 模式（建索引键和候选块）、第 24/28/32/36 层的 Reindex 模式，以及其余层的 Reuse 模式。
 - 验证：没有现成的参考 logits。可以先在 CPU 上用官方 PyTorch 代码只跑注意力部分，取几层做对拍。
 
+### 实际实现（2026-10-24，`mx-llama.cpp/0006`）
+
+- 索引键：KV 源层（2、8、14、20）从压缩器 RoPE 之前的 latent 算 `k_norm(wk(latent))`，在组的位置上做 RoPE，再做 FP4 量化再反量化（每 32 个一块，缩放 `2^ceil(log2(amax/6))`，和官方 `kernel.py` 的 `fp4_act_quant` 一样）。压缩比 2 的层写进已有的索引键 cache，第 20 层写进新增的 `kv_lidp`，两者的 cell 都和对应压缩档一一对应。
+- 打分：索引源层（2、8、14、20、24、28、32、36）用 `wq_b(qr)` 加 RoPE 和 FP4 得到查询，`weights_proj(x)/sqrt(128·32)` 得到每头权重，复用 fork 已有的 `ggml_lightning_indexer` 算 `Σ_h relu(q_h·k)·w_h`，再 `ggml_top_k` 选 512。第 20 层先按每 8 个位置取块最大值、把每个查询最新的块钉住、保留 2,048 块，第 24–36 层只在这些块里选；块数不超过 2,048 时这一步省掉。
+- 注意力：非索引源层沿用最近索引源的 top-k；top-k 用 fork 已有的 `build_top_k_mask` 变成掩码，传 `n_kv_max` 走收集版 FA。CED 子集之间用 host 端的行映射衔接。
+- FP4 用现有算子拼出来；`ggml_round` 在恰好处于中点时向远离零的方向舍入，硬件是向偶数舍入，只在精确中点上不同。
+- 还没做的：和官方 PyTorch 代码的单层对拍；目前的证据是 512 token 以内和稠密版完全一致，以及长上下文 PPL 比稠密版低。
+
 ## 7. 实施顺序
 
 | 阶段 | 内容 | 验收标准 |
@@ -195,7 +203,7 @@ mx-llama.cpp 已有实验性的 `--moe-cache-mib`（`src/llama-moe-cache.{h,cpp}
 | M3 | 组件 A：动态更新槽位 + 预填充后预热 | 解码 ≥ 25 tok/s，换任务时不明显退化 |
 | M4 | 组件 C：步骤 1（提前整批 `MADV_WILLNEED`）已完成，已在 server 上启用；步骤 2–5 暂缓 | 4.8 万 token、Engram 冷：91.1 → 54.3 s，冷读开销约 39 → 2 s；结果不变 |
 | M5 | 组件 B：精确版 CED 预填充；FFN 和注意力两步都已完成，已在 server 上启用 | 对 CED 关的 KLD 0.00004–0.00007；4.8 万 token 热缓存预填充 135 s → 41.8 s（只跳 FFN）→ 27.9 s（再跳注意力） |
-| M6 | 组件 D：稀疏索引器 | 长上下文对拍通过 |
+| M6 | 组件 D：稀疏索引器；已完成，已在 server 上启用 | 512 token 以内和稠密版 KLD 为 0；8k/16k/32k 时 PPL 比稠密版低 0.9%/3.1%/0.23%；4.8 万 token 预填充 27.9 → 22.7 s |
 
 组件 D 关系到结果正确性。如果用户一直跑长上下文的智能体，可以把它提到 M2 之前。
 

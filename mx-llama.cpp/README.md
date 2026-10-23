@@ -10,6 +10,7 @@
 | `0003-ced-prefill.patch` | CED 感知预填充：解码器层只对后面的 token 还能通过滑动窗口看到的那些 token 算 FFN（`ABYSS_CED_PREFILL=1`） |
 | `0004-engram-prefetch.patch` | Engram 预取：`llama_decode` 拿到整批后，后台线程按哈希算出的行号对表做 `MADV_WILLNEED`（`ABYSS_ENGRAM_PREFETCH=<线程数>`） |
 | `0005-ced-attention.patch` | CED 感知预填充第二步：解码器层的注意力也只对同一子集的 token 计算查询，KV 照常全部写入 |
+| `0006-dsv41-indexer.patch` | V4.1 稀疏注意力索引器：每个查询只看索引源选出的 512 个压缩位置（`ABYSS_DSV41_INDEXER=1`） |
 
 ## 安装
 
@@ -18,7 +19,7 @@ cd mx-llama.cpp
 cp <abyss>/mx-llama.cpp/abyss-expert-stats.{h,cpp} tools/server/
 git apply <abyss>/mx-llama.cpp/0001-hook-expert-stats.patch <abyss>/mx-llama.cpp/0002-deepseek-v41-dsml-tags.patch \
   <abyss>/mx-llama.cpp/0003-ced-prefill.patch <abyss>/mx-llama.cpp/0004-engram-prefetch.patch \
-  <abyss>/mx-llama.cpp/0005-ced-attention.patch
+  <abyss>/mx-llama.cpp/0005-ced-attention.patch <abyss>/mx-llama.cpp/0006-dsv41-indexer.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 ```
@@ -38,4 +39,5 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 - `ABYSS_EXPERT_STATS_FLUSH_SEC` 控制写文件间隔，默认 30 秒；只在有请求时写，进程正常退出时也会写一次。
 - 回调会让调度器在每层的路由结果处同步一次，速度会略降。测速时不要开。
 - `ABYSS_CED_PREFILL=1` 打开 CED 感知预填充，只对 DeepSeek V4.1 生效。每次 `llama_decode` 调用按自己的末尾规划，所以 server 要设大 `-b`（比如 65536），让整段提示词进一次调用才省得多。`ABYSS_CED_MARGIN`（默认 256）是末尾额外保持有效的位置数。`0003` 跳过 FFN，`0005` 再跳过注意力的查询，KV 的写入始终不变。
+- `ABYSS_DSV41_INDEXER=1` 打开 V4.1 的稀疏注意力索引器：KV 源层写索引键（第 2、8、14 层用已有的索引键 cache，第 20 层用新增的 `kv_lidp`），索引源层打分选 top-512，第 20 层为后面的压缩比 1 索引源挑 2,048 个候选块，其余层沿用最近索引源的 top-k。DSV4 状态格式版本因此升到 2
 - `ABYSS_ENGRAM_PREFETCH=8` 打开 Engram 预取，只对 DeepSeek V4.1、单序列、64 个 token 以上的批次生效。只做预读，不改计算结果；新批次到来时会叫停上一批还没做完的预取。

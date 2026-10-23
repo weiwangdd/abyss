@@ -1,0 +1,755 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b4cfb42..2bf4fe5 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -329,6 +329,32 @@ void llm_graph_input_ced::set_input(const llama_ubatch * ubatch) {
+         }
+         GGML_ASSERT(n == n_sub[il]);
+     }
++
++    // both subsets keep token order and il's sits inside src's, so the rank inside src's counts up as il's go by
++    for (const auto & [key, map] : maps) {
++        const auto [il, src] = key;
++        GGML_ASSERT(ggml_backend_buffer_is_host(map->buffer));
++        int32_t * data = (int32_t *) map->data;
++
++        int32_t n = 0;
++        int32_t rank = 0;
++        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++            const int32_t last = (*last_layer)[batch_idxs[i]];
++            if (last >= src) {
++                if (last >= il) {
++                    data[n++] = rank;
++                }
++                rank++;
++            }
++        }
++        GGML_ASSERT(n == n_sub[il]);
++    }
++}
++
++ggml_tensor * llm_graph_input_ced::get_map(int32_t il, int32_t src) const {
++    const auto it = maps.find({ il, src });
++    // a source that keeps every token needs no map: the subset's own rows are the ubatch rows
++    return it != maps.end() ? it->second : idx[il];
+ }
+ 
+ bool llm_graph_input_ced::can_reuse(const llm_graph_params & params) {
+@@ -2872,7 +2898,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+     return cur;
+ }
+ 
+-llm_graph_input_ced * llm_graph_context::build_inp_ced() const {
++llm_graph_input_ced * llm_graph_context::build_inp_ced(const std::vector<std::pair<int32_t, int32_t>> & map_pairs) const {
+     auto inp = std::make_unique<llm_graph_input_ced>(ced_last_layer, ced_n_sub);
+ 
+     // only the layers that drop tokens get an index list, a layer with none left runs no FFN at all
+@@ -2886,6 +2912,15 @@ llm_graph_input_ced * llm_graph_context::build_inp_ced() const {
+         }
+     }
+ 
++    for (const auto & [il, src] : map_pairs) {
++        if (inp->idx[il] && inp->idx[src]) {
++            ggml_tensor * cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ced_n_sub[il]);
++            ggml_set_input(cur);
++            ggml_format_name(cur, "ced_map-%d-%d", il, src);
++            inp->maps[{ il, src }] = cur;
++        }
++    }
++
+     return (llm_graph_input_ced *) res->add_input(std::move(inp));
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4fc87aa..8d561d5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -263,6 +263,10 @@ public:
+ 
+     std::vector<ggml_tensor *> idx; // I32 [n_sub[il]] per layer, nullptr where the layer runs every token
+ 
++    // rows of layer il's subset within layer src's, for a layer reading another layer's per-row results
++    std::map<std::pair<int32_t, int32_t>, ggml_tensor *> maps;
++    ggml_tensor * get_map(int32_t il, int32_t src) const;
++
+     const std::vector<int8_t> * last_layer; // per batch token, the last layer whose FFN it needs
+     const std::vector<int32_t>  n_sub;      // per layer, tokens of the ubatch whose FFN runs
+ };
+@@ -1266,7 +1270,7 @@ struct llm_graph_context {
+     ggml_tensor * build_inp_pos() const;
+     ggml_tensor * build_inp_attn_scale() const;
+     ggml_tensor * build_inp_out_ids() const;
+-    llm_graph_input_ced * build_inp_ced() const;
++    llm_graph_input_ced * build_inp_ced(const std::vector<std::pair<int32_t, int32_t>> & map_pairs = {}) const;
+     ggml_tensor * build_inp_mean() const;
+     ggml_tensor * build_inp_cls() const;
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index e2ba0e7..c965a34 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -366,6 +366,19 @@ struct llama_hparams {
+         return false;
+     }
+ 
++    // abyss: the index source whose top-k this layer attends with: the nearest one at or before il in the same
++    // compressed tier, or -1
++    int dsv41_index_source_for(uint32_t il) const {
++        int best = -1;
++        for (uint32_t i = 0; i < dsv41_n_index_source; ++i) {
++            const int s = (int) dsv41_index_source_layers[i];
++            if (s <= (int) il && s > best && dsv4_compress_ratios[s] == dsv4_compress_ratios[il]) {
++                best = s;
++            }
++        }
++        return best;
++    }
++
+     uint32_t engram_n_layers           = 0;
+     std::array<uint32_t, LLAMA_MAX_ENGRAM_LAYERS> engram_layer_ids      = {};
+     std::array<uint64_t, LLAMA_MAX_ENGRAM_LAYERS> engram_num_embeddings = {};
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index d9332cb..3ece07c 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -19,7 +19,7 @@ static constexpr uint32_t DSV4_CSA_RATIO = 4;
+ static constexpr uint32_t DSV4_HCA_RATIO = 128;
+ 
+ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
+-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
++static constexpr uint32_t DSV4_STATE_VERSION       = 2; // abyss: 2 adds the V4.1 ratio 1 index keys
+ static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
+ static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
+ static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
+@@ -1421,6 +1421,18 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
+             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_idx), 256u), n_seq_max, n_pad,
+             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+ 
++    // abyss: V4.1's ratio 1 tier has index keys too, owned by its kv source and read by every ratio 1 index source;
++    // one row per compressed position like kv_hca, so its cells line up with kv_hca's
++    if (model.hparams.dsv41_n_index_source > 0) {
++        LLAMA_LOG_INFO("%s: creating DSV4.1 ratio %u index-key cache, size = %u cells\n",
++                __func__, model.hparams.dsv4_ratio_plain, dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_plain));
++
++        kv_lidp = std::make_unique<llama_kv_cache>(
++                model, hparams_lid, type_k, type_v,
++                v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, model.hparams.dsv4_ratio_plain), 256u), n_seq_max, n_pad,
++                0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
++    }
++
+     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
+ 
+     const bool v41_tiers = model.hparams.dsv41_n_kv_source > 0;
+@@ -1590,6 +1602,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+             res = res & kv_csa->seq_rm(seq_id, p0/csa_state->get_ratio(), -1);
+             res = res & kv_hca->seq_rm(seq_id, p0/hca_state->get_ratio(), -1);
+             res = res & kv_lid->seq_rm(seq_id, p0/lid_state->get_ratio(), -1);
++            if (kv_lidp) {
++                res = res & kv_lidp->seq_rm(seq_id, p0/hca_state->get_ratio(), -1);
++            }
+ 
+             return res;
+         }
+@@ -1632,6 +1647,9 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
+     kv_csa->seq_cp(seq_id_src, seq_id_dst, -1, -1);
+     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
+     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
++    if (kv_lidp) {
++        kv_lidp->seq_cp(seq_id_src, seq_id_dst, -1, -1);
++    }
+ 
+     csa_state->seq_cp(seq_id_src, seq_id_dst);
+     hca_state->seq_cp(seq_id_src, seq_id_dst);
+@@ -1695,6 +1713,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
+     for (const auto & buft_size : kv_lid->memory_breakdown()) {
+         mb[buft_size.first] += buft_size.second;
+     }
++    if (kv_lidp) {
++        for (const auto & buft_size : kv_lidp->memory_breakdown()) {
++            mb[buft_size.first] += buft_size.second;
++        }
++    }
+     for (const auto & buft_size : csa_state->memory_breakdown()) {
+         mb[buft_size.first] += buft_size.second;
+     }
+@@ -1734,6 +1757,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
+         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
+         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
+         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
++        if (kv_lidp) {
++            const uint32_t n_rows_lidp = seq_id >= 0 ?
++                dsv4_state_n_used_k_rows(pos_max, hca_state->get_ratio(), kv_lidp->get_size()) : kv_lidp->get_size();
++            dsv4_state_write_k_cache(io, kv_lidp.get(), seq_id, flags, n_rows_lidp);
++        }
+     }
+ 
+     csa_state->state_write(io, seq_id, flags, rs_idx);
+@@ -1774,6 +1802,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id,
+         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
+         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
++        if (kv_lidp) {
++            dsv4_state_read_k_cache(io, kv_lidp.get(), seq_id, flags);
++        }
+     }
+ 
+     csa_state->state_read(io, seq_id, flags);
+@@ -1804,6 +1835,10 @@ llama_kv_cache * llama_kv_cache_dsv4::get_lid() const {
+     return kv_lid.get();
+ }
+ 
++llama_kv_cache * llama_kv_cache_dsv4::get_lidp() const {
++    return kv_lidp.get();
++}
++
+ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_csa_state() const {
+     return csa_state.get();
+ }
+@@ -1846,6 +1881,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+         kv_csa->clear(data);
+         kv_hca->clear(data);
+         kv_lid->clear(data);
++        if (kv_lidp) {
++            kv_lidp->clear(data);
++        }
+     } else {
+         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+ 
+@@ -1866,6 +1904,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
+         clear_seq(kv_csa.get());
+         clear_seq(kv_hca.get());
+         clear_seq(kv_lid.get());
++        if (kv_lidp) {
++            clear_seq(kv_lidp.get());
++        }
+     }
+ 
+     csa_state->clear(seq_id, data);
+@@ -2150,6 +2191,10 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+     status(llama_memory_status_combine(
+                 llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
+                 llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status()))) {
++    if (kv->get_lidp()) {
++        ctx_lidp_mem = kv->get_lidp()->init_full();
++        ctx_lidp     = std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lidp());
++    }
+ }
+ 
+ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+@@ -2175,6 +2220,9 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+                     llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status())),
+                 this->sc_info_csa.empty() && this->sc_info_hca.empty() && this->sc_info_lid.empty() ?
+                     LLAMA_MEMORY_STATUS_NO_UPDATE : LLAMA_MEMORY_STATUS_SUCCESS)) {
++    if (kv->get_lidp()) {
++        ctx_lidp_mem = kv->get_lidp()->init_update(lctx, optimize);
++    }
+ }
+ 
+ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+@@ -2224,6 +2272,12 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+     lid_state(kv->get_lid_state()),
+     status(ctx_raw->get_status()) {
+     kv->reset_rs_idx_for_ubatches(this->ubatches);
++    if (kv->get_lidp()) {
++        ctx_lidp = std::make_unique<llama_kv_cache_dsv4_comp_context>(
++                kv->get_lidp(),
++                dsv4_build_comp_sinfos(this->ubatches, kv->get_lidp()->get_n_stream()),
++                this->ubatches);
++    }
+ }
+ 
+ llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
+@@ -2235,6 +2289,9 @@ bool llama_kv_cache_dsv4_context::next() {
+     ctx_csa->next();
+     ctx_hca->next();
+     ctx_lid->next();
++    if (ctx_lidp) {
++        ctx_lidp->next();
++    }
+ 
+     if (++i_next >= ubatches.size()) {
+         return false;
+@@ -2254,6 +2311,9 @@ bool llama_kv_cache_dsv4_context::apply() {
+         res = res & ctx_csa_mem->apply();
+         res = res & ctx_hca_mem->apply();
+         res = res & ctx_lid_mem->apply();
++        if (ctx_lidp_mem) {
++            res = res & ctx_lidp_mem->apply();
++        }
+     }
+ 
+     if (ubatches.empty()) {
+@@ -2299,6 +2359,12 @@ const llama_kv_cache_dsv4_comp_context * llama_kv_cache_dsv4_context::get_lid()
+     return ctx_lid.get();
+ }
+ 
++const llama_kv_cache_dsv4_comp_context * llama_kv_cache_dsv4_context::get_lidp() const {
++    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
++
++    return ctx_lidp.get();
++}
++
+ const llama_dsv4_comp_state * llama_kv_cache_dsv4_context::get_csa_state() const {
+     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+ 
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index 510b573..4f7d119 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -144,6 +144,7 @@ public:
+     llama_kv_cache      * get_csa() const;
+     llama_kv_cache      * get_hca() const;
+     llama_kv_cache      * get_lid() const;
++    llama_kv_cache      * get_lidp() const; // abyss: V4.1 index keys of the ratio 1 tier, nullptr otherwise
+     llama_dsv4_comp_state * get_csa_state() const;
+     llama_dsv4_comp_state * get_hca_state() const;
+     llama_dsv4_comp_state * get_lid_state() const;
+@@ -167,6 +168,7 @@ private:
+     std::unique_ptr<llama_kv_cache>      kv_csa;
+     std::unique_ptr<llama_kv_cache>      kv_hca;
+     std::unique_ptr<llama_kv_cache>      kv_lid;
++    std::unique_ptr<llama_kv_cache>      kv_lidp; // abyss: see get_lidp()
+     std::unique_ptr<llama_dsv4_comp_state> csa_state;
+     std::unique_ptr<llama_dsv4_comp_state> hca_state;
+     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+@@ -368,6 +370,7 @@ public:
+     const llama_kv_cache_dsv4_comp_context * get_csa() const;
+     const llama_kv_cache_dsv4_comp_context * get_hca() const;
+     const llama_kv_cache_dsv4_comp_context * get_lid() const;
++    const llama_kv_cache_dsv4_comp_context * get_lidp() const; // abyss: nullptr unless V4.1
+     const llama_dsv4_comp_state       * get_csa_state() const;
+     const llama_dsv4_comp_state       * get_hca_state() const;
+     const llama_dsv4_comp_state       * get_lid_state() const;
+@@ -406,6 +409,10 @@ private:
+     stream_copy_info sc_info_hca;
+     stream_copy_info sc_info_lid;
+ 
++    // abyss: the ratio 1 index-key cache follows kv_hca everywhere, set in the constructor bodies
++    llama_memory_context_ptr ctx_lidp_mem;
++    std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_lidp;
++
+     bool reserve_plans = false;
+     mutable comp_plan reserve_plan_csa;
+     mutable comp_plan reserve_plan_hca;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 713d589..ddb8f10 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -500,7 +500,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
+         int64_t ratio,
+         int64_t n_embd_head,
+         const char * name,
+-        int il) const {
++        int il,
++        ggml_tensor ** comp_pre_rope) const {
+     const int64_t n_embd_head_rope = hparams.n_rot();
+     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+     const int64_t n_blocks         = comp_pos ? comp_pos->ne[0] : 0;
+@@ -531,6 +532,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
+     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
+     cb(comp, name, il);
+ 
++    // abyss: the V4.1 index keys derive from the latent before its RoPE
++    if (comp_pre_rope) {
++        *comp_pre_rope = comp;
++    }
++
+     comp = ggml_rope_ext(ctx0, comp, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
+             hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+             dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+@@ -701,6 +707,217 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
+     return top_k;
+ }
+ 
++// abyss: for each query, the candidate block holding its newest visible compressed position. Created only where the
++// candidate step runs, since an input nothing reads has no buffer.
++class llm_graph_input_dsv41_cand : public llm_graph_input_i {
++public:
++    llm_graph_input_dsv41_cand(int64_t ratio, int64_t blk) : ratio(ratio), blk(blk) {}
++    virtual ~llm_graph_input_dsv41_cand() = default;
++
++    void set_input(const llama_ubatch * ubatch) override {
++        GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
++        int32_t * data = (int32_t *) pos->data;
++        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++            data[i] = (int32_t) (((int64_t) ubatch->pos[i] + 1)/ratio - 1)/(int32_t) blk;
++        }
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        return pos->ne[0] == (int64_t) params.ubatch.n_tokens;
++    }
++
++    ggml_tensor * pos = nullptr; // I32 [n_tokens]
++
++    const int64_t ratio;
++    const int64_t blk;
++};
++
++// abyss: the V4.1 sparse indexer is opt-in until it is validated against the reference
++static bool dsv41_indexer_on() {
++    static const bool on = [] {
++        const char * e = getenv("ABYSS_DSV41_INDEXER");
++        const bool v = e != nullptr && atoi(e) != 0;
++        if (v) {
++            LLAMA_LOG_INFO("deepseek41: ABYSS_DSV41_INDEXER=1, sparse attention indexer enabled\n");
++        }
++        return v;
++    }();
++    return on;
++}
++
++// FP4 (e2m1) quantize-dequantize in blocks of 32 along dim 0, with the power-of-two scale 2^ceil(log2(amax/6)) of the
++// reference's fp4_act_quant. Built from plain ops: the e2m1 grid steps 0.5 up to 2, 1 up to 4 and 2 up to 6, and
++// ggml_round breaks ties away from zero where the hardware rounds to even, which only matters on exact ties.
++ggml_tensor * llama_model_deepseek4::graph::build_fp4_qdq(ggml_tensor * x) const {
++    const int64_t n = ggml_nelements(x);
++    GGML_ASSERT(x->ne[0] % 32 == 0);
++
++    ggml_tensor * b = ggml_reshape_2d(ctx0, ggml_is_contiguous(x) ? x : ggml_cont(ctx0, x), 32, n/32);
++
++    ggml_tensor * amax = ggml_pool_1d(ctx0, ggml_abs(ctx0, b), GGML_OP_POOL_MAX, 32, 32, 0);
++    amax = ggml_clamp(ctx0, amax, 6.0f*1.17549435e-38f, INFINITY);
++
++    // the small offset keeps an exact power of two from stepping up after the log
++    ggml_tensor * e = ggml_scale_bias(ctx0, ggml_log(ctx0, ggml_scale(ctx0, amax, 1.0f/6.0f)), 1.0f/logf(2.0f), -1e-6f);
++    ggml_tensor * s = ggml_exp(ctx0, ggml_scale(ctx0, ggml_ceil(ctx0, e), logf(2.0f)));
++
++    ggml_tensor * y = ggml_clamp(ctx0, ggml_div(ctx0, b, s), -6.0f, 6.0f);
++    ggml_tensor * a = ggml_abs(ctx0, y);
++
++    ggml_tensor * r_half = ggml_scale(ctx0, ggml_round(ctx0, ggml_scale(ctx0, a, 2.0f)), 0.5f);
++    ggml_tensor * r_one  = ggml_round(ctx0, a);
++    ggml_tensor * r_two  = ggml_scale(ctx0, ggml_round(ctx0, ggml_scale(ctx0, a, 0.5f)), 2.0f);
++    ggml_tensor * above2 = ggml_step(ctx0, ggml_scale_bias(ctx0, a, 1.0f, -2.0f));
++    ggml_tensor * above4 = ggml_step(ctx0, ggml_scale_bias(ctx0, a, 1.0f, -4.0f));
++
++    ggml_tensor * r = ggml_add(ctx0, r_half, ggml_mul(ctx0, above2, ggml_sub(ctx0, r_one, r_half)));
++    r = ggml_add(ctx0, r, ggml_mul(ctx0, above4, ggml_sub(ctx0, r_two, r_one)));
++
++    ggml_tensor * out = ggml_mul(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, y), r), s);
++    return ggml_reshape(ctx0, out, x);
++}
++
++// An index-key owner (a kv source) turns its pre-RoPE compressed latent into index keys: k_norm(wk(latent)), RoPE at
++// the group's position like the compressed KV itself, then FP4. The key caches mirror the compressed tiers, so the
++// tier's write rows address them too.
++void llama_model_deepseek4::graph::build_dsv41_index_keys(
++        const llama_model & model,
++        llm_graph_input_dsv4 * inp_dsv4,
++        const llm_graph_input_dsv4::comp_input & tier,
++        bool tier_idx,
++        ggml_tensor * latent,
++        int il) const {
++    const auto & layer = model.layers[il];
++    const int64_t head_dim = hparams.indexer_head_size;
++    const int64_t rope_dim = hparams.n_rot();
++    const int64_t n_blocks = tier.state_write_pos->ne[0];
++
++    GGML_ASSERT(layer.indexer_comp_wkv && layer.indexer_comp_norm);
++    const auto * keys = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lidp();
++    GGML_ASSERT(keys);
++
++    ggml_tensor * k = build_lora_mm(layer.indexer_comp_wkv, latent);
++    k = build_norm(k, layer.indexer_comp_norm, nullptr, LLM_NORM_RMS, il);
++    k = ggml_reshape_3d(ctx0, k, head_dim, 1, n_blocks);
++    k = ggml_rope_ext(ctx0, k, tier.state_write_pos, nullptr, rope_dim, rope_type, n_ctx_orig,
++            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
++            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
++    k = ggml_rope_set_offset(k, head_dim - rope_dim);
++    k = build_fp4_qdq(k);
++    cb(k, "idx_k", il);
++
++    build_cpy_k(keys, k, tier.state_write_idxs, il);
++}
++
++// An index source scores every compressed position its queries can see, sum_h relu(q_h . k) * w_h over FP4 q and k,
++// and keeps the index_topk best. The candidate source first keeps its candidate_topk_blocks best blocks for the later
++// sources of its tier, which then only choose inside them. q_rows narrows the queries to a CED subset.
++ggml_tensor * llama_model_deepseek4::graph::build_dsv41_index_top_k(
++        const llama_model & model,
++        llm_graph_input_dsv4 * inp_dsv4,
++        const llm_graph_input_dsv4::comp_input & tier,
++        bool tier_idx,
++        ggml_tensor * qr,
++        ggml_tensor * cur,
++        ggml_tensor * inp_pos,
++        ggml_tensor * q_rows,
++        int il) const {
++    const auto & layer = model.layers[il];
++    const int64_t head_dim = hparams.indexer_head_size;
++    const int64_t rope_dim = hparams.n_rot();
++    const int64_t n_head   = hparams.indexer_n_head;
++    const int64_t nt       = cur->ne[1];
++    const int     kv_src   = hparams.dsv41_kv_source_for(il);
++
++    GGML_ASSERT(tier.kq_mask && tier.kq_mask->type == GGML_TYPE_F16);
++    GGML_ASSERT(layer.indexer_attn_q_b && layer.indexer_proj && kv_src >= 0);
++
++    ggml_tensor * q = build_lora_mm(layer.indexer_attn_q_b, qr);
++    q = ggml_reshape_3d(ctx0, q, head_dim, n_head, nt);
++    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, rope_dim, rope_type, n_ctx_orig,
++            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
++            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
++    q = ggml_rope_set_offset(q, head_dim - rope_dim);
++
++    ggml_tensor * w = build_lora_mm(layer.indexer_proj, cur);
++    w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(head_dim*n_head)));
++
++    ggml_tensor * mask = tier.kq_mask;
++    int64_t nq = nt;
++    if (q_rows) {
++        nq = q_rows->ne[0];
++        q = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), head_dim*n_head, nt), q_rows);
++        q = ggml_reshape_3d(ctx0, q, head_dim, n_head, nq);
++        w = ggml_get_rows(ctx0, w, q_rows);
++        mask = ggml_cast(ctx0, ggml_get_rows(ctx0, mask, q_rows), GGML_TYPE_F16);
++    }
++    q = build_fp4_qdq(q);
++    cb(q, "idx_q", il);
++    cb(w, "idx_w", il);
++
++    const auto * keys = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lidp();
++    GGML_ASSERT(keys);
++    ggml_tensor * k = build_get_k(keys, kv_src);
++    const int64_t n_comp = tier.kq_mask->ne[0];
++    GGML_ASSERT(n_comp > 0 && n_comp <= k->ne[2]);
++    k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], n_comp, k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
++
++    const int64_t n_stream = k->ne[3];
++    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
++            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
++    w = ggml_view_4d(ctx0, w, w->ne[0], w->ne[1]/n_stream, w->ne[2], n_stream,
++            w->nb[1], w->nb[2]/n_stream, w->nb[3]/n_stream, 0);
++
++    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, k, w, mask);
++    cb(score, "idx_score", il);
++
++    // candidate blocks: only the ratio 1 tier has a candidate source, and below candidate_topk_blocks blocks every
++    // block is kept anyway
++    const int64_t blk      = hparams.dsv41_candidate_block;
++    const int64_t n_cand   = hparams.dsv41_candidate_topk;
++    const int     cand_src = (int) hparams.dsv41_candidate_src_layer;
++    const bool cand_on = !tier_idx && blk > 0 && n_cand > 0 && cand_src > 0 && n_comp % blk == 0 && n_comp/blk > n_cand;
++    if (cand_on && il == cand_src) {
++        const int64_t n_blocks = n_comp/blk;
++        ggml_tensor * blocks = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nq), GGML_OP_POOL_MAX, blk, blk, 0);
++
++        // the block with each query's newest position is only partly filled, so it is pinned in
++        auto inp_newest = std::make_unique<llm_graph_input_dsv41_cand>(hparams.dsv4_compress_ratios[il], blk);
++        inp_newest->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nt);
++        ggml_set_input(inp_newest->pos);
++        ggml_tensor * newest = ggml_reshape_2d(ctx0, inp_newest->pos, 1, nt);
++        res->add_input(std::move(inp_newest));
++        if (q_rows) {
++            newest = ggml_get_rows(ctx0, newest, q_rows);
++        }
++        ggml_tensor * pin = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, nq), INFINITY);
++        blocks = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, blocks, 1, n_blocks, nq), pin, newest);
++        blocks = ggml_reshape_2d(ctx0, blocks, n_blocks, nq);
++
++        ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, blocks, n_cand));
++        ggml_tensor * keep = ggml_fill(ctx0, blocks, -INFINITY);
++        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_cand, nq), 0.0f);
++        keep = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, keep, 1, n_blocks, nq), zeros, top_blocks);
++        idx_cand = ggml_reshape_2d(ctx0, keep, n_blocks, nq);
++        cb(idx_cand, "idx_cand", il);
++    } else if (cand_on && il > cand_src) {
++        GGML_ASSERT(idx_cand);
++        ggml_tensor * cand = idx_cand;
++        if (q_rows) {
++            cand = ggml_get_rows(ctx0, cand, inp_ced->get_map(il, cand_src));
++        }
++        score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, blk, n_comp/blk, nq),
++                ggml_reshape_3d(ctx0, cand, 1, n_comp/blk, nq));
++        score = ggml_reshape_2d(ctx0, score, n_comp, nq);
++    }
++
++    const int64_t n_top_k = std::min<int64_t>(n_comp, hparams.indexer_top_k);
++    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nq), n_top_k));
++    cb(top_k, "idx_top_k", il);
++
++    return top_k;
++}
++
+ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
+         ggml_tensor * kq_mask,
+         ggml_tensor * top_k,
+@@ -802,7 +1019,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+         int il,
+         bool idx_tier,
+         ggml_tensor * q_rows,
+-        bool q_none) const {
++        bool q_none,
++        ggml_tensor * top_k) const {
+     // V4.1 layers after a source reuse the source's compressed cache, which the cache resolves from il.
+     const auto & inp_hca = idx_tier ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
+     GGML_ASSERT(inp_hca.kq_mask);
+@@ -844,20 +1062,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+     ggml_tensor * hca_mask = inp_hca.kq_mask;
+ 
+-    ggml_tensor * kq_mask = nullptr;
+     if (q_rows) {
+-        // get_rows widens the f16 mask rows to f32, so the subset's mask is narrowed back for flash attention
++        // get_rows widens the f16 mask rows to f32, so the subset's masks are narrowed back for flash attention
+         ggml_tensor * q_cont = ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q);
+         q = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, q_cont, q->ne[0]*q->ne[1], q->ne[2]), q_rows);
+         q = ggml_reshape_3d(ctx0, q, q_cont->ne[0], q_cont->ne[1], q_rows->ne[0]);
+-        kq_mask = ggml_cast(ctx0, ggml_concat(ctx0,
+-                ggml_get_rows(ctx0, raw_mask, q_rows), ggml_get_rows(ctx0, hca_mask, q_rows), 0), GGML_TYPE_F16);
+-    } else {
+-        kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
++        raw_mask = ggml_cast(ctx0, ggml_get_rows(ctx0, raw_mask, q_rows), GGML_TYPE_F16);
++        hca_mask = ggml_cast(ctx0, ggml_get_rows(ctx0, hca_mask, q_rows), GGML_TYPE_F16);
++    }
++
++    // abyss: with the V4.1 indexer each query keeps only its top_k compressed positions, and flash attention gathers them
++    int64_t n_kv_max = 0;
++    if (top_k) {
++        hca_mask = build_top_k_mask(hca_mask, top_k, "hca_top_k_mask", il);
++        n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+     }
++
++    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+     cb(kq_mask, "hca_kq_mask", il);
+ 
+-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+@@ -1200,6 +1424,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
+         hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
+ 
++        ggml_tensor * comp_latent = nullptr;
+         ggml_tensor * kv_comp_hca = build_hca_compressed_kv_from_state(
+                 hca_source_kv,
+                 hca_source_score,
+@@ -1209,7 +1434,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+                 tier_ratio,
+                 n_embd_head,
+                 "comp_state_compress",
+-                il);
++                il,
++                &comp_latent);
++
++        // abyss: a V4.1 kv source also owns its tier's index keys
++        if (v41 && dsv41_indexer_on()) {
++            build_dsv41_index_keys(model, inp_dsv4, tier, tier_idx, comp_latent, il);
++        }
+ 
+         if (tier.k_rot) {
+             kv_comp_hca = llama_mul_mat_hadamard(ctx0, kv_comp_hca, tier.k_rot);
+@@ -1288,8 +1519,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+             out_rows = inp_ced->idx[il];
+             out_none = ced_n_sub[il] == 0;
+         }
++
++        // abyss: V4.1 attends to the index_topk compressed positions its index source picked, see build_dsv41_index_top_k()
++        ggml_tensor * top_k = nullptr;
++        if (v41 && dsv41_indexer_on() && !out_none) {
++            const int src = hparams.dsv41_index_source_for(il);
++            GGML_ASSERT(src >= 0);
++            if (src == il) {
++                idx_top_k     = build_dsv41_index_top_k(model, inp_dsv4, tier, tier_idx, qr, cur, inp_pos, out_rows, il);
++                idx_top_k_src = il;
++            }
++            GGML_ASSERT(idx_top_k && idx_top_k_src == src);
++            top_k = idx_top_k;
++            if (out_rows && src != il) {
++                top_k = ggml_get_rows(ctx0, top_k, inp_ced->get_map(il, src));
++            }
++        }
++
+         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
+-                1.0f/sqrtf(float(n_embd_head)), il, v41 && tier_idx, out_rows, out_none);
++                1.0f/sqrtf(float(n_embd_head)), il, v41 && tier_idx, out_rows, out_none, top_k);
+     } else {
+         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
+                 1.0f/sqrtf(float(n_embd_head)), il);
+@@ -1340,7 +1588,25 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+     // abyss: the CED-aware prefill trims the decoder FFNs, see llama_context::ced_plan()
+-    inp_ced = ced_n_sub.empty() ? nullptr : build_inp_ced();
++    if (!ced_n_sub.empty()) {
++        // abyss: under the indexer, a decoder layer reads its index source's top-k rows and a ratio 1 source the
++        // candidate source's
++        std::vector<std::pair<int32_t, int32_t>> map_pairs;
++        if (hparams.dsv41_n_index_source > 0 && dsv41_indexer_on()) {
++            const int32_t cand_src = (int32_t) hparams.dsv41_candidate_src_layer;
++            for (int32_t il = 0; il < (int32_t) n_layer; ++il) {
++                const int32_t src = hparams.dsv41_index_source_for(il);
++                if (src >= 0 && src != il) {
++                    map_pairs.push_back({ il, src });
++                }
++                if (cand_src > 0 && il > cand_src && hparams.dsv41_is_index_source(il) &&
++                        hparams.dsv4_compress_ratios[il] == hparams.dsv4_compress_ratios[cand_src]) {
++                    map_pairs.push_back({ il, cand_src });
++                }
++            }
++        }
++        inp_ced = build_inp_ced(map_pairs);
++    }
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index af20ef4..5879f33 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1263,6 +1263,12 @@ struct llama_model_deepseek4 : public llama_model_base {
+         // abyss: the token subsets of the CED-aware prefill, set by the constructor, see llama_context::ced_plan()
+         llm_graph_input_ced * inp_ced = nullptr;
+ 
++        // abyss: the V4.1 sparse indexer's state while the layers are built: the latest index source's top-k (and
++        // which layer computed it), and the candidate source's block mask
++        mutable ggml_tensor * idx_top_k     = nullptr;
++        mutable int32_t       idx_top_k_src = -1;
++        mutable ggml_tensor * idx_cand      = nullptr;
++
+         ggml_tensor * build_head_fold(const llama_model & model, ggml_tensor * x) const;
+ 
+         ggml_tensor * build_hc_post(
+@@ -1313,6 +1319,29 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 int64_t ratio,
+                 int64_t n_embd_head,
+                 const char * name,
++                int il,
++                ggml_tensor ** comp_pre_rope = nullptr) const;
++
++        // abyss: the V4.1 sparse indexer (ABYSS_DSV41_INDEXER=1), see deepseek4.cpp
++        ggml_tensor * build_fp4_qdq(ggml_tensor * x) const;
++
++        void build_dsv41_index_keys(
++                const llama_model & model,
++                llm_graph_input_dsv4 * inp_dsv4,
++                const llm_graph_input_dsv4::comp_input & tier,
++                bool tier_idx,
++                ggml_tensor * latent,
++                int il) const;
++
++        ggml_tensor * build_dsv41_index_top_k(
++                const llama_model & model,
++                llm_graph_input_dsv4 * inp_dsv4,
++                const llm_graph_input_dsv4::comp_input & tier,
++                bool tier_idx,
++                ggml_tensor * qr,
++                ggml_tensor * cur,
++                ggml_tensor * inp_pos,
++                ggml_tensor * q_rows,
+                 int il) const;
+ 
+         ggml_tensor * build_overlap_compressed_kv_from_state(
+@@ -1364,7 +1393,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 int il,
+                 bool idx_tier,
+                 ggml_tensor * q_rows = nullptr,
+-                bool q_none = false) const;
++                bool q_none = false,
++                ggml_tensor * top_k = nullptr) const;
+ 
+         ggml_tensor * build_raw_attention(
+                 llm_graph_input_dsv4_raw * inp_attn,
