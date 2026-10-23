@@ -31,21 +31,21 @@
 
 - 原生总量约 474 GiB，超过显存加内存的 383 GiB，所以 Engram 表放 NVMe。
 - **方案 A（推荐）**：专家量化到 3.0 bpw EXL3，用 vLLM TP2，预计 55–75 tok/s。公开配方需要约 250 GiB 空闲内存，要么改成从 NVMe 读 Engram，要么加内存。
-- **方案 B**：原生 MXFP4，用 mx-llama.cpp；第 0–21 层的专家放 GPU，第 22–39 层放 CPU。2026-10-20 本机实测：解码 16.5 tok/s，预填充 307 tok/s（2048 token，ubatch 2048）。2026-10-21 开 `--moe-cache-mib 14000` 后，4.8 万上下文解码从 14.1 提到 25.2 tok/s，短上下文约 29–30 tok/s，预填充不变（约 354 tok/s）。再开 CED 感知预填充（`ABYSS_CED_PREFILL=1`，`mx-llama.cpp/0003`）后，4.8 万 token 预填充从 355 提到约 890 tok/s，对拍 KLD 0.00004。
+- **方案 B**：原生 MXFP4，用 mx-llama.cpp；第 0–21 层的专家放 GPU，第 22–39 层放 CPU。2026-10-20 本机实测：解码 16.5 tok/s，预填充 307 tok/s（2048 token，ubatch 2048）。2026-10-21 开 `--moe-cache-mib 14000` 后，4.8 万上下文解码从 14.1 提到 25.2 tok/s，短上下文约 29–30 tok/s，预填充不变（约 354 tok/s）。再开 CED 感知预填充（`ABYSS_CED_PREFILL=1`，`mx-llama.cpp/0003`）后，4.8 万 token 预填充从 355 提到约 890 tok/s，对拍 KLD 0.00004。再开 Engram 预取（`ABYSS_ENGRAM_PREFETCH=8`，`mx-llama.cpp/0004`）后，Engram 页缓存冷时的预填充从 91.1 s 降到 54.3 s，热时约 42 s（约 1,140 tok/s）。
 
 ## 方案 B 运行要点（blackwell）
 
-- 模型在 `~/models/DeepSeek-V4.1-Flash-GGUF`（mxxm-t 的 MXFP4 GGUF，383 GiB），mx-llama.cpp 在 `~/src/mx-llama.cpp`（分支 `abyss-expert-stats`，基于 `c4d12e2`；当前 server 用 `build-ced`，`build-v41` 是不含 CED 的旧编译）
+- 模型在 `~/models/DeepSeek-V4.1-Flash-GGUF`（mxxm-t 的 MXFP4 GGUF，383 GiB），mx-llama.cpp 在 `~/src/mx-llama.cpp`（分支 `abyss-expert-stats`，基于 `c4d12e2`；当前 server 用 `build-eng`（含 CED 和 Engram 预取）；`build-ced` 只含 CED，`build-v41` 两者都不含）
 - 必须设 `GGML_CUDA_Q8_1_CACHE=0`：分支的 q8_1 激活缓存按 FIFO 淘汰，和 CUDA VMM 内存池的 LIFO 释放冲突，会触发 `ggml_cuda_pool_vmm::free` 断言
 - 必须设 `GGML_CUDA_MMQ_PREC=q8`：Blackwell 上 MXFP4 的 MMQ 默认用 W4A4（激活量化到 4 bit），只影响超过 8 个 token 的批次，也就是预填充。官方参考实现是 W4A8（`inference/model.py` 的 `linear`）。2026-10-21 对拍：W4A4 预填充对解码路径 KLD 0.044、top-1 91%；改 q8 后 KLD 0.012、top-1 95%，和数值底线相当；预填充只慢约 5%
 - 对拍的数值底线分两档（同一配置重跑是 0）：改动只落在解码器层（20–39）时 KLD 约 0.0005，超过 0.001 就要查；改动经过编码器层（0–19，包括换内核、关融合、换 ubatch）时 0.005–0.01 属正常。原因是编码器的输出决定了所有位置共享的全局 KV，数值差别会扩散到之后所有位置；解码器层的差别只影响当前 token。2026-10-21 实测：只把第 5 层专家改到 CPU 算，KLD 0.0064；把第 22–39 层专家改到 GPU 算，KLD 0.0005
 - 层切分用 `-ts 12/29`；`12/28` 会把 13 层分给 GPU0，放不下计算缓冲区
 - 参数：`-ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU"`
-- 原版对提示词也跑完 40 层。`0003` 补丁让解码器层只对后面的 token 还能通过滑动窗口看到的 token 算 FFN，注意力照常算。每次 `llama_decode` 调用按自己的末尾规划，所以 server 用 `-b 65536`，让整段提示词进一次调用。2026-10-23 测 Engram 占比（开 CED，4.8 万 token，`tools/eval/engram-share.sh`）：页缓存冷时 Engram 约 38.6 s / 91.0 s，热时约 0.4 s / 41.7 s（热时预填充约 1,150 tok/s）；server 启动后第一个请求另有约 11 s 一次性开销
+- 原版对提示词也跑完 40 层。`0003` 补丁让解码器层只对后面的 token 还能通过滑动窗口看到的 token 算 FFN，注意力照常算。每次 `llama_decode` 调用按自己的末尾规划，所以 server 用 `-b 65536`，让整段提示词进一次调用。2026-10-23 测 Engram 占比（开 CED，4.8 万 token，`tools/eval/engram-share.sh`）：页缓存冷时 Engram 约 38.6 s / 91.0 s，热时约 0.4 s / 41.7 s（热时预填充约 1,150 tok/s）；server 启动后第一个大请求另有约 11 s 一次性开销（发一个短请求热身消不掉）。`0004` 的预取把冷读开销从约 39 s 降到约 2 s（`tools/eval/engram-cold.sh`）
 - 专家缓存：`--moe-cache-mib 14000`，分支自带，在 GPU1 上为第 22–39 层做 LRU 专家缓存，约 780 个槽位，未命中时上传。KLD 0.0005，GPU1 用到 93.3 / 95.6 GiB。`~/abyss-stats/restart.sh` 已带上，`restart-nocache.sh` 是不带缓存的版本
 - DSpark 投机解码在 V4.1 上还不支持
 - 工具调用：V4.1 的 DSML 标签名带前导空格（`<｜DSML｜ calls>`、` invoke`、` parameter`，见官方 `encoding/encoding.py`），GGUF 内嵌的是 V4 模板。要用 `mx-llama.cpp/0002` 补丁加 `--chat-template-file mx-llama.cpp/deepseek-v4.1.jinja`
-- server 用 `~/abyss-stats/restart.sh` 重启（仓库副本是 `tools/restart-server.sh`，会先备份统计文件）；退路是 `restart-noced.sh`（不开 CED）和 `restart-nocache.sh`（不开 CED 和专家缓存）；不要用 `pkill -f llama-server`，它会匹配到 ssh 命令自身
+- server 用 `~/abyss-stats/restart.sh` 重启（仓库副本是 `tools/restart-server.sh`，会先备份统计文件）；退路是 `restart-noprefetch.sh`（不开 Engram 预取）、`restart-noced.sh`（不开 CED）和 `restart-nocache.sh`（不开 CED 和专家缓存）；不要用 `pkill -f llama-server`，它会匹配到 ssh 命令自身
 - 专家热度统计：补丁在 `mx-llama.cpp/`，分析脚本是 `tools/expert_hotness.py`
 - 对拍和测速：`tools/eval/`（`kl.sh` 存基准 logits 并比 KLD，`bench.sh` 测速），复制到 blackwell 的 `~/abyss-tools/eval` 运行，结果在 `~/abyss-eval`；运行前要先停 server
 - Strata（https://github.com/Niko1221/Strata）只作设计参考，不直接依赖。

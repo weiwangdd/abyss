@@ -1,0 +1,234 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7fced93..13dc295 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -10,6 +10,7 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
++#include "models/models.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
+@@ -2196,6 +2197,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+ 
++    // abyss: start reading the Engram rows of this batch in the background, see llama_model_deepseek41::engram_prefetch()
++    if (model.arch == LLM_ARCH_DEEPSEEK41) {
++        static_cast<const llama_model_deepseek41 &>(model).engram_prefetch(balloc->get_batch());
++    }
++
+     if (output_all) {
+         // require that all tokens are output
+         if (n_outputs_all != n_tokens_all) {
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 6e7a853..57a4291 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -1,8 +1,11 @@
+ #include "llama-hparams.h"
+ #include "llama-kv-cache-dsv4.h"
++#include "llama-mmap.h"
+ #include "models.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <memory>
+ #include <cmath>
+ #include <cstdlib>
+ #include <stdexcept>
+@@ -193,6 +196,30 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
+ // The rows become one key per hc copy plus a shared value, and the value is added in through a gate that measures how well the key matches the stream.
+ //
+ // The hash itself runs host side, as the PLE of qwen4exp does: it is int64 multiply, xor and modulo over the token history, none of which ggml has, and the tables it needs (primes from a sympy search, multipliers from a numpy PCG64 stream, a normalizer-derived token map) are baked into the model file because they cannot be recomputed here.
++
++// The row indices one token reads, shared by the gather input and the prefetch: tok holds the compressed ids of the token and its predecessors, nearest first, and table e's n_hash_cols indices land at out + e*stride.
++static void engram_hash_token(const llama_hparams & hp, const int64_t * tok, int32_t * out, int64_t stride) {
++    const int64_t n_gram  = hp.engram_max_ngram_size;
++    const int64_t n_heads = hp.engram_n_heads;
++    const int64_t n_cols  = hp.engram_n_hash_cols();
++
++    for (int64_t e = 0; e < hp.engram_n_layers; ++e) {
++        const uint64_t * mult   = &hp.engram_multipliers[e*hp.engram_max_ngram_size];
++        const uint64_t * primes = &hp.engram_primes[e*n_cols];
++        const uint64_t * offs   = &hp.engram_offsets[e*n_cols];
++
++        // xor one look-back in at a time, so the running value after step s is the hash of the (s+1)-gram; each lands in its own prime-sized bucket range of the table
++        uint64_t rolling = (uint64_t) tok[0] * mult[0];
++        for (int64_t s = 1; s < n_gram; ++s) {
++            rolling ^= (uint64_t) tok[s] * mult[s];
++            for (int64_t h = 0; h < n_heads; ++h) {
++                const int64_t c = (s - 1)*n_heads + h;
++                out[e*stride + c] = (int32_t) (rolling % primes[c] + offs[c]);
++            }
++        }
++    }
++}
++
+ class llm_graph_input_engram : public llm_graph_input_i {
+ public:
+     llm_graph_input_engram(const llama_model_deepseek4 & pmodel,
+@@ -225,7 +252,6 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_tokens = ubatch->n_tokens;
+     const int64_t n_gram   = hp.engram_max_ngram_size;
+-    const int64_t n_heads  = hp.engram_n_heads;
+     const int64_t n_cols   = hp.engram_n_hash_cols();
+     const int64_t n_eng    = hp.engram_n_layers;
+     const int64_t n_prev   = n_gram - 1;
+@@ -262,21 +288,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+             tok[s] = cut ? pad : compress(t);
+         }
+ 
+-        for (int64_t e = 0; e < n_eng; ++e) {
+-            const uint64_t * mult   = &hp.engram_multipliers[e*hp.engram_max_ngram_size];
+-            const uint64_t * primes = &hp.engram_primes[e*n_cols];
+-            const uint64_t * offs   = &hp.engram_offsets[e*n_cols];
+-
+-            // xor one look-back in at a time, so the running value after step s is the hash of the (s+1)-gram; each lands in its own prime-sized bucket range of the table
+-            uint64_t rolling = (uint64_t) tok[0] * mult[0];
+-            for (int64_t s = 1; s < n_gram; ++s) {
+-                rolling ^= (uint64_t) tok[s] * mult[s];
+-                for (int64_t h = 0; h < n_heads; ++h) {
+-                    const int64_t c = (s - 1)*n_heads + h;
+-                    idx[e*n_cols*n_tokens + i*n_cols + c] = (int32_t) (rolling % primes[c] + offs[c]);
+-                }
+-            }
+-        }
++        engram_hash_token(hp, tok.data(), &idx[i*n_cols], n_cols*n_tokens);
+     }
+ 
+     for (size_t e = 0; e < emb.size(); ++e) {
+@@ -308,6 +320,109 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+ }
+ 
++// abyss: background prefetch of the Engram rows a batch is about to gather.
++// The rows depend only on the tokens, so a whole prompt's rows are known as soon as llama_decode() gets it, long before each ubatch gathers them.
++// MADV_WILLNEED makes the kernel start all those reads at once, where the gather would fault them in one page per thread at a time.
++// ABYSS_ENGRAM_PREFETCH sets how many threads issue it; 0, the default, turns it off.
++struct llama_engram_prefetcher {
++    std::vector<std::thread> workers;
++    std::atomic<bool> stop { false };
++
++    // a prefetch still running belongs to an older batch, so it is cut short
++    void join() {
++        stop = true;
++        for (auto & worker : workers) {
++            worker.join();
++        }
++        workers.clear();
++        stop = false;
++    }
++
++    ~llama_engram_prefetcher() {
++        join();
++    }
++};
++
++void llama_model_deepseek41::engram_prefetch(const llama_batch & batch) const {
++    static const int n_threads = [] {
++        const char * e = getenv("ABYSS_ENGRAM_PREFETCH");
++        return e != nullptr ? std::max(0, std::min(64, atoi(e))) : 0;
++    }();
++
++    const auto & hp = hparams;
++
++    // a decode step gathers its few rows right away, so only prompts gain from reading ahead
++    if (n_threads == 0 || hp.engram_n_layers == 0 || engram_token_map.empty() || batch.token == nullptr || batch.pos == nullptr ||
++            batch.n_tokens < 64) {
++        return;
++    }
++
++    // one sequence with consecutive positions, so the batch itself holds every look-back but the first few
++    for (int32_t i = 0; i < batch.n_tokens; ++i) {
++        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != batch.seq_id[0][0] || (i > 0 && batch.pos[i] != batch.pos[i - 1] + 1)) {
++            return;
++        }
++    }
++
++    const int64_t n_gram = hp.engram_max_ngram_size;
++    const int64_t n_cols = hp.engram_n_hash_cols();
++    const int64_t n_eng  = hp.engram_n_layers;
++
++    std::vector<const ggml_tensor *> tables(n_eng);
++    for (int64_t e = 0; e < n_eng; ++e) {
++        tables[e] = layers[hp.engram_layer_ids[e]].engram_embed;
++        if (!tables[e] || !tables[e]->data || !tables[e]->buffer || !ggml_backend_buffer_is_host(tables[e]->buffer)) {
++            return;
++        }
++    }
++
++    if (!engram_prefetcher) {
++        engram_prefetcher = std::make_shared<llama_engram_prefetcher>();
++    }
++    engram_prefetcher->join();
++
++    const int64_t n_vocab_map = (int64_t) engram_token_map.size();
++    auto compress = [&](llama_token t) -> int64_t {
++        return t >= 0 && t < n_vocab_map ? (int64_t) engram_token_map[t] : 0;
++    };
++
++    // the first n_gram - 1 tokens look back into earlier batches, so their rows are left to the gather
++    llama_memory_ranges mr;
++    mr.reserve((size_t) (std::max<int64_t>(0, batch.n_tokens - n_gram + 1)*n_cols*n_eng));
++    std::vector<int64_t> tok(n_gram);
++    std::vector<int32_t> rows(n_cols*n_eng);
++    for (int64_t i = n_gram - 1; i < batch.n_tokens; ++i) {
++        for (int64_t s = 0; s < n_gram; ++s) {
++            tok[s] = compress(batch.token[i - s]);
++        }
++        engram_hash_token(hp, tok.data(), rows.data(), n_cols);
++        for (int64_t e = 0; e < n_eng; ++e) {
++            const auto * base = (const uint8_t *) tables[e]->data;
++            for (int64_t c = 0; c < n_cols; ++c) {
++                mr.push_back({ base + (size_t) rows[e*n_cols + c]*tables[e]->nb[1], (size_t) tables[e]->nb[1] });
++            }
++        }
++    }
++
++    // contiguous address slices, so no two threads advise the same page, in small steps so a newer batch stops them early
++    std::sort(mr.begin(), mr.end(), [](const llama_memory_range & a, const llama_memory_range & b) {
++        return (uintptr_t) a.addr < (uintptr_t) b.addr;
++    });
++    auto ranges = std::make_shared<const llama_memory_ranges>(std::move(mr));
++    llama_engram_prefetcher * pf = engram_prefetcher.get();
++    const size_t n = ranges->size();
++    for (int t = 0; t < n_threads; ++t) {
++        const size_t i0 = n*t/n_threads;
++        const size_t i1 = n*(t + 1)/n_threads;
++        pf->workers.emplace_back([pf, ranges, i0, i1] {
++            constexpr size_t step = 4096;
++            for (size_t i = i0; i < i1 && !pf->stop; i += step) {
++                llama_prefetch(llama_memory_ranges(ranges->begin() + i, ranges->begin() + std::min(i1, i + step)));
++            }
++        });
++    }
++}
++
+ ggml_tensor * llama_model_deepseek4::graph::build_inp_engram(const llama_model & model) const {
+     const auto & pmodel = static_cast<const llama_model_deepseek4 &>(model);
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index e543236..d2a728e 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1392,11 +1392,17 @@ struct llama_model_deepseek4 : public llama_model_base {
+ 
+ // DeepSeek-V4.1 is not V4 plus a lookup: its KV compressor and sparse indexer sit on explicit source layers that the layers between them reuse, its compression ratios are 1 and 2, and it folds the hyper-connection copies with the mix the last layer already computed.
+ // Only the parts V4 gets right are inherited.
++struct llama_engram_prefetcher;
++
+ struct llama_model_deepseek41 : public llama_model_deepseek4 {
+     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {
+         head_hc_flags = TENSOR_NOT_REQUIRED;
+     }
+ 
++    // abyss: starts reading the Engram rows of a batch in the background, see deepseek41.cpp
++    void engram_prefetch(const llama_batch & batch) const;
++    mutable std::shared_ptr<llama_engram_prefetcher> engram_prefetcher; // shared_ptr: the type is only complete in deepseek41.cpp
++
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
