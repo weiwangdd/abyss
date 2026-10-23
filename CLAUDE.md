@@ -41,7 +41,7 @@
 - 对拍的数值底线分两档（同一配置重跑是 0）：改动只落在解码器层（20–39）时 KLD 约 0.0005，超过 0.001 就要查；改动经过编码器层（0–19，包括换内核、关融合、换 ubatch）时 0.005–0.01 属正常。原因是编码器的输出决定了所有位置共享的全局 KV，数值差别会扩散到之后所有位置；解码器层的差别只影响当前 token。2026-10-21 实测：只把第 5 层专家改到 CPU 算，KLD 0.0064；把第 22–39 层专家改到 GPU 算，KLD 0.0005
 - 层切分用 `-ts 12/29`；`12/28` 会把 13 层分给 GPU0，放不下计算缓冲区
 - 参数：`-ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU"`
-- 原版对提示词也跑完 40 层。`0003` 补丁让解码器层只对后面的 token 还能通过滑动窗口看到的 token 算 FFN，注意力照常算。每次 `llama_decode` 调用按自己的末尾规划，所以 server 用 `-b 65536`，让整段提示词进一次调用。Engram 随机读在预填充里的占比要在 CED 之后重新测
+- 原版对提示词也跑完 40 层。`0003` 补丁让解码器层只对后面的 token 还能通过滑动窗口看到的 token 算 FFN，注意力照常算。每次 `llama_decode` 调用按自己的末尾规划，所以 server 用 `-b 65536`，让整段提示词进一次调用。2026-10-23 测 Engram 占比（开 CED，4.8 万 token，`tools/eval/engram-share.sh`）：页缓存冷时 Engram 约 38.6 s / 91.0 s，热时约 0.4 s / 41.7 s（热时预填充约 1,150 tok/s）；server 启动后第一个请求另有约 11 s 一次性开销
 - 专家缓存：`--moe-cache-mib 14000`，分支自带，在 GPU1 上为第 22–39 层做 LRU 专家缓存，约 780 个槽位，未命中时上传。KLD 0.0005，GPU1 用到 93.3 / 95.6 GiB。`~/abyss-stats/restart.sh` 已带上，`restart-nocache.sh` 是不带缓存的版本
 - DSpark 投机解码在 V4.1 上还不支持
 - 工具调用：V4.1 的 DSML 标签名带前导空格（`<｜DSML｜ calls>`、` invoke`、` parameter`，见官方 `encoding/encoding.py`），GGUF 内嵌的是 V4 模板。要用 `mx-llama.cpp/0002` 补丁加 `--chat-template-file mx-llama.cpp/deepseek-v4.1.jinja`
