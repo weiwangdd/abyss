@@ -1,0 +1,24 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d..22e2de0 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -18,6 +18,7 @@ else()
+     add_subdirectory(debug)
+     add_subdirectory(embedding)
+     add_subdirectory(eval-callback)
++    add_subdirectory(abyss-dump)
+ 
+     add_subdirectory(gguf-hash)
+     add_subdirectory(gguf)
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index ddb8f10..a8f489c 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -793,6 +793,7 @@ void llama_model_deepseek4::graph::build_dsv41_index_keys(
+     const int64_t n_blocks = tier.state_write_pos->ne[0];
+ 
+     GGML_ASSERT(layer.indexer_comp_wkv && layer.indexer_comp_norm);
++    cb(latent, "idx_latent", il);
+     const auto * keys = tier_idx ? inp_dsv4->mctx->get_lid() : inp_dsv4->mctx->get_lidp();
+     GGML_ASSERT(keys);
+ 
