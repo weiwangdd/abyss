@@ -14,6 +14,7 @@
 | `abyss-dump/` + `0007-abyss-dump.patch` | `llama-abyss-dump`：跑一段提示词，把名字匹配正则的计算图张量存成文件，给 `tools/eval/indexer_oracle.py` 对拍用 |
 | `0008-dsv41-decode-gather.patch` | 单 token 解码时，压缩注意力层先取出索引器选中的 top-k 行，再和滑动窗口拼接，不再每层拼接整个压缩 KV（`ABYSS_DSV41_DECODE_GATHER=1`，要和 `ABYSS_DSV41_INDEXER=1` 一起开） |
 | `0009-moe-cpu-miss.patch` | 专家缓存的未命中，一部分按热度挑出来上传进缓存，其余交给 CPU 算，两边同时进行（`ABYSS_MOE_CPU_MISS=1`） |
+| `0010-fix-ced-inputs-m2-small-batches.patch` | 修两处崩溃：`0006` 的 CED 行映射在计算图用不到时没有分配，提示词约 2,500–16,000 token 时断言失败；`0009` 在 9–32 个 token 的批次里，同一 token 的多个 CPU 未命中指向同一个全零槽位，CUDA MMQ 越界读 |
 
 ## 安装
 
@@ -25,7 +26,7 @@ git apply <abyss>/mx-llama.cpp/0001-hook-expert-stats.patch <abyss>/mx-llama.cpp
   <abyss>/mx-llama.cpp/0005-ced-attention.patch <abyss>/mx-llama.cpp/0006-dsv41-indexer.patch
 cp -r <abyss>/mx-llama.cpp/abyss-dump examples/
 git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-dsv41-decode-gather.patch \
-  <abyss>/mx-llama.cpp/0009-moe-cpu-miss.patch
+  <abyss>/mx-llama.cpp/0009-moe-cpu-miss.patch <abyss>/mx-llama.cpp/0010-fix-ced-inputs-m2-small-batches.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选
@@ -49,5 +50,5 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 - `ABYSS_DSV41_INDEXER=1` 打开 V4.1 的稀疏注意力索引器：KV 源层写索引键（第 2、8、14 层用已有的索引键 cache，第 20 层用新增的 `kv_lidp`），索引源层打分选 top-512，第 20 层为后面的压缩比 1 索引源挑 2,048 个候选块，其余层沿用最近索引源的 top-k。DSV4 状态格式版本因此升到 2
 - `llama-abyss-dump` 由 `ABYSS_DUMP_RE`（张量名正则，名字带 `-<层号>` 后缀）和 `ABYSS_DUMP_DIR` 控制，整段提示词作为一批送入，每个 ubatch 存一个 `<名字>.<序号>.bin`。设 `ABYSS_DUMP_GEN=N` 时不存提示词，而是之后贪心解码 N 个 token，只存这些单 token 的计算。`0007` 给索引键的输入起名 `idx_latent`，`0008` 给压缩注意力的查询起名 `hca_q`，都不影响计算
 - `ABYSS_DSV41_DECODE_GATHER=1` 只在单 token、开了索引器、压缩行多于 top-k 时生效。取出的行补齐到 256 的倍数（补的行掩码为 -inf），走普通的 flash attention；和原来的掩码收集是同一组 KV，差别只在 F16 舍入
-- `ABYSS_MOE_CPU_MISS=1` 只对专家缓存覆盖的层、32 个 token 以内的批次（也就是解码）生效，目前只支持 DeepSeek V4 的 SwiGLU 专家。每层先由一个 CPU 算子规划：命中的照常读缓存；未命中的按衰减热度挑出 `ABYSS_MOE_ADMIT`（默认 0.5）比例异步上传进缓存，其余由 CPU 用主机内存里的原始专家计算，GPU 那边读全零的备用槽位，最后两边相加。热度每层每步乘 `ABYSS_MOE_HEAT_DECAY`（默认 0.99）。CPU 的 `mul_mat_id` 遇到 id < 0 会跳过并把输出清零。server 退出时在 stderr 打印 `abyss: moe cache` 统计
+- `ABYSS_MOE_CPU_MISS=1` 只对专家缓存覆盖的层、32 个 token 以内的批次（也就是解码）生效，目前只支持 DeepSeek V4 的 SwiGLU 专家。每层先由一个 CPU 算子规划：命中的照常读缓存；未命中的按衰减热度挑出 `ABYSS_MOE_ADMIT`（默认 0.5）比例异步上传进缓存，其余由 CPU 用主机内存里的原始专家计算，GPU 那边读全零的备用槽位（每个 token 的第 k 个专家用第 k 个，同一 token 里不能重复，否则 CUDA MMQ 会越界），最后两边相加。CPU 这一路固定在 CPU 上，32 个 token 的批次也不会被卸载到 GPU。热度每层每步乘 `ABYSS_MOE_HEAT_DECAY`（默认 0.99）。CPU 的 `mul_mat_id` 遇到 id < 0 会跳过并把输出清零。server 退出时在 stderr 打印 `abyss: moe cache` 统计
 - `ABYSS_ENGRAM_PREFETCH=8` 打开 Engram 预取，只对 DeepSeek V4.1、单序列、64 个 token 以上的批次生效。只做预读，不改计算结果；新批次到来时会叫停上一批还没做完的预取。

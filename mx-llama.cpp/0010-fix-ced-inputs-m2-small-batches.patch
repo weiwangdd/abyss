@@ -1,0 +1,91 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1abd6db..ebeeffb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -313,8 +313,10 @@ void llm_graph_input_ced::set_input(const llama_ubatch * ubatch) {
+ 
+     const auto & batch_idxs = ubatch->data->batch_idxs;
+ 
++    // abyss: the lists are made up front, and one the graph does not read is never allocated, for example the
++    // candidate source's map below 2,048 compressed blocks
+     for (size_t il = 0; il < idx.size(); ++il) {
+-        if (idx[il] == nullptr) {
++        if (idx[il] == nullptr || idx[il]->buffer == nullptr) {
+             continue;
+         }
+ 
+@@ -333,6 +335,9 @@ void llm_graph_input_ced::set_input(const llama_ubatch * ubatch) {
+     // both subsets keep token order and il's sits inside src's, so the rank inside src's counts up as il's go by
+     for (const auto & [key, map] : maps) {
+         const auto [il, src] = key;
++        if (map->buffer == nullptr) {
++            continue;
++        }
+         GGML_ASSERT(ggml_backend_buffer_is_host(map->buffer));
+         int32_t * data = (int32_t *) map->data;
+ 
+@@ -2459,6 +2464,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         const float limit = hparams.swiglu_clamp_exp[il];
+         ggml_tensor * act_c  = limit > 1e-6f ? ggml_swiglu_clamp(ctx0, gate_c, up_c, limit) : ggml_swiglu_split(ctx0, gate_c, up_c);
+         experts_cpu = ggml_mul_mat_id(ctx0, down_exps, act_c, cpu_ids); // [n_embd, n_expert_used, n_tokens]
++        // a batch of 32 would otherwise be offloaded to a GPU, whose kernels do not skip the -1 ids
++        for (ggml_tensor * t : { up_c, gate_c, act_c, experts_cpu }) {
++            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
++        }
+         cb(experts_cpu, "ffn_moe_down_cpu", il);
+         ggml_build_forward_expand(gf, experts_cpu);
+     }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 834cfe7..31992bb 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -298,11 +298,15 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // one extra slot at the end, CUDA MMQ can read past the last expert
++        // abyss: with ABYSS_MOE_CPU_MISS zero slots come first, one per selected expert of a token, the device reads them
++        // as experts. A token's ids must stay distinct: CUDA MMQ keeps one row per expert and token
++        const int32_t n_zero  = split ? n_expert_used : 0;
++        const int32_t n_extra = 1 + n_zero;
+         auto alloc_size = [&](const group & g, int32_t n_slots) {
+             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+             size_t res = 0;
+             for (const ggml_tensor * t : g.ref) {
+-                res += GGML_PAD(t->nb[2]*(n_slots + 1), alignment);
++                res += GGML_PAD(t->nb[2]*(n_slots + n_extra), alignment);
+             }
+             return res;
+         };
+@@ -395,7 +399,7 @@ struct llama_moe_cache::impl {
+             }
+             ggml_context * ctx = devices[g.id].ctx.get();
+             for (const ggml_tensor * t : g.ref) {
+-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
++                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_extra);
+                 GGML_ASSERT(bank->nb[2] == t->nb[2]);
+                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
+                 g.banks.push_back(bank);
+@@ -406,8 +410,8 @@ struct llama_moe_cache::impl {
+                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
+                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                     ggml_tensor * bank   = g.banks[ip];
+-                    // the slot after the last one stays zero, the experts the CPU computes read it
+-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + split, bank->nb[1], bank->nb[2], 0);
++                    // the slots after the last one stay zero, the experts the CPU computes read them
++                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                 }
+@@ -566,9 +570,11 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        // the k-th expert of a token reads zero slot k, so a token never names a slot twice
++        GGML_ASSERT(n_ids % n_expert_used == 0);
+         for (int64_t i = 0; i < n_ids; ++i) {
+             const int32_t e = ids[i];
+-            dev_slots[i] = slots[e] >= 0 ? slots[e] : g.n_slots;
++            dev_slots[i] = slots[e] >= 0 ? slots[e] : g.n_slots + (int32_t) (i % n_expert_used);
+             cpu_ids[i]   = slots[e] >= 0 ? -1 : e;
+         }
+ 
