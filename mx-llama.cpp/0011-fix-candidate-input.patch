@@ -1,0 +1,23 @@
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index e378399..824d800 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -708,13 +708,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
+ }
+ 
+ // abyss: for each query, the candidate block holding its newest visible compressed position. Created only where the
+-// candidate step runs, since an input nothing reads has no buffer.
++// candidate step runs, and even then nothing may read it: when CED leaves layers 24-36 no tokens in a ubatch, the
++// candidate blocks are dropped from the graph and this input gets no buffer.
+ class llm_graph_input_dsv41_cand : public llm_graph_input_i {
+ public:
+     llm_graph_input_dsv41_cand(int64_t ratio, int64_t blk) : ratio(ratio), blk(blk) {}
+     virtual ~llm_graph_input_dsv41_cand() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override {
++        if (pos->buffer == nullptr) {
++            return;
++        }
+         GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+         int32_t * data = (int32_t *) pos->data;
+         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
