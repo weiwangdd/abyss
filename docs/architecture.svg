@@ -1,0 +1,734 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1696" viewBox="0 0 1500 1696" font-family="'PingFang SC','Hiragino Sans GB','Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei',sans-serif">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker></defs>
+<rect width="1500" height="1696" fill="#ffffff"/>
+<text x="40" y="50" font-size="26" fill="#0f172a" font-weight="bold" text-anchor="start">DeepSeek V4.1 Flash 模型结构，以及方案 B 在本机的布局</text>
+<text x="40" y="80" font-size="15" fill="#475569" font-weight="normal" text-anchor="start">40 层 · 隐藏维度 5,120 · 4 路超连接残差流 · 词表 129,280 · 上下文 1M（YaRN 16 倍，原生 64K）· 总参数 763B</text>
+<text x="40" y="122" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">逐层结构</text>
+<text x="122" y="122" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">左边两条色条：这一层的稠密部分 / 路由专家放在哪里：</text>
+<rect x="462.18" y="111" width="12" height="13" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="479.18" y="122" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">GPU0</text>
+<rect x="522.1800000000001" y="111" width="12" height="13" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="539.1800000000001" y="122" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">GPU1</text>
+<rect x="582.1800000000001" y="111" width="12" height="13" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="599.1800000000001" y="122" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">主机内存</text>
+<rect x="40" y="136" width="760" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="54" y="158" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">Token 嵌入 129,280 × 5,120（BF16）→ 复制成 4 路残差流，之后每层都在 4 路上读写</text>
+<line x1="420.0" y1="176" x2="420.0" y2="194" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="40" y="196" width="760" height="656" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="56" y="220" font-size="15" fill="#0f172a" font-weight="bold" text-anchor="start">编码器 第 0–19 层</text>
+<text x="56" y="238" font-size="12" fill="#475569" font-weight="normal" text-anchor="start">提示词的每个 token 都算；每层 = 注意力 + MoE（384 个专家选 6 个，外加 1 个共享专家）</text>
+<text x="62" y="238" font-size="10" fill="#0f172a" font-weight="normal" text-anchor="start"></text>
+<rect x="52" y="248" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="252" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="252" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="266" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L0</text>
+<text x="130" y="266" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">滑动窗口注意力：最近 128 个 token</text>
+<rect x="52" y="278" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="282" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="282" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="296" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L1</text>
+<text x="130" y="296" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">滑动窗口注意力：最近 128 个 token</text>
+<rect x="600" y="282" width="56" height="18" rx="9" fill="#e7e5e4" stroke="#57534e" stroke-width="1"/>
+<text x="628.0" y="295" font-size="11" fill="#57534e" font-weight="bold" text-anchor="middle">Engram</text>
+<rect x="52" y="308" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="312" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="312" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="326" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L2</text>
+<text x="130" y="326" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 写压缩 KV 和索引键 · 自己选 top-512</text>
+<rect x="600" y="312" width="46" height="18" rx="9" fill="#dcfce7" stroke="#15803d" stroke-width="1"/>
+<text x="623.0" y="325" font-size="11" fill="#15803d" font-weight="bold" text-anchor="middle">KV 源</text>
+<rect x="652" y="312" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="677.0" y="325" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="338" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="342" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="342" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="356" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L3</text>
+<text x="130" y="356" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L2 的压缩 KV 和 L2 的 top-512</text>
+<rect x="52" y="368" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="372" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="372" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="386" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L4</text>
+<text x="130" y="386" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L2 的压缩 KV 和 L2 的 top-512</text>
+<rect x="52" y="398" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="402" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="402" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="416" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L5</text>
+<text x="130" y="416" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L2 的压缩 KV 和 L2 的 top-512</text>
+<rect x="52" y="428" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="432" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="432" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="446" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L6</text>
+<text x="130" y="446" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L2 的压缩 KV 和 L2 的 top-512</text>
+<rect x="52" y="458" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="462" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="462" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="476" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L7</text>
+<text x="130" y="476" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L2 的压缩 KV 和 L2 的 top-512</text>
+<rect x="52" y="488" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="492" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="492" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="506" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L8</text>
+<text x="130" y="506" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 写压缩 KV 和索引键 · 自己选 top-512</text>
+<rect x="600" y="492" width="46" height="18" rx="9" fill="#dcfce7" stroke="#15803d" stroke-width="1"/>
+<text x="623.0" y="505" font-size="11" fill="#15803d" font-weight="bold" text-anchor="middle">KV 源</text>
+<rect x="652" y="492" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="677.0" y="505" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="518" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="522" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="522" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="536" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L9</text>
+<text x="130" y="536" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L8 的压缩 KV 和 L8 的 top-512</text>
+<rect x="52" y="548" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="552" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="552" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="566" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L10</text>
+<text x="130" y="566" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L8 的压缩 KV 和 L8 的 top-512</text>
+<rect x="52" y="578" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="582" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<rect x="71" y="582" width="10" height="18" rx="2" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+<text x="92" y="596" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L11</text>
+<text x="130" y="596" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L8 的压缩 KV 和 L8 的 top-512</text>
+<rect x="52" y="608" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="612" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="612" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="626" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L12</text>
+<text x="130" y="626" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L8 的压缩 KV 和 L8 的 top-512</text>
+<rect x="52" y="638" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="642" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="642" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="656" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L13</text>
+<text x="130" y="656" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L8 的压缩 KV 和 L8 的 top-512</text>
+<rect x="52" y="668" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="672" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="672" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="686" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L14</text>
+<text x="130" y="686" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 写压缩 KV 和索引键 · 自己选 top-512</text>
+<rect x="600" y="672" width="46" height="18" rx="9" fill="#dcfce7" stroke="#15803d" stroke-width="1"/>
+<text x="623.0" y="685" font-size="11" fill="#15803d" font-weight="bold" text-anchor="middle">KV 源</text>
+<rect x="652" y="672" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="677.0" y="685" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="708" y="672" width="56" height="18" rx="9" fill="#e7e5e4" stroke="#57534e" stroke-width="1"/>
+<text x="736.0" y="685" font-size="11" fill="#57534e" font-weight="bold" text-anchor="middle">Engram</text>
+<rect x="52" y="698" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="702" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="702" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="716" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L15</text>
+<text x="130" y="716" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L14 的压缩 KV 和 L14 的 top-512</text>
+<rect x="52" y="728" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="732" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="732" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="746" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L16</text>
+<text x="130" y="746" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L14 的压缩 KV 和 L14 的 top-512</text>
+<rect x="52" y="758" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="762" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="762" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="776" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L17</text>
+<text x="130" y="776" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L14 的压缩 KV 和 L14 的 top-512</text>
+<rect x="52" y="788" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="792" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="792" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="806" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L18</text>
+<text x="130" y="806" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L14 的压缩 KV 和 L14 的 top-512</text>
+<rect x="52" y="818" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="822" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="822" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="836" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L19</text>
+<text x="130" y="836" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 2 · 读 L14 的压缩 KV 和 L14 的 top-512</text>
+<line x1="420.0" y1="852" x2="420.0" y2="868" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="40" y="870" width="760" height="656" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="56" y="894" font-size="15" fill="#0f172a" font-weight="bold" text-anchor="start">解码器 第 20–39 层</text>
+<text x="56" y="912" font-size="12" fill="#475569" font-weight="normal" text-anchor="start">CED：预填充时只算后面还能通过滑动窗口看到的 token，越靠后的层越少，第 39 层只算最后一个</text>
+<text x="62" y="912" font-size="10" fill="#0f172a" font-weight="normal" text-anchor="start"></text>
+<rect x="52" y="922" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="926" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="926" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="940" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L20</text>
+<text x="130" y="940" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 写全局压缩 KV（第 20–39 层共享）· 选 top-512 和候选块</text>
+<rect x="600" y="926" width="46" height="18" rx="9" fill="#dcfce7" stroke="#15803d" stroke-width="1"/>
+<text x="623.0" y="939" font-size="11" fill="#15803d" font-weight="bold" text-anchor="middle">KV 源</text>
+<rect x="652" y="926" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="677.0" y="939" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="708" y="926" width="50" height="18" rx="9" fill="#fef3c7" stroke="#b45309" stroke-width="1"/>
+<text x="733.0" y="939" font-size="11" fill="#b45309" font-weight="bold" text-anchor="middle">候选块</text>
+<rect x="52" y="952" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="956" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="956" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<text x="92" y="970" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L21</text>
+<text x="130" y="970" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L20 的 top-512</text>
+<rect x="52" y="982" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="986" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="986" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1000" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L22</text>
+<text x="130" y="1000" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L20 的 top-512</text>
+<rect x="52" y="1012" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1016" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1016" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1030" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L23</text>
+<text x="130" y="1030" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L20 的 top-512</text>
+<rect x="52" y="1042" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1046" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1046" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1060" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L24</text>
+<text x="130" y="1060" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV · 在候选块里重选 top-512</text>
+<rect x="600" y="1046" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="625.0" y="1059" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="1072" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1076" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1076" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1090" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L25</text>
+<text x="130" y="1090" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L24 的 top-512</text>
+<rect x="52" y="1102" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1106" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1106" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1120" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L26</text>
+<text x="130" y="1120" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L24 的 top-512</text>
+<rect x="52" y="1132" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1136" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1136" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1150" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L27</text>
+<text x="130" y="1150" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L24 的 top-512</text>
+<rect x="52" y="1162" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1166" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1166" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1180" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L28</text>
+<text x="130" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV · 在候选块里重选 top-512</text>
+<rect x="600" y="1166" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="625.0" y="1179" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="1192" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1196" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1196" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1210" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L29</text>
+<text x="130" y="1210" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L28 的 top-512</text>
+<rect x="52" y="1222" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1226" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1226" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1240" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L30</text>
+<text x="130" y="1240" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L28 的 top-512</text>
+<rect x="52" y="1252" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1256" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1256" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1270" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L31</text>
+<text x="130" y="1270" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L28 的 top-512</text>
+<rect x="52" y="1282" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1286" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1286" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1300" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L32</text>
+<text x="130" y="1300" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV · 在候选块里重选 top-512</text>
+<rect x="600" y="1286" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="625.0" y="1299" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="1312" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1316" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1316" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1330" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L33</text>
+<text x="130" y="1330" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L32 的 top-512</text>
+<rect x="52" y="1342" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1346" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1346" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1360" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L34</text>
+<text x="130" y="1360" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L32 的 top-512</text>
+<rect x="52" y="1372" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1376" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1376" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1390" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L35</text>
+<text x="130" y="1390" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L32 的 top-512</text>
+<rect x="52" y="1402" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1406" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1406" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1420" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L36</text>
+<text x="130" y="1420" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV · 在候选块里重选 top-512</text>
+<rect x="600" y="1406" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="625.0" y="1419" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<rect x="52" y="1432" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1436" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1436" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1450" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L37</text>
+<text x="130" y="1450" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L36 的 top-512</text>
+<rect x="52" y="1462" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1466" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1466" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1480" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L38</text>
+<text x="130" y="1480" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L36 的 top-512</text>
+<rect x="52" y="1492" width="736" height="26" rx="4" fill="#ffffff" stroke="#e2e8f0" stroke-width="1"/>
+<rect x="58" y="1496" width="10" height="18" rx="2" fill="#ede9fe" stroke="#7c3aed" stroke-width="1"/>
+<rect x="71" y="1496" width="10" height="18" rx="2" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+<text x="92" y="1510" font-size="12" fill="#475569" font-weight="bold" text-anchor="start">L39</text>
+<text x="130" y="1510" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩比 1 · 读 L20 的压缩 KV 和 L36 的 top-512</text>
+<line x1="420.0" y1="1526" x2="420.0" y2="1542" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="40" y="1544" width="760" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="54" y="1566" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">最终 RMSNorm → 输出头 5,120 × 129,280（BF16）→ 下一个 token 的 logits</text>
+<rect x="40" y="1598" width="760" height="40" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="54" y="1620" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">DSpark 草稿模型：3 层，每层 128 个专家（MXFP4，7.4 GiB），用于投机解码；mx-llama.cpp 在 V4.1 上暂不支持</text>
+<text x="840" y="122" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">单层内部（以解码器层为例）</text>
+<rect x="840" y="136" width="620" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="854" y="158" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">4 路残差流 · 超连接混合：4 路加权合成 1 路，权重经 Sinkhorn 归一化（20 次迭代）</text>
+<line x1="1150.0" y1="176" x2="1150.0" y2="192" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="840" y="194" width="620" height="262" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="856" y="218" font-size="15" fill="#0f172a" font-weight="bold" text-anchor="start">注意力</text>
+<text x="916" y="218" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">RMSNorm 之后；64 个查询头，键值只有 1 个头（K = V，512 维）</text>
+<rect x="854" y="232" width="290" height="112" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="868" y="254" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">查询</text>
+<text x="868" y="275" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">x → q_a 5,120→1,280（低秩）→ 范数</text>
+<text x="868" y="294.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">→ q_b → 64 头 × 512 维</text>
+<text x="868" y="314.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">后 64 维做 RoPE（YaRN）</text>
+<text x="868" y="333.5" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">q_a 的输出也给稀疏索引器</text>
+<rect x="1156" y="232" width="290" height="112" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="1170" y="254" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">键值</text>
+<text x="1170" y="275" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">滑动窗口：最近 128 个 token 的原始 KV</text>
+<text x="1170" y="294.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩 KV：每 r 个 token 合成一行</text>
+<text x="1170" y="314.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">（r = 2 或 1，在 KV 源层写入）</text>
+<text x="1170" y="333.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">索引器只放行 top-512 个压缩行</text>
+<line x1="999" y1="344" x2="999" y2="364" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="1301" y1="344" x2="1301" y2="364" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="854" y="366" width="592" height="76" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="868" y="388" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">注意力计算</text>
+<text x="868" y="409" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">flash attention：128 个窗口行 + 512 个压缩行，每个头一个 sink</text>
+<text x="868" y="428.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">输出投影：分 8 组低秩（秩 1,024）→ 5,120，写回 4 路残差流</text>
+<line x1="1150.0" y1="456" x2="1150.0" y2="474" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="840" y="476" width="620" height="196" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="856" y="500" font-size="15" fill="#0f172a" font-weight="bold" text-anchor="start">MoE 前馈</text>
+<text x="936" y="500" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">超连接再混合出输入 → RMSNorm</text>
+<text x="856" y="528" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">路由：给 384 个专家打分，选 6 个，权重归一化后 × 1.5</text>
+<text x="856" y="553" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">路由专家：SwiGLU（clamp 10），5,120 → 2,304 → 5,120</text>
+<text x="856" y="578" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">MXFP4，每个专家约 18.8 MB，每层共 7.2 GB</text>
+<text x="856" y="603" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">共享专家 1 个：每个 token 都算</text>
+<text x="856" y="628" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">输出加权求和后写回 4 路残差流</text>
+<rect x="1228" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="516" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="525" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1363" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="525" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="534" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1264" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="534" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="543" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="552" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="561" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1336" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="561" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="570" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="579" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="588" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="597" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1390" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="597" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="606" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="615" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="624" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1291" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="624" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="633" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="642" width="7" height="7" rx="1.5" fill="#ea580c"/>
+<rect x="1417" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="642" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1228" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1237" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1246" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1255" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1264" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1273" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1282" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1291" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1300" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1309" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1318" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1327" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1336" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1345" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1354" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1363" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1372" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1381" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1390" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1399" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1408" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1417" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1426" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<rect x="1435" y="651" width="7" height="7" rx="1.5" fill="#e2e8f0"/>
+<text x="1336" y="674" font-size="11" fill="#475569" font-weight="normal" text-anchor="middle">384 个专家里选 6 个</text>
+<line x1="1150.0" y1="672" x2="1150.0" y2="690" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="840" y="692" width="620" height="72" rx="6" fill="#ffffff" stroke="#57534e" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="854" y="714" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">Engram 查表</text>
+<text x="854" y="735" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">只在第 1、14 层：按最近 2–4 个 token 的 n-gram 哈希查两张大表</text>
+<text x="854" y="754.5" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">每张表约 3.84 亿行 × 256 维，每 token 读 24 行（3 种长度 × 8 头），门控后加回残差流</text>
+<text x="840" y="802" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">稀疏注意力索引器（第 2/8/14/20/24/28/32/36 层）</text>
+<rect x="840" y="816" width="198.66666666666666" height="92" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="854" y="838" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">索引查询</text>
+<text x="854" y="859" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">q_a 输出 → wq_b</text>
+<text x="854" y="878.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">→ 32 头 × 128 维</text>
+<text x="854" y="898.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">→ RoPE → FP4</text>
+<rect x="1050.6666666666667" y="816" width="198.66666666666666" height="92" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="1064.6666666666667" y="838" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">索引键</text>
+<text x="1064.6666666666667" y="859" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">压缩器 latent → wk</text>
+<text x="1064.6666666666667" y="878.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">→ 范数 → RoPE → FP4</text>
+<text x="1064.6666666666667" y="898.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">KV 源层写入缓存</text>
+<rect x="1261.3333333333333" y="816" width="198.66666666666666" height="92" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="1275.3333333333333" y="838" font-size="14" fill="#0f172a" font-weight="bold" text-anchor="start">头权重</text>
+<text x="1275.3333333333333" y="859" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">proj(x) / √(128·32)</text>
+<text x="1275.3333333333333" y="878.5" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">每个头一个权重</text>
+<line x1="939.3333333333334" y1="908" x2="939.3333333333334" y2="928" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="1150.0" y1="908" x2="1150.0" y2="928" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="1360.6666666666665" y1="908" x2="1360.6666666666665" y2="928" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="840" y="930" width="620" height="92" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="854" y="952" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">分数 = Σ_h ReLU(q_h · k) · w_h，按查询可见的位置选 top-512 个压缩行</text>
+<text x="854" y="971.5" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 20 层：每 8 行一块，按块内最高分挑 2,048 块（最新的块固定保留）</text>
+<text x="854" y="991.0" font-size="12.5" fill="#475569" font-weight="normal" text-anchor="start">第 24/28/32/36 层只在这些块里重选；其余层沿用最近索引源层的 top-512</text>
+<text x="840" y="1056" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">方案 B 的存储布局（本机）</text>
+<rect x="840" y="1070" width="620" height="58" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
+<text x="854" y="1091" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start">GPU0 · RTX PRO 6000 Max-Q，95.6 GiB</text>
+<text x="854" y="1112" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 0–11 层整层：专家 80.6 GiB + 稠密部分</text>
+<rect x="840" y="1138" width="620" height="78" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.2"/>
+<text x="854" y="1159" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start">GPU1 · RTX PRO 6000 Max-Q，95.6 GiB</text>
+<text x="854" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 12–39 层的稠密部分，第 12–21 层的专家 67.2 GiB</text>
+<text x="854" y="1200" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">专家缓存 14 GiB：第 22–39 层的热专家，约 780 个槽位</text>
+<rect x="840" y="1226" width="620" height="78" rx="8" fill="#ffedd5" stroke="#ea580c" stroke-width="1.2"/>
+<text x="854" y="1247" font-size="13.5" fill="#ea580c" font-weight="bold" text-anchor="start">主机内存 · 192 GiB DDR5（锁页）</text>
+<text x="854" y="1268" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 22–39 层的专家 121 GiB</text>
+<text x="854" y="1288" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">解码时缓存未命中的专家：一半上传进缓存，一半由 CPU 直接算</text>
+<rect x="840" y="1314" width="620" height="58" rx="8" fill="#e7e5e4" stroke="#57534e" stroke-width="1.2"/>
+<text x="854" y="1335" font-size="13.5" fill="#57534e" font-weight="bold" text-anchor="start">NVMe · Samsung 9100 PRO</text>
+<text x="854" y="1356" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">两张 Engram 表约 97 GiB（MXFP4），经页缓存读取，预填充前整批预取</text>
+<text x="840" y="1396" font-size="13" fill="#0f172a" font-weight="bold" text-anchor="start">图例</text>
+<rect x="880" y="1383" width="46" height="18" rx="9" fill="#dcfce7" stroke="#15803d" stroke-width="1"/>
+<text x="903.0" y="1396" font-size="11" fill="#15803d" font-weight="bold" text-anchor="middle">KV 源</text>
+<text x="932" y="1396" font-size="12" fill="#475569" font-weight="normal" text-anchor="start">写压缩 KV</text>
+<rect x="1004.3199999999999" y="1383" width="50" height="18" rx="9" fill="#ccfbf1" stroke="#0f766e" stroke-width="1"/>
+<text x="1029.32" y="1396" font-size="11" fill="#0f766e" font-weight="bold" text-anchor="middle">索引源</text>
+<text x="1060.32" y="1396" font-size="12" fill="#475569" font-weight="normal" text-anchor="start">选 top-512</text>
+<rect x="1145.84" y="1383" width="50" height="18" rx="9" fill="#fef3c7" stroke="#b45309" stroke-width="1"/>
+<text x="1170.84" y="1396" font-size="11" fill="#b45309" font-weight="bold" text-anchor="middle">候选块</text>
+<rect x="1207.84" y="1383" width="56" height="18" rx="9" fill="#e7e5e4" stroke="#57534e" stroke-width="1"/>
+<text x="1235.84" y="1396" font-size="11" fill="#57534e" font-weight="bold" text-anchor="middle">Engram</text>
+<text x="40" y="1672" font-size="12" fill="#94a3b8" font-weight="normal" text-anchor="start">来源：GGUF 元数据（mxxm-t/DeepSeek-V4.1-Flash-GGUF）、官方 inference/model.py；本机布局和实测见 CLAUDE.md 与 docs/scheduler.md（2026-10-25）</text>
+</svg>
