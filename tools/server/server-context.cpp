@@ -1880,6 +1880,18 @@ private:
             }
         }
 
+        // abyss: a cached prompt that serves clearly more of the task than the slot is swapped in, for example a long
+        // conversation that a shorter request sharing its start pushed out of the slot
+        if (ret && !update_cache && prompt_cache && !ret->prompt.tokens.empty()) {
+            const int window = server_prompt_cache::ckpt_window(ctx_tgt);
+            const int usable_slot  = server_prompt_cache::n_usable(ret->prompt, task.tokens, window);
+            const int usable_cache = prompt_cache->best_usable(task.tokens, window);
+            if (usable_cache >= usable_slot + server_prompt_cache::n_usable_margin) {
+                SLT_INF(*ret, "a cached prompt serves %d tokens, the slot %d: swapping it in\n", usable_cache, usable_slot);
+                update_cache = true;
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -4279,6 +4291,12 @@ private:
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
                                                 return false;
+                                            }
+                                            // abyss: a memory whose checkpoint is the whole state at one position (DeepSeek V4
+                                            // reports pos_min == pos_max) can continue from any checkpoint before pos_next. The
+                                            // n_swa margin of pos_min_thold is for checkpoints that hold a window
+                                            if (cur.pos_min == cur.pos_max && cur.pos_max < pos_next) {
+                                                return true;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }

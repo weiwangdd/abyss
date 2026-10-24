@@ -755,6 +755,19 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // abyss: -1 if the memory goes back to any position, otherwise it goes back only to a checkpoint and this is the
+    // window a checkpoint may hold (n_swa, 0 for a recurrent or hybrid model)
+    static int ckpt_window(const llama_context * ctx);
+
+    // abyss: how many tokens of tokens_new the state of prompt serves without recomputing them
+    static int n_usable(const server_prompt & prompt, const server_tokens & tokens_new, int window);
+
+    // abyss: the most tokens of tokens_new a cached prompt serves
+    int best_usable(const server_tokens & tokens_new, int window) const;
+
+    // abyss: a cached prompt replaces the slot's only if it serves at least this many more tokens
+    static constexpr int n_usable_margin = 256;
 };
 
 // used exclusively by router mode

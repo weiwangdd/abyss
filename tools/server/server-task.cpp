@@ -1835,41 +1835,68 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+int server_prompt_cache::ckpt_window(const llama_context * ctx) {
+    const llama_model * model = llama_get_model(ctx);
+    if (llama_model_n_swa(model) > 0) {
+        return llama_model_n_swa(model);
+    }
+    return llama_model_is_recurrent(model) || llama_model_is_hybrid(model) ? 0 : -1;
+}
+
+int server_prompt_cache::n_usable(const server_prompt & prompt, const server_tokens & tokens_new, int window) {
+    const int lcp = prompt.tokens.get_common_prefix(tokens_new);
+    if (window < 0) {
+        return lcp;
+    }
+    // the slot restores the newest checkpoint within the common prefix, even when the new tokens extend the whole prompt;
+    // checkpoints holding a window also need n_swa tokens before the prefix ends (server_context: pos_min_thold)
+    int64_t res = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        const bool whole_state = ckpt.pos_min == ckpt.pos_max;
+        if (ckpt.n_tokens <= lcp && (whole_state || ckpt.pos_min == 0 || ckpt.n_tokens + window <= lcp)) {
+            res = std::max(res, ckpt.n_tokens);
+        }
+    }
+    return (int) res;
+}
+
+int server_prompt_cache::best_usable(const server_tokens & tokens_new, int window) const {
+    int res = 0;
+    for (const auto & state : states) {
+        res = std::max(res, n_usable(state.prompt, tokens_new, window));
+    }
+    return res;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // abyss: pick the cached prompt that serves the most tokens of the new one. Comparing the fractions of each prompt
+    // kept missed a long conversation in the cache whenever a shorter request sharing its start held the slot
+    const int window = ckpt_window(ctx_tgt);
+    const int usable_cur = prompt.tokens.size() > 0 ? n_usable(prompt, tokens_new, window) : 0;
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
-
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, the slot serves %d tokens\n", usable_cur);
 
     auto it_best = states.end();
+    int usable_best = usable_cur + n_usable_margin - 1;
 
-    // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int usable = n_usable(it->prompt, tokens_new, window);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        SRV_TRC("   - prompt with length %7zu serves %7d tokens\n", it->prompt.tokens.size(), usable);
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-            lcp_best    = lcp_cur;
-
+        if (usable > usable_best) {
+            usable_best = usable;
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        // when the new prompt keeps little of the cached one, a copy is loaded and the cached prompt stays for the
+        // conversation it came from
+        const float f_keep = float(it_best->prompt.tokens.get_common_prefix(tokens_new)) / it_best->prompt.tokens.size();
+        const bool  keep   = f_keep < 0.9f;
+
+        SRV_TRC(" - found better prompt serving %d tokens, f_keep = %.3f%s\n", usable_best, f_keep, keep ? ", keeping it cached" : "");
 
         {
             auto & data = it_best->data.main;
@@ -1882,8 +1909,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!keep) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1900,21 +1929,27 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!keep) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
         // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
+        if (it_best->prompt.tokens.get_common_prefix(tokens_new) == it_best->prompt.tokens.size()) {
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
-        prompt = std::move(it_best->prompt);
+        if (keep) {
+            prompt = it_best->prompt.clone();
+        } else {
+            prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+            states.erase(it_best);
+        }
     }
 
     return true;
