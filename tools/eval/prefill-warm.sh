@@ -13,6 +13,11 @@ if pgrep -x llama-server >/dev/null; then
   exit 1
 fi
 
+# a GPU whose link trained below Gen5 uploads experts at half speed (GPU1 came up at Gen4 once, 2026-10-24; a reboot fixed it)
+if nvidia-smi --query-gpu=index,pcie.link.gen.max --format=csv,noheader | awk -F', ' '$2 < 5 { bad = 1 } END { exit bad }'; then :; else
+  echo "warning: a GPU link is below PCIe Gen5 (nvidia-smi -q | grep -A6 'GPU Link Info'), speeds will be off" >&2
+fi
+
 ask() {  # $1 = max_tokens
   python3 -I - "$E/corpus.txt" "$1" "${REPEAT:-3}" <<'PY'
 import json, sys, urllib.request

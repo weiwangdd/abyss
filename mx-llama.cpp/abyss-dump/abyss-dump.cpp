@@ -5,6 +5,9 @@
 //
 // Each evaluation of a matching tensor becomes <dir>/<name>.<n>.bin, n counting from 0 per name (one per ubatch):
 // "ADMP", int32 ggml type, int64 ne[4], then the data as the tensor holds it (contiguous tensors only).
+//
+// With ABYSS_DUMP_GEN=N the prompt is not dumped; N tokens are then decoded greedily one at a time and only those
+// single-token evaluations are dumped, for checking the decode path.
 
 #include "arg.h"
 #include "common.h"
@@ -27,11 +30,12 @@ struct dump_state {
     std::string dir;
     std::map<std::string, int> seq;
     std::vector<uint8_t> buf;
+    bool active = true;
 };
 
 static bool dump_cb(ggml_tensor * t, bool ask, void * user_data) {
     auto & s = *static_cast<dump_state *>(user_data);
-    if (!std::regex_search(t->name, s.re)) {
+    if (!s.active || !std::regex_search(t->name, s.re)) {
         return !ask;
     }
     if (ask) {
@@ -82,6 +86,10 @@ int main(int argc, char ** argv) {
     state.re  = std::regex(re);
     state.dir = dir;
 
+    const char * gen = getenv("ABYSS_DUMP_GEN");
+    const int n_gen = gen ? atoi(gen) : 0;
+    state.active = n_gen == 0;
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -105,6 +113,25 @@ int main(int argc, char ** argv) {
     if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("failed to eval\n");
         return 1;
+    }
+
+    // greedy decoding, one token per evaluation
+    state.active = true;
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    for (int i = 0; i < n_gen; ++i) {
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        llama_token tok = 0;
+        for (llama_token v = 1; v < n_vocab; ++v) {
+            if (logits[v] > logits[tok]) {
+                tok = v;
+            }
+        }
+        LOG_INF("abyss-dump: generated token %d: %d\n", i, tok);
+        common_batch next = common_batch_get_one(ctx, { tok });
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, next.get())) {
+            LOG_ERR("failed to decode\n");
+            return 1;
+        }
     }
 
     for (const auto & [name, n] : state.seq) {
