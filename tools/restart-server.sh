@@ -1,9 +1,15 @@
 #!/bin/bash
-# Restart llama-server (plan B) with expert stats, keeping the stats file.
+# Restart llama-server (plan B) with expert stats, keeping the stats file. Slot 0 is saved to ~/abyss-stats/slots
+# before the stop (with its context checkpoints) and restored after the start, so the next request continues the
+# conversation instead of prefilling it again; NO_RESTORE=1 skips the restore, e.g. when the cache layout changed.
 set -e
 cd ~/abyss-stats
+mkdir -p slots
 pid=$(pgrep -x llama-server || true)
 if [ -n "$pid" ]; then
+  curl -s -m 120 -X POST "http://127.0.0.1:8080/slots/0?action=save" -H "Content-Type: application/json" \
+    -d '{"filename": "slot0.bin"}' || echo "slot save failed"
+  echo
   kill -TERM $pid
   for i in $(seq 60); do kill -0 $pid 2>/dev/null || break; sleep 1; done
   kill -0 $pid 2>/dev/null && { echo "server $pid did not stop"; exit 1; }
@@ -18,6 +24,17 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" \
   -c 131072 -b 65536 -ub 2048 -np 1 --moe-cache-mib 14000 \
+  --checkpoint-min-step 32768 --slot-save-path $HOME/abyss-stats/slots \
   --jinja --chat-template-file $HOME/abyss-stats/tmpl/v41.jinja \
   --host 127.0.0.1 --port 8080 > ~/abyss-stats/server.log 2>&1 &
-echo "started $!"
+pid=$!
+echo "started $pid"
+if [ -z "$NO_RESTORE" ] && [ -f ~/abyss-stats/slots/slot0.bin ]; then
+  until grep -q "listening on" ~/abyss-stats/server.log; do
+    kill -0 $pid 2>/dev/null || { echo "server died, see ~/abyss-stats/server.log"; exit 1; }
+    sleep 3
+  done
+  curl -s -m 120 -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: application/json" \
+    -d '{"filename": "slot0.bin"}' || echo "slot restore failed"
+  echo
+fi
