@@ -19,6 +19,7 @@
 | `0012-prompt-cache-usable-tokens.patch` | server 的 prompt 缓存按「能直接用上的 token 数」挑选，内存缓存里的长对话能换回槽位；只记一个位置的检查点（DeepSeek V4）在分叉点之前就能用，不再要求早 128 个 token |
 | `0013-sched-reserve-size-reset.patch` | 修 `ggml_backend_sched_reserve_size`：它在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端，按错误的切分估算计算缓冲区 |
 | `0014-moe-big-split.patch` | 专家缓存覆盖的层在大批次（超过 32 个 token）时，按规划把专家分成两路同时计算：分到 token 少的交给 CPU（紧凑批次），其余照常上传到 GPU0（`ABYSS_MOE_BIG_SPLIT=1`） |
+| `0015-prefill-tail-one-pass.patch` | 提示词末段尽量一遍算完：server 不再在最后 T 个 token 里按用户消息开头和「末尾前 4 + n_ubatch」拆调用（`ABYSS_CKPT_TAIL_MERGE=T`，生产用 2700；末尾前 4 个 token 的检查点和第一个检查点照旧）；一次调用的余数放进第一个 ubatch，最后一个 ubatch 是满的（`ABYSS_CED_ALIGN=1`）；CED 末尾的余量默认等于 `n_rs_seq`（没开 DSpark 时是 0），`ABYSS_CED_MARGIN` 仍可覆盖 |
 
 ## 安装
 
@@ -32,7 +33,8 @@ cp -r <abyss>/mx-llama.cpp/abyss-dump examples/
 git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-dsv41-decode-gather.patch \
   <abyss>/mx-llama.cpp/0009-moe-cpu-miss.patch <abyss>/mx-llama.cpp/0010-fix-ced-inputs-m2-small-batches.patch \
   <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch \
-  <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch
+  <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch \
+  <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选

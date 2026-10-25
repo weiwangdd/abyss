@@ -1,0 +1,93 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cf63464..1fa2129 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3265,19 +3265,21 @@ llm_graph_params llama_context::graph_params(
+ // encoder output, and see the other tokens' own hidden states only through sliding windows of n_swa positions, each
+ // reaching n_swa - 1 positions back. So a decoder layer needs a token's FFN only where an output token reaches it
+ // through the windows of the layers above, or where the next decode step does: the last positions of each sequence
+-// stay valid up to the second-to-last layer, ABYSS_CED_MARGIN (256) of them on top of the window, so the short
+-// rollbacks the cache allows still find correct sliding-window KV. Tokens out of reach keep their attention, so every
+-// KV write is unchanged, and skip the FFN: their wrong hidden states only feed KV entries no later token reads.
++// stay valid up to the second-to-last layer, n_rs_seq of them on top of the window (ABYSS_CED_MARGIN overrides it), so
++// the short rollbacks the cache allows still find correct sliding-window KV (without n_rs_seq the cache rolls back only
++// to a checkpoint). Tokens out of reach keep their attention, so every KV write is unchanged, and skip the FFN: their
++// wrong hidden states only feed KV entries no later token reads.
+ // Each llama_decode() call is planned on its own end, so a prompt split across calls stays correct and only saves less.
+ bool llama_context::ced_plan(const llama_batch & batch) {
+     static const bool enabled = [] {
+         const char * e = getenv("ABYSS_CED_PREFILL");
+         return e != nullptr && atoi(e) != 0;
+     }();
+-    static const int32_t margin = [] {
++    static const int32_t margin_env = [] {
+         const char * e = getenv("ABYSS_CED_MARGIN");
+-        return e != nullptr ? std::max(0, atoi(e)) : 256;
++        return e != nullptr ? std::max(0, atoi(e)) : -1;
+     }();
++    const int32_t margin = margin_env >= 0 ? margin_env : (int32_t) cparams.n_rs_seq;
+ 
+     const auto & hparams = model.hparams;
+     const int32_t n_layer = (int32_t) hparams.n_layer();
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 3ece07c..fbd7600 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -1506,9 +1506,20 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
+ 
+         balloc.split_reset();
+ 
++        // abyss: ABYSS_CED_ALIGN=1 puts the remainder in the first ubatch instead of the last, so the last ubatch is full.
++        // The CED-aware prefill runs the decoder layers only on the tail of a call, and every ubatch that holds part of
++        // that tail reads the host-resident experts of those layers once; a full last ubatch leaves the earlier one only
++        // the first few decoder layers.
++        static const bool ced_align = [] {
++            const char * e = getenv("ABYSS_CED_ALIGN");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        uint32_t n_first = ced_align && balloc.get_n_tokens() > n_ubatch ? balloc.get_n_tokens() % n_ubatch : 0;
++
+         std::vector<llama_ubatch> ubatches;
+         while (true) {
+-            auto ubatch = balloc.split_simple(n_ubatch);
++            auto ubatch = balloc.split_simple(n_first > 0 ? n_first : n_ubatch);
++            n_first = 0;
+             if (ubatch.n_tokens == 0) {
+                 break;
+             }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 6361f59..2c09385 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4033,8 +4033,20 @@ private:
+                         }
+                         slot.prompt.tokens.push_back(cur_tok);
+ 
++                        // abyss: ABYSS_CKPT_TAIL_MERGE=T keeps the last T tokens of a prompt in one llama_decode() call, apart
++                        // from the final 4. With the CED-aware prefill every call runs the decoder layers on its own tail,
++                        // reading the host-resident experts once more, so a checkpoint break that close to the end costs a
++                        // pass over them. The break before the first checkpoint stays (a system prompt shared by other requests).
++                        static const int32_t ckpt_tail_merge = [] {
++                            const char * e = getenv("ABYSS_CKPT_TAIL_MERGE");
++                            return e != nullptr ? std::max(0, atoi(e)) : 0;
++                        }();
++                        const bool in_merged_tail = ckpt_tail_merge > 0 && !slot.prompt.checkpoints.empty() &&
++                            slot.task->n_tokens() - slot.prompt.n_tokens() > 4 &&
++                            slot.task->n_tokens() - slot.prompt.n_tokens() < ckpt_tail_merge;
++
+                         // break at the last user message, or at user messages at least min step past the last checkpoint
+-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
++                        if (do_checkpoint && !in_merged_tail && spans.is_user_start(slot.prompt.n_tokens())) {
+                             const auto pos = slot.prompt.n_tokens();
+                             const auto & checkpoints = slot.prompt.checkpoints;
+ 
+@@ -4053,6 +4065,9 @@ private:
+ 
+                             bool should_break = false;
+                             for (int offset : checkpoint_offsets) {
++                                if (ckpt_tail_merge > 0 && offset > 4 && offset < ckpt_tail_merge) {
++                                    continue;
++                                }
+                                 const int n_last = std::min(n_batch, offset);
+                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                     should_break = true;
