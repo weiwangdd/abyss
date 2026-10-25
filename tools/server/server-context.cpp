@@ -4674,8 +4674,20 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // abyss: ABYSS_CKPT_TAIL_MERGE=T keeps the last T tokens of a prompt in one llama_decode() call, apart
+                        // from the final 4. With the CED-aware prefill every call runs the decoder layers on its own tail,
+                        // reading the host-resident experts once more, so a checkpoint break that close to the end costs a
+                        // pass over them. The break before the first checkpoint stays (a system prompt shared by other requests).
+                        static const int32_t ckpt_tail_merge = [] {
+                            const char * e = getenv("ABYSS_CKPT_TAIL_MERGE");
+                            return e != nullptr ? std::max(0, atoi(e)) : 0;
+                        }();
+                        const bool in_merged_tail = ckpt_tail_merge > 0 && !slot.prompt.checkpoints.empty() &&
+                            slot.task->n_tokens() - slot.prompt.n_tokens() > 4 &&
+                            slot.task->n_tokens() - slot.prompt.n_tokens() < ckpt_tail_merge;
+
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && !in_merged_tail && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4694,6 +4706,9 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (ckpt_tail_merge > 0 && offset > 4 && offset < ckpt_tail_merge) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
