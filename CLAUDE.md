@@ -10,17 +10,17 @@
 
 - GPU：2 × RTX PRO 6000 Blackwell **Max-Q**（300 W，上限 325 W），每张 97,887 MiB；PCIe 5.0 x8 / x8，P2P 可用（PHB，经 CPU），没有 NVLink
 - CPU：AMD Ryzen 9 9950X（16 核 32 线程，单 NUMA），主板 ASUS ProArt X870E-CREATOR WIFI（BIOS 1715）
-- 内存：4 × 48 GiB DDR5（共 192 GiB，系统可用约 186 GiB），**双通道，2DPC 运行在 3600 MT/s**（条子标称 5600），理论带宽约 57.6 GB/s
+- 内存：4 × 48 GiB DDR5（Acer BL.9BWWR.665，双 rank，共 192 GiB，系统可用约 186 GiB），**双通道 2DPC**。条子标称 5600，SPD 里的 XMP/EXPO 配置是 DDR5-6000、1.40 V；AMD 对 2DPC 双 rank 的默认是 3600 MT/s。2026-10-25 起 BIOS 设 `Ai Overclock Tuner = EXPO I`、`DRAM Frequency = DDR5-5200`、`Memory Context Restore = Disabled`，运行在 **5200 MT/s**，理论带宽约 83.2 GB/s（stressapptest 150 GB 1 小时通过，内存条最高 62 °C）
 - 存储：Samsung 9100 PRO 4TB（PCIe 5.0，系统盘 `/`，剩余 2.1 TB）、Samsung 990 PRO 4TB（PCIe 4.0，`/data`，剩余 3.4 TB）
 - 系统：IOMMU 未启用；`ulimit -l` 约 23 GiB（锁页内存上限，方案 A 需要调大）
 - 平台上限：AM5 最多 4 × 64 GB = 256 GB 内存
 
 实测带宽（2026-10-20，工具在 blackwell 的 `~/bench`）：
 
-- 内存：纯读约 44 GB/s；STREAM Copy 42、Triad 32 GB/s。8 线程就已饱和
-- 主机 → 单卡 28.9 GB/s，单卡 → 主机 28.7 GB/s；**两卡同时从主机读合计只有 43.4 GB/s**，被内存带宽卡住
+- 内存：5200 MT/s 时纯读约 54 GB/s，STREAM Copy 53.5、Triad 39.7 GB/s（3600 MT/s 时是 44、42、32）
+- 主机 → 单卡 28.9 GB/s，单卡 → 主机 28.7 GB/s（卡在 PCIe）；两卡同时从主机读合计 50.6 GB/s（3600 MT/s 时 43.4，被内存带宽卡住）
 - 卡间 P2P 单向约 27.7 GB/s，双向合计 104 GB/s
-- 2026-10-24 有一次开机 GPU1 的链路只训练到 Gen4（主机 → GPU1 14.4 GB/s），专家上传慢一半，解码从约 25 掉到 17 tok/s；重启后恢复 Gen5。`nvidia-smi --query-gpu=index,pcie.link.gen.max --format=csv` 应该两张卡都是 5，`tools/eval` 的测速脚本会检查并警告
+- 2026-10-24 有一次开机 GPU1 的链路只训练到 Gen4（主机 → GPU1 14.4 GB/s），专家上传慢一半，解码从约 25 掉到 17 tok/s；重启后恢复 Gen5。2026-10-25 改 BIOS 后第一次开机 GPU1 只到 Gen3，主机 → GPU1 只有 1.78 GB/s，再重启恢复。`nvidia-smi --query-gpu=index,pcie.link.gen.max --format=csv` 应该两张卡都是 5，`tools/eval` 的测速脚本会检查并警告
 
 ## 目标模型：DeepSeek V4.1 Flash
 
@@ -39,7 +39,7 @@
 - 模型在 `~/models/DeepSeek-V4.1-Flash-GGUF`（mxxm-t 的 MXFP4 GGUF，383 GiB），mx-llama.cpp 在 `~/src/mx-llama.cpp`（分支 `abyss-expert-stats`，基于 `c4d12e2`；当前 server 用 `build-m2`（含 0003–0015）；`build-gat` 不含 0009，`build-idx` 不含 0008、0009，`build-b2` 不含 0006，`build-eng` 不含 0005，`build-ced` 只含 0003，`build-v41` 都不含。非交互 ssh 的 PATH 里没有 nvcc，新建编译目录要加 `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`）
 - 必须设 `GGML_CUDA_Q8_1_CACHE=0`：分支的 q8_1 激活缓存按 FIFO 淘汰，和 CUDA VMM 内存池的 LIFO 释放冲突，会触发 `ggml_cuda_pool_vmm::free` 断言
 - 必须设 `GGML_CUDA_MMQ_PREC=q8`：Blackwell 上 MXFP4 的 MMQ 默认用 W4A4（激活量化到 4 bit），只影响超过 8 个 token 的批次，也就是预填充。官方参考实现是 W4A8（`inference/model.py` 的 `linear`）。2026-10-21 对拍：W4A4 预填充对解码路径 KLD 0.044、top-1 91%；改 q8 后 KLD 0.012、top-1 95%，和数值底线相当；预填充只慢约 5%
-- 对拍的数值底线分两档（同一配置重跑是 0）：改动只落在解码器层（20–39）时 KLD 约 0.0005，超过 0.001 就要查；改动经过编码器层（0–19，包括换内核、关融合、换 ubatch）时 0.005–0.01 属正常。原因是编码器的输出决定了所有位置共享的全局 KV，数值差别会扩散到之后所有位置；解码器层的差别只影响当前 token。2026-10-21 实测：只把第 5 层专家改到 CPU 算，KLD 0.0064；把第 22–39 层专家改到 GPU 算，KLD 0.0005
+- 对拍的数值底线分两档（同一配置重跑不完全是 0：2026-10-25 的编译重跑之间 KLD 平均约 0、最大约 6e-5、top-1 100%，关掉索引器也一样）：改动只落在解码器层（20–39）时 KLD 约 0.0005，超过 0.001 就要查；改动经过编码器层（0–19，包括换内核、关融合、换 ubatch）时 0.005–0.01 属正常。原因是编码器的输出决定了所有位置共享的全局 KV，数值差别会扩散到之后所有位置；解码器层的差别只影响当前 token。2026-10-21 实测：只把第 5 层专家改到 CPU 算，KLD 0.0064；把第 22–39 层专家改到 GPU 算，KLD 0.0005
 - 层切分用 `-ts 12/29`；`12/28` 会把 13 层分给 GPU0，放不下计算缓冲区
 - 参数：`-ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU"`
 - 原版对提示词也跑完 40 层。`0003` 补丁让解码器层只对后面的 token 还能通过滑动窗口看到的 token 算 FFN，`0005` 让注意力也只对这些 token 算查询，KV 照常全部写入。每次 `llama_decode` 调用按自己的末尾规划，所以 server 用 `-b 65536`，让整段提示词进一次调用。2026-10-23 测 Engram 占比（开 CED，4.8 万 token，`tools/eval/engram-share.sh`）：页缓存冷时 Engram 约 38.6 s / 91.0 s，热时约 0.4 s / 41.7 s（热时预填充约 1,150 tok/s）；server 启动后第一个大请求另有约 11 s 一次性开销（发一个短请求热身消不掉）。`0004` 的预取把冷读开销从约 39 s 降到约 2 s（`tools/eval/engram-cold.sh`）
