@@ -17,6 +17,8 @@
 | `0010-fix-ced-inputs-m2-small-batches.patch` | 修两处崩溃：`0006` 的 CED 行映射在计算图用不到时没有分配，提示词约 2,500–16,000 token 时断言失败；`0009` 在 9–32 个 token 的批次里，同一 token 的多个 CPU 未命中指向同一个全零槽位，CUDA MMQ 越界读 |
 | `0011-fix-candidate-input.patch` | 修 `0006` 的同类崩溃：CED 让第 24–36 层在某个 ubatch 里没有 token 时，第 20 层的候选块被整段丢掉，它的输入没有分配；提示词超过约 1.7 万 token、长度除以 2,048 余约 114–622 时触发 |
 | `0012-prompt-cache-usable-tokens.patch` | server 的 prompt 缓存按「能直接用上的 token 数」挑选，内存缓存里的长对话能换回槽位；只记一个位置的检查点（DeepSeek V4）在分叉点之前就能用，不再要求早 128 个 token |
+| `0013-sched-reserve-size-reset.patch` | 修 `ggml_backend_sched_reserve_size`：它在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端，按错误的切分估算计算缓冲区 |
+| `0014-moe-big-split.patch` | 专家缓存覆盖的层在大批次（超过 32 个 token）时，按规划把专家分成两路同时计算：分到 token 少的交给 CPU（紧凑批次），其余照常上传到 GPU0（`ABYSS_MOE_BIG_SPLIT=1`） |
 
 ## 安装
 
@@ -29,7 +31,8 @@ git apply <abyss>/mx-llama.cpp/0001-hook-expert-stats.patch <abyss>/mx-llama.cpp
 cp -r <abyss>/mx-llama.cpp/abyss-dump examples/
 git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-dsv41-decode-gather.patch \
   <abyss>/mx-llama.cpp/0009-moe-cpu-miss.patch <abyss>/mx-llama.cpp/0010-fix-ced-inputs-m2-small-batches.patch \
-  <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch
+  <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch \
+  <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选
@@ -55,4 +58,5 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 - `ABYSS_DSV41_DECODE_GATHER=1` 只在单 token、开了索引器、压缩行多于 top-k 时生效。取出的行补齐到 256 的倍数（补的行掩码为 -inf），走普通的 flash attention；和原来的掩码收集是同一组 KV，差别只在 F16 舍入
 - `ABYSS_MOE_CPU_MISS=1` 只对专家缓存覆盖的层、32 个 token 以内的批次（也就是解码）生效，目前只支持 DeepSeek V4 的 SwiGLU 专家。每层先由一个 CPU 算子规划：命中的照常读缓存；未命中的按衰减热度挑出 `ABYSS_MOE_ADMIT`（默认 0.5）比例异步上传进缓存，其余由 CPU 用主机内存里的原始专家计算，GPU 那边读全零的备用槽位（每个 token 的第 k 个专家用第 k 个，同一 token 里不能重复，否则 CUDA MMQ 会越界），最后两边相加。CPU 这一路固定在 CPU 上，32 个 token 的批次也不会被卸载到 GPU。热度每层每步乘 `ABYSS_MOE_HEAT_DECAY`（默认 0.99）。CPU 的 `mul_mat_id` 遇到 id < 0 会跳过并把输出清零。server 退出时在 stderr 打印 `abyss: moe cache` 统计
 - `0012` 改的是 server 的 prompt 缓存：新请求到来时，比较当前槽位和内存缓存里各条目能直接用上的 token 数（检查点受限的缓存取不晚于分叉点的最近检查点），缓存里的条目多出 256 个以上就换进来；只用到条目一小部分时复制一份，原条目留在缓存里。智能体的辅助请求（共享系统提示、只问一句）因此只算几十个 token，也不会把主对话冲掉。`-lv 4` 能看到检查点和缓存的换入换出
+- `ABYSS_MOE_BIG_SPLIT=1` 只对专家缓存覆盖的层、超过 32 个 token 的批次生效。每层一个 CPU 算子统计每个专家的 token 数，按 token 数从少到多把专家交给 CPU，直到 CPU 的预计时间追上其余专家的上传时间（`ABYSS_MOE_BIG_UPLOAD_US`、`ABYSS_MOE_BIG_CPU_EXPERT_US`、`ABYSS_MOE_BIG_CPU_TOKEN_US`，默认 650 / 450 / 50 微秒），而且这些「token × 专家」不超过 `ABYSS_MOE_BIG_CPU_ROWS`（默认 1,024）行。GPU 那一路的这些条目为 -1：CUDA MMQ 跳过它们并把输出清零，上传回调不传它们，而且直接用规划算子在主机上的结果，不必从 GPU 读回 id。CPU 那一路在 GPU1 上取出这些 token，在 CPU 上按一行一个专家计算，再用 `set_rows` 写回、和 GPU0 的结果相加；合并固定在 0 号后端（GPU0）。退出时在 stderr 打印 `abyss: moe cache large batches` 统计
 - `ABYSS_ENGRAM_PREFETCH=8` 打开 Engram 预取，只对 DeepSeek V4.1、单序列、64 个 token 以上的批次生效。只做预读，不改计算结果；新批次到来时会叫停上一批还没做完的预取。
