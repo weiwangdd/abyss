@@ -74,7 +74,7 @@
   \node[anchor=west,inner sep=0] (t) at (0.80,0.31) {\sffamily\bfseries\Large\color{dsblue}abyss};
 \end{tikzpicture}
 
-\vspace{1.2em}
+\vspace{0.6em}
 \begin{center}
   {\LARGE\bfseries Abyss：在两张显卡上分层运行\\[0.25em] DeepSeek-V4.1-Flash}\\[1.0em]
   {\large Abyss}\\[0.2em]
@@ -85,7 +85,7 @@
 \begin{center}{\large\bfseries 摘要}\end{center}
 \vspace{-0.3em}
 \noindent
-长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器，我们依次实现了 CED 感知预填充、Engram 预取、官方稀疏索引器、解码注意力的 top-k 收集、按热度准入的专家缓存未命中分流，以及预填充大批次的 CPU 分流。在保持原生 MXFP4 精度的前提下（每项改动对改动前的 KLD 都在数值底线以内），4.8 万上下文的单流解码从 14.1 \tps{} 提升到 36.1 \tps{}，12.8 万上下文为 36.2 \tps{}。预填充的提升更大：4.8 万 token 提示词从 135 s（355 \tps{}）降到 22.7 s（2,111 \tps{}），快约 6 倍，其中 CED 感知预填充把解码器层的计算量从约 96 万个「token × 层」降到约 2.9 万个，贡献最大；12.8 万 token 的提示词只需 51.8 s（2,464 \tps{}）；Engram 页缓存冷时，预取把冷读开销从约 39 s 降到约 2 s；多轮智能体会话里，之后每轮（1,200--1,600 token）的预填充从 5.7--7.2 s 降到 4.6--5.6 s。我们同时记录了评估方法（两档数值底线、对官方实现的单层对拍、逐 token 剖析），以及在真实 Codex 负载中发现并修复的缺陷。
+长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器，我们依次实现了 CED 感知预填充、Engram 预取、官方稀疏索引器、解码注意力的 top-k 收集、按热度准入的专家缓存未命中分流、预填充大批次的 CPU 分流，以及让提示词末段一遍算完的调用合并，最后把内存从 3600 MT/s 提到 5200 MT/s。在保持原生 MXFP4 精度的前提下（每项改动对改动前的 KLD 都在数值底线以内），预填充的提升最大：4.8 万 token 提示词从 135 s（355 \tps{}）降到 22.7 s（2,111 \tps{}），快约 6 倍，其中 CED 感知预填充把解码器层的计算量从约 96 万个「token × 层」降到约 2.4 万个，贡献最大；Engram 页缓存冷时，预取把冷读开销从约 39 s 降到约 2 s；多轮智能体会话里，之后每轮（1,200--1,600 token）的预填充从 5.7--7.2 s 降到 2.7--3.2 s。解码从 4.8 万上下文的 14.1 \tps{} 提升到只追加的多轮会话里的 31--33 \tps{}，4.8 万和 9.6 万上下文一样；剩下的时间主要花在把未命中的专家从内存经 PCIe 搬到 GPU。我们同时记录了评估方法（两档数值底线、对官方实现的单层对拍、逐 token 剖析）、一个让解码速度虚高的测法陷阱，以及在真实 Codex 负载中发现并修复的缺陷。
 
 \vspace{0.2em}
 \begin{figure}[!h]
@@ -94,16 +94,16 @@
     \centering
     \begin{tikzpicture}
       \begin{axis}[abyss,
-        width=\linewidth, height=4.6cm,
-        ybar, bar width=15pt, ymin=0, ymax=42,
+        width=\linewidth, height=4.0cm,
+        ybar, bar width=12pt, ymin=0, ymax=42,
         ylabel={解码速度（\tps）},
-        xtick={1,2,3,4,5},
-        xticklabels={原版, 专家缓存, 稀疏索引器, 注意力取 top-k, 未命中分流},
-        xticklabel style={font=\scriptsize,align=center,text width=1.3cm},
+        xtick={1,2,3,4,5,6},
+        xticklabels={原版, 专家缓存, 稀疏索引器, 注意力取 top-k, 未命中分流, 多轮会话实测},
+        xticklabel style={font=\scriptsize,align=center,text width=1.1cm},
         nodes near coords, nodes near coords style={font=\scriptsize},
-        enlarge x limits=0.14]
-        \addplot[fill=dslight,draw=dsblue] coordinates {(1,14.1) (2,25.2) (3,27.7) (4,30.6)};
-        \addplot[fill=dsblue,draw=dsblue,bar shift=0pt] coordinates {(5,36.1)};
+        enlarge x limits=0.12]
+        \addplot[fill=dslight,draw=dsblue] coordinates {(1,14.1) (2,25.2) (3,27.7) (4,30.6) (5,36.1)};
+        \addplot[fill=dsblue,draw=dsblue,bar shift=0pt] coordinates {(6,31.8)};
       \end{axis}
     \end{tikzpicture}
     \caption{}
@@ -112,7 +112,7 @@
     \centering
     \begin{tikzpicture}
       \begin{axis}[abyss,
-        width=\linewidth, height=4.6cm,
+        width=\linewidth, height=4.0cm,
         ybar, bar width=17pt, ymin=0, ymax=150,
         ylabel={预填充时间（s）},
         xtick={1,2,3,4},
@@ -126,7 +126,7 @@
     \end{tikzpicture}
     \caption{}
   \end{subfigure}
-  \caption{(a) 4.8 万上下文的单流解码速度，从左到右依次叠加各项优化（第 4 节）。(b) 4.8 万 token 提示词的预填充时间，Engram 页缓存已热（第 5 节）；Engram 预取只影响冷缓存，不在图中。}
+  \caption{(a) 4.8 万上下文的单流解码速度，依次叠加各项优化（第 4 节）；第 3--5 根是同一提示词第二次生成，缓存命中偏高；最后一根是只追加的多轮会话实测（9.6 万上下文、内存 5200 MT/s，\S\ref{sec:realdecode}）。(b) 4.8 万 token 提示词的预填充时间，Engram 页缓存已热（第 5 节）。}
   \label{fig:hero}
 \end{figure}
 
@@ -146,8 +146,9 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
 本报告记录这一过程。主要结果见表~\ref{tab:summary}：
 
 \begin{itemize}
-  \item \textbf{解码}：GPU 专家缓存、解码注意力只取 top-k 行、按热度准入的未命中分流，使 4.8 万上下文的解码从 14.1 \tps{} 提升到 36.1 \tps{}，而且基本不再随上下文变长而变慢（12.8 万上下文为 36.2 \tps{}）。
-  \item \textbf{预填充}：CED 感知预填充让解码器层只计算后面还能看到的 token，加上 Engram 预取和官方稀疏索引器，4.8 万 token 提示词从 135 s 降到 22.7 s；大批次分流再把多轮会话每轮的预填充降低约 20\%。
+  \item \textbf{解码}：GPU 专家缓存、解码注意力只取 top-k 行、按热度准入的未命中分流，使解码从 14.1 \tps{} 提升到只追加的多轮会话里约 30 \tps{}（内存 3600 MT/s），4.8 万和 9.6 万上下文一样；内存提到 5200 MT/s 后为 31--33 \tps{}。
+  \item \textbf{预填充}：CED 感知预填充让解码器层只计算后面还能看到的 token，加上 Engram 预取和官方稀疏索引器，4.8 万 token 提示词从 135 s 降到 22.7 s；大批次分流和末段一遍算完再把多轮会话每轮的预填充从 5.7--7.2 s 降到 2.9--3.5 s。
+  \item \textbf{测法}：同一提示词第二次、一字不差的生成会让专家缓存命中偏高，解码速度虚高约 15--20\%。我们用只追加的多轮会话重新测量，并据此修正了此前的结论。
   \item \textbf{正确性}：所有改动都有对拍。我们区分了两档数值底线，并对稀疏索引器和解码注意力做了对官方 PyTorch 实现、对 float64 的逐层对拍。
   \item \textbf{真实负载}：在 Codex 的实际请求中发现了 prompt 缓存的选择问题和三处只在特定提示词长度下出现的崩溃，均已修复。
 \end{itemize}
@@ -167,12 +168,14 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
     0004 & Engram 整批预取 & 冷缓存 91.1 $\to$ 54.3 s & — \\
     0005 & 解码器层的注意力也只算子集 & 41.8 $\to$ 27.9 s & 0.00007 \\
     0006 & 补上官方稀疏索引器（top-512） & 27.9 $\to$ 22.7 s；修正长上下文 & 见 \S\ref{sec:indexer} \\
-    0008 & 解码注意力只取 top-k 行 & 解码 27.7 $\to$ 30.6 \tps{} & 0.003\textsuperscript{†} \\
-    0009 & 未命中按热度一半上传、一半交给 CPU & 30.6 $\to$ 36.1 \tps{} & 0.0003\textsuperscript{†} \\
+    0008 & 解码注意力只取 top-k 行 & 解码 27.7 $\to$ 30.6 \tps{}\textsuperscript{‡} & 0.003\textsuperscript{†} \\
+    0009 & 未命中按热度一半上传、一半交给 CPU & 30.6 $\to$ 36.1 \tps{}\textsuperscript{‡} & 0.0003\textsuperscript{†} \\
     0014 & 预填充大批次分流 & 每轮 5.7--7.2 $\to$ 4.6--5.6 s & 0.0005 \\
+    0015 & 提示词末段一遍算完：末段不拆调用，最后一个 ubatch 对齐到满 & 每轮 4.6--5.6 $\to$ 2.9--3.5 s & 0.009\textsuperscript{§} \\
+    BIOS & 内存 3600 $\to$ 5200 MT/s & 解码约 +6\%，每轮 2.7--3.2 s & 重跑一致 \\
     \bottomrule
   \end{tabularx}
-  \par\smallskip\raggedright\footnotesize *\ 预填充路径对解码路径的 KLD，不是对改动前。†\ server 上 temperature 0 生成时的 top-20 KL；0008 经过编码器层，属于较高的一档底线（\S\ref{sec:floors}）。
+  \par\smallskip\raggedright\footnotesize *\ 预填充路径对解码路径的 KLD，不是对改动前。†\ server 上 temperature 0 生成时的 top-20 KL；0008 经过编码器层，属于较高的一档底线（\S\ref{sec:floors}）。‡\ 同一提示词第二次、一字不差的生成，缓存命中偏高；只追加的多轮会话见 \S\ref{sec:realdecode}。§\ 和只换 ubatch 大小的差别一样（\S\ref{sec:tailmerge}）。
 \end{table}
 
 % ---------------------------------------------------------------- 2
@@ -180,12 +183,12 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
 
 \subsection{硬件}
 
-表~\ref{tab:hw} 是机器的配置和实测带宽。两点决定了后面的设计：内存是双通道、2DPC 运行在 3600 MT/s，纯读只有约 44 GB/s；两张卡各走 PCIe 5.0 x8，单卡主机到显存约 28.9 GB/s，但两卡同时从主机读合计只有 43.4 GB/s，被内存带宽卡住。所以无论专家由 CPU 计算还是上传到 GPU，每读一个专家都要占用同一份内存带宽。
+表~\ref{tab:hw} 是机器的配置和实测带宽。两点决定了后面的设计：内存是双通道、每通道两条，优化过程中运行在 3600 MT/s，纯读只有约 44 GB/s（最后提到 5200 MT/s，见第 7 节）；两张卡各走 PCIe 5.0 x8，单卡主机到显存约 28.9 GB/s，但两卡同时从主机读合计只有 43.4 GB/s，被内存带宽卡住。所以无论专家由 CPU 计算还是上传到 GPU，每读一个专家都要占用同一份内存带宽。
 
 \begin{table}[h]
   \centering
   \small
-  \caption{硬件与实测带宽（2026-10-20，STREAM 与 nvbandwidth）。}
+  \caption{硬件与实测带宽（2026-10-20，STREAM 与 nvbandwidth；括号里是 2026-10-25 内存提到 5200 MT/s 后的值）。}
   \label{tab:hw}
   \begin{tabularx}{\textwidth}{@{}l X@{}}
     \toprule
@@ -194,8 +197,8 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
     GPU & 2 × RTX PRO 6000 Blackwell Max-Q（300 W），每张 97,887 MiB GDDR7，SM120 \\
     互联 & PCIe 5.0 x8 / x8，P2P 经 CPU，无 NVLink；卡间单向约 27.7 GB/s \\
     CPU & AMD Ryzen 9 9950X，16 核 32 线程，单 NUMA \\
-    内存 & 4 × 48 GB DDR5，双通道 2DPC 运行在 3600 MT/s；纯读 44 GB/s，STREAM Copy 42 / Triad 32 GB/s \\
-    主机 $\to$ 显存 & 单卡 28.9 GB/s；两卡同时合计 43.4 GB/s \\
+    内存 & 4 × 48 GB DDR5（双 rank），双通道 2DPC，3600 MT/s；纯读 44 GB/s，STREAM Copy 42 / Triad 32 GB/s（5200 MT/s：54、53.5 / 39.7） \\
+    主机 $\to$ 显存 & 单卡 28.9 GB/s；两卡同时合计 43.4 GB/s（5200 MT/s：50.6） \\
     存储 & Samsung 9100 PRO 4TB（PCIe 5.0）、990 PRO 4TB（PCIe 4.0） \\
     \bottomrule
   \end{tabularx}
@@ -277,7 +280,7 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
 \subsection{数值底线}
 \label{sec:floors}
 
-我们用 llama.cpp 的 KL 散度对拍：先存一份基准 logits，再比较改动后的 logits，同一配置重跑结果完全相同（KLD 为 0）。重要的发现是数值底线分两档（表~\ref{tab:floors}）：
+我们用 llama.cpp 的 KL 散度对拍：先存一份基准 logits，再比较改动后的 logits。早期的编译同一配置重跑完全相同（KLD 为 0）；加了后来的补丁后，重跑之间 KLD 平均约 0、最大约 6e-5，top-1 一致率 100\%。重要的发现是数值底线分两档（表~\ref{tab:floors}）：
 
 \begin{itemize}
   \item 改动只落在解码器层（第 20--39 层）时，KLD 约 0.0005。例如把第 22--39 层的专家从 CPU 改到 GPU 上计算。
@@ -297,7 +300,7 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
     \toprule
     比较 & 改动范围 & KLD \\
     \midrule
-    同一配置重跑 & — & 0 \\
+    同一配置重跑 & — & 0（后来最大 6e-5） \\
     第 22--39 层专家从 CPU 改到 GPU & 只有解码器层 & 0.0005 \\
     第 5 层专家从 GPU 改到 CPU & 经过编码器层 & 0.0064 \\
     预填充 W4A4 对解码路径 & 全部层 & 0.044 \\
@@ -334,20 +337,19 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
       xmin=0, xmax=62,
       xlabel={每 token 时间（ms）},
       ytick={1,2,3},
-      yticklabels={{全部优化后}, {专家缓存，Gen5}, {专家缓存，GPU1 只有 Gen4}},
+      yticklabels={{全部优化后，多轮会话}, {专家缓存，Gen5}, {专家缓存，GPU1 只有 Gen4}},
       y dir=reverse,
       ymajorgrids=false, xmajorgrids,
-      legend columns=5, legend style={at={(0.5,1.04)},anchor=south,/tikz/every even column/.append style={column sep=8pt}},
+      legend columns=4, legend style={at={(0.5,1.04)},anchor=south,/tikz/every even column/.append style={column sep=8pt}},
       enlarge y limits=0.3]
-      \addplot[fill=dsblue,draw=dsblue] coordinates {(0,1) (17.4,2) (33.3,3)};
-      \addplot[fill=dsviolet,draw=dsviolet] coordinates {(0,1) (13.3,2) (13.3,3)};
-      \addplot[fill=dslight,draw=dsblue] coordinates {(0,1) (4.8,2) (5.0,3)};
-      \addplot[fill=dsgray,draw=dsgray] coordinates {(0,1) (4.5,2) (6.3,3)};
-      \addplot[fill=dsorange!60,draw=dsorange] coordinates {(27.7,1) (0,2) (0,3)};
-      \legend{上传专家, GPU1 内核, GPU0 内核, 两卡空闲, 合计（未剖析）}
+      \addplot[fill=dsblue,draw=dsblue] coordinates {(14.7,1) (17.4,2) (33.3,3)};
+      \addplot[fill=dsviolet,draw=dsviolet] coordinates {(10.4,1) (13.3,2) (13.3,3)};
+      \addplot[fill=dslight,draw=dsblue] coordinates {(4.2,1) (4.8,2) (5.0,3)};
+      \addplot[fill=dsgray,draw=dsgray] coordinates {(8.1,1) (4.5,2) (6.3,3)};
+      \legend{上传专家, GPU1 内核, GPU0 内核, 两卡空闲}
     \end{axis}
   \end{tikzpicture}
-  \caption{4.8 万上下文解码的每 token 时间。中间一行是开启专家缓存后的剖析；下面一行是一次开机后 GPU1 的链路只训练到 Gen4 时的剖析，上传慢了一倍（\S\ref{sec:incidents}）；上面一行是本报告全部优化后的总时间（36.1 \tps{}）。}
+  \caption{4.8 万上下文解码的每 token 时间（nsys，内存 3600 MT/s）。中间一行是只开专家缓存时；下面一行是一次开机后 GPU1 的链路只训练到 Gen4 时，上传慢了一倍（\S\ref{sec:incidents}）；上面一行是全部优化后、只追加的多轮会话中，每 token 37.5 ms（\S\ref{sec:realdecode}）。}
   \label{fig:decode}
 \end{figure}
 
@@ -356,7 +358,7 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
 
 剖析还显示 GPU1 内核里有约 3 ms 花在 \code{concat\_cont} 上，而且随上下文增长：每层每个 token 都把滑动窗口和整个压缩 KV 拼成一个张量（4.8 万上下文时每次约 40 µs），再由 flash attention 按 top-512 掩码挑行。单个查询时这是浪费的：它只会看到 512 个压缩行。我们改为先用 \code{get\_rows} 取出这 512 行和它们的掩码，再和滑动窗口拼接，补齐到 256 的倍数后走普通 flash attention。
 
-4.8 万上下文的解码从 27.7 提升到 30.6 \tps{}，12.8 万上下文从 23.9 提升到 30.9 \tps{}，解码速度基本不再随上下文变长而下降。server 上 temperature 0 生成的 top-20 KL 约 0.003，高于解码器层那一档底线。我们用 float64 对拍确认了原因：给定相同输入时，两条路径看到的是同一组 640 行，和 float64 的误差都约 5e-4（F16 舍入）；第 20 层的差别来自上游——第 2--19 层约 5e-4 的舍入差别经 MoE 在分数接近的专家之间选择而被放大，这正是「经过编码器层」那一档的机制。
+4.8 万上下文的解码从 27.7 提升到 30.6 \tps{}，12.8 万上下文从 23.9 提升到 30.9 \tps{}（都是同一提示词第二次生成，\S\ref{sec:realdecode}），解码速度基本不再随上下文变长而下降。server 上 temperature 0 生成的 top-20 KL 约 0.003，高于解码器层那一档底线。我们用 float64 对拍确认了原因：给定相同输入时，两条路径看到的是同一组 640 行，和 float64 的误差都约 5e-4（F16 舍入）；第 20 层的差别来自上游——第 2--19 层约 5e-4 的舍入差别经 MoE 在分数接近的专家之间选择而被放大，这正是「经过编码器层」那一档的机制。
 
 \subsection{按热度准入的未命中分流}
 
@@ -364,12 +366,12 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
 
 我们改为按热度准入。每层由一个 CPU 算子规划：命中的照常读缓存；未命中的按衰减热度（每层每步乘 0.99）挑出一定比例，立即异步上传进 LRU 槽位；其余由 CPU 用主机内存里的原始专家计算，GPU 那边读 bank 末尾的全零槽位，down 之后两边相加。计算图里 CPU 分支先于 GPU 分支展开，规划算子在 CPU split 开头发出上传，CPU 计算其余未命中时 DMA 正在进行，每个专家只从内存读一遍。
 
-表~\ref{tab:admit} 是上传比例的扫描。只上传一半，命中率不降：按热度挑出来的才进缓存，冷门专家不会把缓存冲掉。最终取 0.5：4.8 万上下文 36.1 \tps{}，12.8 万上下文 36.2 \tps{}，KL 约 2e-4，低于解码器层底线。
+表~\ref{tab:admit} 是上传比例的扫描。只上传一半，命中率不降：按热度挑出来的才进缓存，冷门专家不会把缓存冲掉。最终取 0.5：4.8 万上下文 36.1 \tps{}，12.8 万上下文 36.2 \tps{}，KL 约 2e-4，低于解码器层底线。这两个数和表里的速度一样，都是同一提示词第二次生成测出的，偏高；实际会话见下节。
 
 \begin{table}[h]
   \centering
   \small
-  \caption{未命中上传比例的扫描（4.8 万上下文，已开启 top-k 收集，复用提示词缓存后生成 256 token）。}
+  \caption{未命中上传比例的扫描（4.8 万上下文，已开启 top-k 收集，复用提示词缓存后生成 256 token，即同一提示词第二次、一字不差的生成）。}
   \label{tab:admit}
   \begin{tabular}{@{}l r r r@{}}
     \toprule
@@ -386,6 +388,33 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
   \end{tabular}
 \end{table}
 
+\subsection{实际会话中的解码速度}
+\label{sec:realdecode}
+
+Codex 的实际会话（上下文约 10 万 token）解码只有 30--31 \tps{}，明显低于表~\ref{tab:admit} 的 36。差别在测法：表里的速度来自同一提示词的第二次生成，temperature 0 下它和第一次一字不差，第一次用过的专家正好还在 LRU 缓存里，命中率偏高；同一脚本里第一次生成只有 32--35 \tps{}。Codex 自带的测速在短上下文下得到 47--49 \tps{}，也是同一段生成重复跑出来的。
+
+我们改用只追加的会话测量（\code{decode\_modes.sh}）：首轮放文档和工具定义，之后每轮追加上一轮的回答和一个新问题，生成 256 个 token，轮换贪心或默认采样、流式或不流式。9.6 万上下文 27--31 \tps{}，4.8 万上下文 27--29 \tps{}，四种方式没有差别，和 Codex 的实际会话一致。所以解码既不受流式和采样影响，也不随上下文变长而变慢。
+
+\begin{table}[h]
+  \centering
+  \small
+  \caption{只追加的多轮会话中每 token 的时间（nsys，内存 3600 MT/s）。}
+  \label{tab:realdecode}
+  \begin{tabular}{@{}l r r@{}}
+    \toprule
+    部分 & 9.6 万上下文 & 4.8 万上下文 \\
+    \midrule
+    GPU1 上传未命中专家（约 20 个、360 MiB） & 14.5 ms & 14.7 ms \\
+    GPU1 内核 & 10.5 ms & 10.4 ms \\
+    GPU0 内核 & 4.2 ms & 4.2 ms \\
+    两卡都空闲 & 7.9 ms & 8.1 ms \\
+    合计（nsys 下） & 37.1 ms & 37.5 ms \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:realdecode} 是剖析结果。和上下文长度有关的内核（注意力、索引器打分、top-k、取行和拼接）在 9.6 万上下文时合计只有约 2 ms，top-k 已经是基数选择。一个解码器层的时间线是：GPU1 先算上一层专家的合并、本层注意力和路由（127 个内核，约 0.47 ms）；路由结果和本层输入传回主机后，上传 1 个未命中的专家（3 × 6.3 MB，约 0.70 ms），同时 CPU 算另一个（约 0.79 ms）；之后 CPU 结果传回、启动下一段计算图（约 0.09 ms）。上传和 CPU 计算同时从内存读约 37.6 MB，用了约 0.8 ms，已经到内存带宽的上限；而 GPU 上能挪到上传期间去算的只有本层命中的专家，每层不到 0.1 ms。所以解码剩下的时间主要是每层串行的未命中处理，把上传和命中专家的计算并行起来，每 token 最多省 2--3 ms。
+
 % ---------------------------------------------------------------- 5
 \section{预填充}
 
@@ -393,7 +422,7 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
 
 \subsection{CED 感知预填充}
 
-官方参考实现对提示词也跑满 40 层，CED 体现在 KV 的共享方式上：解码器层只有滑动窗口用到各层自己的隐状态。因此可以精确地裁剪：第 0--19 层全部 token 都算；第 39 层只算最后一个 token；第 $L$ 层（20--38）只需算最后 $128 + 127 \times (38-L)$ 个 token——每往前一层，滑动窗口让依赖往前延伸 127 个 token。实现中再多留约 256 个位置的余量。这样解码器层合计约 2.9 万个「token × 层」，与提示词长度无关；4.8 万 token 的提示词在原版中是 $20 \times 48{,}240 \approx 96$ 万个（图~\ref{fig:ced}）。
+官方参考实现对提示词也跑满 40 层，CED 体现在 KV 的共享方式上：解码器层只有滑动窗口用到各层自己的隐状态。因此可以精确地裁剪：第 0--19 层全部 token 都算；第 39 层只算最后一个 token；第 $L$ 层（20--38）只需算最后 $128 + 127 \times (38-L)$ 个 token——每往前一层，滑动窗口让依赖往前延伸 127 个 token。实现原本在末尾多留 256 个位置，给投机解码的回退用；没开 DSpark 时 DSV4 不能部分回退，后来改为默认不留（\S\ref{sec:tailmerge}）。这样解码器层合计约 2.4 万个「token × 层」，与提示词长度无关；4.8 万 token 的提示词在原版中是 $20 \times 48{,}240 \approx 96$ 万个（图~\ref{fig:ced}）。
 
 \begin{figure}[t]
   \centering
@@ -409,12 +438,12 @@ mx-llama.cpp 自带一个实验性的专家缓存：在 GPU1 上划出一组槽�
       \addplot[dsblue, mark=*, mark size=1.2pt, line width=1pt] coordinates {
         (0,48240) (1,48240) (2,48240) (3,48240) (4,48240) (5,48240) (6,48240) (7,48240) (8,48240) (9,48240)
         (10,48240) (11,48240) (12,48240) (13,48240) (14,48240) (15,48240) (16,48240) (17,48240) (18,48240) (19,48240)
-        (20,2669) (21,2542) (22,2415) (23,2288) (24,2161) (25,2034) (26,1907) (27,1780) (28,1653) (29,1526)
-        (30,1399) (31,1272) (32,1145) (33,1018) (34,891) (35,764) (36,637) (37,510) (38,383) (39,1)};
+        (20,2414) (21,2287) (22,2160) (23,2033) (24,1906) (25,1779) (26,1652) (27,1525) (28,1398) (29,1271)
+        (30,1144) (31,1017) (32,890) (33,763) (34,636) (35,509) (36,382) (37,255) (38,128) (39,1)};
       \legend{原版, CED 感知预填充}
     \end{axis}
   \end{tikzpicture}
-  \caption{4.8 万 token 提示词每层计算 FFN 的 token 数（按实现中的规划规则计算，含约 256 个位置的余量）。编码器层全部计算；解码器层只计算后面还能通过滑动窗口看到的 token。}
+  \caption{4.8 万 token 提示词每层计算 FFN 的 token 数（按实现中的规划规则计算，没开 DSpark 时不留余量）。编码器层全部计算；解码器层只计算后面还能通过滑动窗口看到的 token。}
   \label{fig:ced}
 \end{figure}
 
@@ -480,23 +509,54 @@ fork 原本对 V4.1 的压缩 KV 做稠密注意力。压缩行在 512 以内时
   \begin{tikzpicture}
     \begin{axis}[abyss,
       width=0.92\textwidth, height=5.0cm,
-      ybar, bar width=12pt, ymin=0, ymax=8.5,
+      ybar, bar width=10pt, ymin=0, ymax=8.5,
       xlabel={轮次（每轮新增 1,200--1,600 token）}, ylabel={预填充时间（s）},
       xtick={2,3,4,5,6},
       nodes near coords={\pgfmathprintnumber[fixed,fixed zerofill,precision=1]{\pgfplotspointmeta}},
       nodes near coords style={font=\scriptsize},
-      legend columns=2, legend style={at={(0.5,1.03)},anchor=south,/tikz/every even column/.append style={column sep=10pt}},
+      legend columns=3, legend style={at={(0.5,1.03)},anchor=south,/tikz/every even column/.append style={column sep=10pt}},
       enlarge x limits=0.15]
       \addplot[fill=dslight,draw=dsblue] coordinates {(2,5.8) (3,6.1) (4,5.7) (5,7.0) (6,7.2)};
       \addplot[fill=dsblue,draw=dsblue] coordinates {(2,4.7) (3,4.9) (4,4.6) (5,5.6) (6,5.6)};
-      \legend{不分流, 大批次分流}
+      \addplot[fill=dsviolet,draw=dsviolet] coordinates {(2,3.3) (3,3.2) (4,3.0) (5,2.9) (6,3.5)};
+      \legend{不分流, 大批次分流, 末段一遍算完}
     \end{axis}
   \end{tikzpicture}
-  \caption{多轮智能体会话中每轮的预填充时间（首轮为 4.8 万 token 的文档，之后每轮回填工具结果或追问）。}
+  \caption{多轮智能体会话中每轮的预填充时间（首轮为 4.8 万 token 的文档，之后每轮回填工具结果或追问；内存 3600 MT/s）。末段一遍算完见 \S\ref{sec:tailmerge}。}
   \label{fig:agent}
 \end{figure}
 
 这一步离下限还有约 30 ms/层：GPU0 的上传暂存区在 gate、up、down 三份权重之间复用，每段之间都要同步，CPU 要等 gate 那批传完才能开始；CPU 计算和 DMA 又共享 44 GB/s 的内存带宽。合并的几步要固定在 GPU0，否则 GPU1 的计算缓冲区会大 3.7 GB，12.8 万上下文时放不下。实现中还发现并修复了 fork 的一处问题（\code{0013}）：\code{ggml\_backend\_sched\_reserve\_size} 在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端，按错误的切分估算计算缓冲区。
+
+\subsection{末段一遍算完}
+\label{sec:tailmerge}
+
+CED 让每次 \code{llama\_decode} 调用都按自己的末尾跑解码器层，凡是超过 32 个 token 的调用都要把第 22--39 层几乎全部专家从内存读一遍。server 为了建检查点，会在最后一条用户消息开头、末尾前 4 + n\_ubatch 和末尾前 4 处拆调用。生产日志里 Codex 的大多数轮次因此被拆成两次大调用（例如 1,772 + 866 + 4），比同样长度只有一次调用的轮次多花 1.5--2 s；一次调用里末段跨两个 ubatch 时，也要读两遍。我们做了三处改动（\code{0015}）：
+
+\begin{itemize}
+  \item 提示词最后 2,700 个 token 里不再按用户消息开头和末尾前 4 + n\_ubatch 拆调用，只留末尾前 4 个 token 那次，下一轮靠它从助手前缀处接着算。会话的第一个检查点照旧，Codex 的辅助请求靠它复用系统提示。代价是这两类检查点没了：只有改写最后一条用户消息时才用得上，这时 server 退回上一轮的检查点，多算这一轮。
+  \item 一次调用的余数放进第一个 ubatch，最后一个 ubatch 是满的 2,048 个。原来余数在最后，最后一个 ubatch 常常只有几百个 token，第 20--32 层左右都要在前一个 ubatch 里再算一遍；现在前一个 ubatch 只剩第 20--22 层的少量 token。
+  \item 末尾的余量默认等于回退环的深度 \code{n\_rs\_seq}，没开 DSpark 时为 0。我们按规划公式逐个位置核对过，余量为 0 时下一个 token 需要的滑动窗口状态仍然完整。
+\end{itemize}
+
+\begin{table}[h]
+  \centering
+  \small
+  \caption{末段一遍算完的效果（\code{agent-turns.sh}，内存 3600 MT/s）。}
+  \label{tab:tailmerge}
+  \begin{tabular}{@{}l r r@{}}
+    \toprule
+    配置 & 首轮 4.8 万 token & 之后 5 轮（1,200--1,600 token） \\
+    \midrule
+    改动前 & 27.9 s & 4.6--5.6 s \\
+    末段不拆调用 & 25.3 s & 3.2--3.7 s \\
+    + 最后一个 ubatch 对齐到满 & 24.4 s & 3.2--3.7 s \\
+    + 余量为 0 & 24.0 s & 2.9--3.5 s \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+新提示词按外部测速的方式（关闭 prompt 缓存，每档 3 次取中位数）测，2,324 token 从 5.57 s 降到 3.69 s，4,277 token 从 8.80 s 降到 4.34 s。对拍方面，最后一个 ubatch 对齐对改动前的 KLD 是 0.0092、top-1 一致率 95.4\%，和只把 ubatch 从 2048 改成 1024 的 0.0090、96.0\% 一样；余量 0 对余量 256 生成的 256 个 token 全部相同（top-20 KL 4.6e-4）。我们还用 token 数组直接构造提示词，让调用长度除以 2,048 余 0、1、2、7--9、31--33、127--129、1000、2047，各测约 2 千、4 千、2 万 token，42 个请求全部正常。
 
 % ---------------------------------------------------------------- 6
 \section{服务与智能体负载}
@@ -517,20 +577,49 @@ V4.1 的缓存不能回退到滑动窗口中间，只能退回检查点。server
 \begin{itemize}
   \item \textbf{未分配的输入张量}。CED 让某些层在某个 ubatch 里没有 token，依赖它们的计算被整段丢掉，预先建好的输入张量就不会分配，往里写数据时断言失败。这在 CED 行映射（提示词约 2,500--16,000 token）和候选块输入（约 1.7 万 token 以上、长度除以 2,048 余约 114--622）上各出现一次，都只在特定长度下触发，测速用的 4.8 万和 12.8 万 token 恰好都没碰到，由 Codex 的请求暴露。
   \item \textbf{全零槽位重复}。未命中分流最初只有一个全零槽位。9--32 token 的批次里，同一 token 的多个 CPU 未命中指向同一个槽位，CUDA MMQ 的重排每个专家每个 token 只记一行，漏掉的行号未初始化，量化内核越界。改为每个 token 的第 $k$ 个专家用第 $k$ 个全零槽位。
-  \item \textbf{PCIe 降速}。有一次开机后 GPU1 的链路只训练到 Gen4，主机到 GPU1 只有 14.4 GB/s，未命中上传慢了一倍，解码从约 25 掉到 17 \tps{}（图~\ref{fig:decode}）；重启后恢复。测速脚本现在会先检查链路。
+  \item \textbf{PCIe 降速}。有一次开机后 GPU1 的链路只训练到 Gen4，主机到 GPU1 只有 14.4 GB/s，未命中上传慢了一倍，解码从约 25 掉到 17 \tps{}（图~\ref{fig:decode}）；重启后恢复。改 BIOS 后第一次开机又出现一次，GPU1 只到 Gen3，主机到 GPU1 只有 1.78 GB/s，同样重启恢复。测速脚本现在会先检查链路。
+  \item \textbf{测试 server 退出时卡住}。测试 server 收到退出信号时正好接到外部请求，之后 GPU 和 CPU 都是 0\%，只能强制结束。生产 server 重启时也可能碰到。
+  \item \textbf{Codex 的 MCP 工具被丢弃}。Codex 每个请求带的 9 个 \code{namespace} 类型工具，server 不支持，直接跳过，模型看不到。这个问题还没有修。
 \end{itemize}
+
+% ---------------------------------------------------------------- 7
+\section{把内存提到 5200 MT/s}
+
+4 × 48 GB 双 rank、每通道两条时，AMD 默认只跑 3600 MT/s。内存条标称 5600，SPD 里的 XMP 和 EXPO 配置都是 DDR5-6000、1.40 V。我们在 BIOS 里设 EXPO I，再把频率降到 DDR5-5200，并关掉 Memory Context Restore。stressapptest 用 150 GB 压 1 小时通过，没有硬件错误，内存条最高 62 °C；同一编译重跑的对拍和改之前一致，差别和这个编译两次运行之间一样。
+
+\begin{table}[h]
+  \centering
+  \small
+  \caption{内存从 3600 提到 5200 MT/s 前后（2026-10-25）。}
+  \label{tab:ddr5200}
+  \begin{tabular}{@{}l r r@{}}
+    \toprule
+    测试 & 3600 MT/s & 5200 MT/s \\
+    \midrule
+    内存纯读 & 44 GB/s & 54 GB/s \\
+    两卡同时从主机读 & 43.4 GB/s & 50.6 GB/s \\
+    单卡从主机读 & 28.9 GB/s & 28.9 GB/s \\
+    9.6 万上下文多轮会话解码 & 29.0--31.1 \tps{} & 30.7--33.0 \tps{} \\
+    多轮智能体首轮 / 之后每轮 & 24.0 / 2.9--3.5 s & 23.1 / 2.7--3.2 s \\
+    新提示词 604 / 2,324 / 4,277 token & 2.59 / 3.69 / 4.34 s & 2.27 / 3.35 / 4.01 s \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+各项快了 6--12\%，少于我们预计的 15--20\%。解码时上传到 GPU1 受 PCIe 限制，每个专家约 0.7 ms，和内存频率无关，只有 CPU 算的那一半变快了。内存带宽也只提高了 23\%，理论上是 44\%，可能是内存控制器频率被自动设成了内存频率的一半，还没有确认。专家缓存的上传比例（0.5）是在 3600 MT/s 下定的，现在 CPU 快了，可能不再最优。
 
 % ---------------------------------------------------------------- 7
 \section{结论、局限与未来方向}
 
-在一台双卡工作站上，Abyss 以原生 MXFP4 精度运行 DeepSeek-V4.1-Flash：单流解码约 36 \tps{}，且几乎不随上下文变长而变慢；4.8 万 token 提示词的预填充约 23 s，多轮会话每轮约 5 s。收益主要来自三类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k），按热度安排数据所在的层级（专家缓存与准入），以及让 CPU、DMA 和 GPU 同时工作（未命中分流、大批次分流）。每一项都先剖析、后实现，并用分档的数值底线和对官方实现的对拍确认正确性。
+在一台双卡工作站上，Abyss 以原生 MXFP4 精度运行 DeepSeek-V4.1-Flash：只追加的多轮会话里单流解码 31--33 \tps{}，4.8 万和 9.6 万上下文一样；4.8 万 token 提示词的预填充约 23 s，多轮会话每轮约 3 s。收益主要来自四类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k），按热度安排数据所在的层级（专家缓存与准入），让 CPU、DMA 和 GPU 同时工作（未命中分流、大批次分流），以及减少重复读取（末段一遍算完）。每一项都先剖析、后实现，并用分档的数值底线和对官方实现的对拍确认正确性。
 
-\paragraph{局限。} 解码器专家的读取最终受内存带宽限制：无论 CPU 计算还是上传，每个专家都要从 44 GB/s 的双通道内存读一遍，预填充的大批次和解码的未命中都已接近这个下限。显存余量很小（12.8 万上下文时两卡分别约 3.6 GB 和 1.2 GB），更大的缓存或更长的上下文要以缩小专家缓存为代价。GGUF 中的 Engram 表从官方的 FP8 降到了 MXFP4（\S\ref{sec:formats}），这对质量的影响还没有测过。DSpark 投机解码在 V4.1 上尚不支持，这部分收益还没有拿到。
+\paragraph{局限。} 解码器专家的读取最终受内存带宽和 PCIe 限制：每个未命中的专家都要从双通道内存读一遍，上传的那一半还要经过 x8 的 PCIe（每个约 0.7 ms），而且一层接一层串行；预填充的大批次也已接近「每层专家读一遍」的下限。GPU1 的链路两天里两次没有训练到 Gen5，每次开机后都要先检查。显存余量很小（12.8 万上下文时两卡分别约 3.6 GB 和 1.2 GB），更大的缓存或更长的上下文要以缩小专家缓存为代价。GGUF 中的 Engram 表从官方的 FP8 降到了 MXFP4（\S\ref{sec:formats}），这对质量的影响还没有测过。DSpark 投机解码在 V4.1 上尚不支持，这部分收益还没有拿到。
 
 \paragraph{未来方向。}
 \begin{itemize}
-  \item 让超过 2,048 token 的提示词末段只上传一遍解码器专家（目前每个 ubatch 各传一遍），预计新提示词的预填充还能省数秒。
-  \item 在 BIOS 中尝试把内存提到 5200 MT/s，带宽约提高 1.4 倍，所有受内存带宽限制的部分都会受益。
+  \item 在 5200 MT/s 下重新扫专家缓存的上传比例，并确认内存控制器是否和内存同频。
+  \item 合并 GPU 上的小内核：解码时每 token 约 2,900 个内核、14.6 ms，占四成多，平均每个只有约 5 µs。
+  \item 让上传和本层命中专家的计算并行，并减少每层的同步，预计每 token 省 2--3 ms。
   \item 补上 V4.1 的 DSpark 投机解码。diffbot 在智能体编程会话中开启后解码约为单流的两倍；但在分层布局下，一次验证多个 token 会选中更多不同的专家，要多读的专家可能抵消一部分收益，需要实测。
   \item 与方案 A（3.0 bpw 专家、vLLM 双卡张量并行，预计 55--75 \tps{}）做一次同机对比，量化速度与精度的取舍。
 \end{itemize}
@@ -570,19 +659,22 @@ Abyss 的全部改动以补丁形式保存在仓库的 \code{mx-llama.cpp/} 目�
     0012 & prompt 缓存按能直接用上的 token 数挑选 & — \\
     0013 & 修调度器估算显存时清掉手动指定的后端 & — \\
     0014 & 预填充大批次分流到 CPU & \code{ABYSS\_MOE\_BIG\_SPLIT=1} \\
+    0015 & 提示词末段一遍算完；CED 余量跟 \code{n\_rs\_seq} & \code{ABYSS\_CKPT\_TAIL\_MERGE=2700} \\
+         & & \code{ABYSS\_CED\_ALIGN=1} \\
     \bottomrule
   \end{tabularx}
 \end{table}
 
 \section{复现}
 
-生产配置的启动命令（需打过全部补丁的编译；还必须设 \code{GGML\_CUDA\_Q8\_1\_CACHE=0} 和 \code{GGML\_CUDA\_MMQ\_PREC=q8}）：
+生产配置的启动命令（需打过全部补丁的编译；还必须设 \code{GGML\_CUDA\_Q8\_1\_CACHE=0} 和 \code{GGML\_CUDA\_MMQ\_PREC=q8}；内存在 BIOS 里设 EXPO I + DDR5-5200）：
 
 \begin{small}
 \begin{verbatim}
 GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 \
 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 \
+ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 \
 llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -c 131072 -b 65536 -ub 2048 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" \
@@ -608,8 +700,104 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
     \code{engram-cold.sh}、\code{engram-share.sh} & Engram 冷读开销与占比 \\
     \code{m2-cpu-miss.sh} & 未命中分流的上传比例扫描 \\
     \code{agent-turns.sh} & 多轮智能体会话 \\
+    \code{decode\_modes.sh} & 只追加的长会话里测解码，\code{CAPTURE=1} 剖析 \\
+    \code{prefill-sizes.sh} & 几种长度新提示词的预填充 \\
     \bottomrule
   \end{tabular}
 \end{center}
+
+\section{术语表}
+\label{sec:glossary}
+
+按主题分组；同一个词在不同语境下含义不同的（如「解码器层」和「解码」、server 的槽位和专家缓存的槽位），在条目里分别说明。
+
+\setlist[description]{font=\normalfont\bfseries,leftmargin=0pt,itemsep=0.25em}
+
+\subsection*{模型结构}
+\begin{description}\small
+  \item[MoE（混合专家）] 每层有许多个前馈网络（专家），每个 token 只由路由器挑出其中几个来算。V4.1-Flash 每层 384 个路由专家，每个 token 选 6 个，另有 1 个共享专家每个 token 都算。
+  \item[路由器（gate）] 每层给 384 个专家打分并选出 top-6 的小矩阵；它选中的专家号决定了这一步要读哪些专家权重。
+  \item[CED（编码器-解码器结构）] V4.1 把 40 层分成前 20 层因果编码器（第 0--19 层）和后 20 层解码器（第 20--39 层）。第 20 层用编码器的输出生成所有解码器层共享的全局 KV；解码器层自己的隐状态只能通过 128 个 token 的滑动窗口被其他 token 看到。所以提示词里较早的 token 不必算完解码器层，这是 CED 感知预填充的依据。
+  \item[编码器层、解码器层] 分别指第 0--19 层和第 20--39 层，是模型结构上的划分；和下面推理过程里的「解码」（逐个生成 token）不是一回事。
+  \item[滑动窗口注意力（SWA）] 每个 token 只看自己和前面 127 个位置的 KV（共 128 个）。
+  \item[压缩注意力、压缩比] 把每 2 个或每 1 个 token 的 KV 压成一行，长程注意力只看压缩后的行。第 0--1 层只有滑动窗口，第 2--19 层压缩比为 2，第 20--39 层为 1。压缩 KV 只在第 2、8、14、20 层（KV 源层）写入，其后的层复用。
+  \item[全局 KV] 第 20 层的压缩器生成、被全部解码器层共享的压缩 KV。
+  \item[稀疏索引器（lightning indexer）] 用 32 个头、128 维、FP4 的查询和键给所有压缩位置打分，为每个查询挑出 top-512 个位置；注意力只看这些位置和滑动窗口，共约 640 行。第 2、8、14、20、24、28、32、36 层是索引源层，其余层沿用最近索引源的结果。
+  \item[候选块] 第 20 层按每 8 个压缩位置一块挑出 2,048 块，第 24--36 层只在这些块里重新选 top-512。
+  \item[超连接（hc）] V4 系列对残差连接的扩展：隐状态保留 4 路，每层注意力和前馈网络的前后按学到的系数把它们混合、写回。解码时它带来不少小内核。
+  \item[Engram] V4.1 的查表模块：第 1、14 层按最近 2--4 个 token 的 n-gram 哈希，从两张各约 3.84 亿行的大表里取行。表很大（官方 FP8 约 189 GiB），但每个 token 只读几十行，所以可以放在 NVMe 上。
+  \item[DSpark] V4.1 自带的约 14B 草稿模型，用于投机解码；mx-llama.cpp 对 V4.1 还不支持。
+\end{description}
+
+\subsection*{数值格式与量化}
+\begin{description}\small
+  \item[MXFP4] 4 bit 浮点（E2M1），每 32 个元素共享一个 8 bit 的 2 的幂缩放（E8M0），平均 4.25 bit/权重。V4.1 路由专家的原生格式。
+  \item[FP8、BF16、F16、F32] 8、16、16、32 位浮点。官方 checkpoint 的稠密权重和 Engram 表是 FP8；KV cache 用 F16。
+  \item[Q8\_0] llama.cpp 的 8 bit 整数格式，每 32 个元素一个 F16 缩放，平均 8.5 bit。GGUF 里的稠密权重是这种格式。
+  \item[W4A8、W4A4] 矩阵乘的精度：权重 4 bit，激活量化到 8 bit 或 4 bit。官方参考实现是 W4A8；fork 在 Blackwell 上的预填充默认是 W4A4，我们用 \code{GGML\_CUDA\_MMQ\_PREC=q8} 改回 8 bit。
+  \item[bpw] 每个权重平均占的位数。方案 A 把专家从约 4.25 bpw 压到 3.0 bpw。
+  \item[EXL3] ExLlamaV3 的量化格式，方案 A 的公开配方用它。
+  \item[GGUF] llama.cpp 的模型文件格式；本报告用的是 mxxm-t 转换的 MXFP4 GGUF，共 12 个分片、383 GiB。
+\end{description}
+
+\subsection*{推理过程}
+\begin{description}\small
+  \item[预填充（prefill）] 一次处理整段提示词，写入 KV 并算出第一个 token 的分布。很多 token 一起算，主要受算力和读权重的总量限制。
+  \item[解码（decode）] 每次生成一个 token。每一步都要把用到的权重读一遍，主要受带宽限制。
+  \item[tok/s] 每秒 token 数：预填充指每秒处理的提示词 token，解码指每秒生成的 token。
+  \item[KV cache] 已处理位置的键和值，后面的 token 做注意力时读取。V4.1 的 KV 很小：每个位置只有 1 个 512 维的头，又经过压缩。
+  \item[llama\_decode 调用、ubatch] server 把要处理的 token 组成一次 \code{llama\_decode} 调用（上限由 \code{-b} 决定，本报告用 65536）；一次调用再切成最多 2,048 个 token（\code{-ub}）的 ubatch，每个 ubatch 把计算图从头到尾跑一遍。
+  \item[检查点（checkpoint）] DeepSeek V4 的缓存不能回退到中间位置。server 在一些位置保存那一刻的完整状态（滑动窗口和压缩器状态），之后的请求如果在这之后才和缓存分叉，就从检查点恢复，不必从头算。
+  \item[prompt 缓存] server 把处理过的提示词状态（连同检查点）留在内存里，下一个请求前缀相同时直接复用。
+  \item[server 的槽位（slot）] server 同时服务的会话数（\code{-np}），本报告用 1 个；和专家缓存的槽位无关。
+  \item[回退环（n\_rs\_seq）] 为投机解码准备的少量回退能力，可以撤销最近几个 token；没开投机解码时为 0，缓存只能退回检查点。
+  \item[投机解码] 用小模型先猜几个 token，再让大模型一次验证，猜对的部分直接接受。
+  \item[temperature 0（贪心）] 每步都取概率最大的 token，同样的输入一定得到同样的输出，适合对拍。
+\end{description}
+
+\subsection*{Abyss 调度器}
+\begin{description}\small
+  \item[方案 A、方案 B] 方案 A 把专家量化到 3.0 bpw，用 vLLM 双卡张量并行（TP2）；方案 B 保留原生 MXFP4，用 mx-llama.cpp 按层切分，是本报告的主线。
+  \item[层切分] \code{-sm layer -ts 12/29}：GPU0 放第 0--11 层整层，GPU1 放第 12--39 层的稠密部分和第 12--21 层的专家，第 22--39 层的专家放主机内存。
+  \item[锁页内存（CUDA\_Host）] 不会被操作系统换出、GPU 可以直接用 DMA 读取的主机内存；第 22--39 层的专家（121 GiB）放在这里。
+  \item[专家缓存、bank、槽位] GPU1 上划出 14 GB（bank），分成约 780 个槽位，每个放一个专家；每层有一张从专家号到槽位号的映射表。
+  \item[命中、未命中、命中率] token 选中的专家已在缓存里叫命中，否则叫未命中；命中率按「token × 专家」计。实际会话里约 65--76\%。
+  \item[LRU] 最近最少使用：缓存满了先换出最久没用过的专家。
+  \item[准入、热度] 未命中的专家不是都放进缓存：按衰减热度（每层每步乘 0.99）挑出一定比例（默认 0.5）上传进缓存，其余由 CPU 算。
+  \item[未命中分流（0009）] 解码时把未命中的专家分成两路同时处理：一部分上传到 GPU1 的缓存里算，其余由 CPU 直接用主机内存里的权重算，每个专家只从内存读一遍。
+  \item[大批次分流（0014）] 预填充时超过 32 个 token 的批次，把分到 token 少的专家交给 CPU，其余照常上传到 GPU0。
+  \item[CED 感知预填充（0003、0005）] 解码器层只对后面的 token 还能通过滑动窗口看到的那些 token 计算前馈网络和注意力，KV 照常全部写入。
+  \item[末段一遍算完（0015）] 让提示词最后一段不再被 server 拆成几次调用，并让一次调用的最后一个 ubatch 是满的，解码器层的专家尽量只读一遍。
+  \item[计算图、split] ggml 把一次前向计算表示成计算图，再按算子所在的设备切成几段（split），每段在一个后端（CPU、GPU0 或 GPU1）上执行，段与段之间拷贝数据、同步。
+  \item[MMQ、MMVQ] CUDA 上的量化矩阵乘内核：MMQ 用于超过 8 个 token 的批次（预填充），MMVQ 用于 1--8 个 token（解码）。
+  \item[CUDA graph] 把一串内核录成一次提交，减少逐个启动的开销。
+  \item[flash attention] 不显式存出完整注意力矩阵、分块计算注意力的内核。
+\end{description}
+
+\subsection*{评估方法}
+\begin{description}\small
+  \item[对拍] 同一段输入下，把改动后的输出和改动前或参照实现逐项比较。
+  \item[KLD（KL 散度）] 两个配置在每个位置上输出的概率分布之差，再取平均；0 表示完全相同。本报告用 llama.cpp 的 \code{llama-perplexity} 计算。
+  \item[数值底线] 不改变语义的改动（换内核、换 ubatch 大小、换计算设备）也会带来的 KLD。只经过解码器层时约 0.0005，经过编码器层时 0.005--0.01（\S\ref{sec:floors}）。
+  \item[top-1 一致率] 两个配置下概率最大的 token 相同的位置所占的比例。
+  \item[top-20 KL] 只用 server 返回的前 20 个候选的概率估算的 KL，用来在单 token 的解码路径上对拍。
+  \item[PPL（困惑度）] 模型对一段文本的平均「意外程度」，越低越好。
+  \item[参照实现（oracle）] 我们照官方 \code{inference/model.py} 写的 PyTorch 实现，用同样的输入逐层重算，检查 fork 的每一步。
+  \item[nsys] NVIDIA Nsight Systems，记录 GPU 内核、拷贝和 CUDA 调用的时间线，用来剖析每个 token 的时间花在哪。
+  \item[stressapptest] Google 的内存压力测试工具，反复读写大块内存并校验，用来确认内存提频后没有错误。
+\end{description}
+
+\subsection*{硬件与系统}
+\begin{description}\small
+  \item[PCIe 5.0 x8、Gen3/4/5] 显卡和主机之间的链路：第几代决定每条通道的速率，x8 是 8 条通道。Gen5 x8 实测约 28.9 GB/s；开机时链路训练失败会降到 Gen4 或 Gen3。
+  \item[P2P] 两张显卡之间直接拷贝，本机经过 CPU 转发，单向约 27.7 GB/s。
+  \item[MT/s、双通道] 内存每秒传输次数和通道数，两者决定理论带宽：双通道 3600 MT/s 约 57.6 GB/s，5200 MT/s 约 83.2 GB/s。
+  \item[2DPC、双 rank] 每个内存通道插两条内存；每条内存有两组可以分别寻址的芯片。两者都会让内存控制器难以跑高频率。
+  \item[EXPO、XMP] 存在内存条 SPD 芯片里的超频配置（频率、时序、电压），BIOS 可以一键载入；EXPO 是 AMD 的，XMP 是 Intel 的。
+  \item[UCLK] 内存控制器的时钟。和内存时钟 1:1 同频时延迟最低、带宽最好；1:2 时控制器只跑内存时钟的一半，延迟更高，实际带宽也会打折扣。
+  \item[页缓存、mmap、MADV\_WILLNEED] Linux 把读过的文件内容留在内存里（页缓存）；mmap 把文件映射到内存地址，访问时按需读入；\code{MADV\_WILLNEED} 提前告诉内核哪些页马上要用，让它预读。
+  \item[Max-Q] RTX PRO 6000 的 300 W 版本，功耗上限低于 600 W 的工作站版。
+  \item[Codex、MCP] Codex 是 OpenAI 的编程智能体命令行工具，本报告用它作为实际负载的客户端；MCP（Model Context Protocol）是给智能体接入外部工具的协议。
+\end{description}
 
 \end{document}
