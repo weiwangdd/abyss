@@ -1864,6 +1864,29 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+
+                // abyss: a memory that goes back only to a checkpoint keeps the newest checkpoint within the common
+                // prefix, which can be far less than the prefix. The newest checkpoint of the slot marks how far its
+                // last prompt reached; the slot is saved when the task keeps clearly less, for example a conversation
+                // taken over by a request that shares only its first part (an agent's review of its own turn).
+                // ABYSS_SLOT_SAVE_LOST=N tokens kept fewer (default 2048, 0 = off)
+                static const int64_t slot_save_lost = [] {
+                    const char * e = getenv("ABYSS_SLOT_SAVE_LOST");
+                    return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 2048;
+                }();
+                const int window = server_prompt_cache::ckpt_window(ctx_tgt);
+                if (slot_save_lost > 0 && !update_cache && prompt_cache && window >= 0 && !ret->prompt.checkpoints.empty()) {
+                    int64_t held = 0;
+                    for (const auto & ckpt : ret->prompt.checkpoints) {
+                        held = std::max(held, ckpt.n_tokens);
+                    }
+                    const int usable = server_prompt_cache::n_usable(ret->prompt, task.tokens, window);
+                    if (held - usable >= slot_save_lost) {
+                        SLT_INF(*ret, "the task keeps %d tokens of a prompt that reached %" PRId64 ": saving it in the prompt cache\n",
+                                usable, held);
+                        update_cache = true;
+                    }
+                }
             }
         }
 
@@ -2742,12 +2765,20 @@ private:
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+        // abyss: ABYSS_CKPT_THIN_STEP=N spaces the kept checkpoints N tokens apart instead of --checkpoint-min-step,
+        // which also sets how often a long prompt is split for a checkpoint. A large split step speeds up a first
+        // prefill; thinned that far, a conversation that diverges from the slot past its start goes back that far
+        static const int64_t ckpt_thin_step = [] {
+            const char * e = getenv("ABYSS_CKPT_THIN_STEP");
+            return e != nullptr ? std::max<int64_t>(0, atoll(e)) : -1;
+        }();
+        const int64_t thin_step = ckpt_thin_step >= 0 ? ckpt_thin_step : params_base.checkpoint_min_step;
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + thin_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
