@@ -894,6 +894,12 @@ ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il, int64_t n_tokens) const {
     return pimpl->get_cpu_map(il, n_tokens);
 }
 
+void llama_moe_cache::small_counts(size_t & hits, size_t & uploaded, size_t & cpu) const {
+    hits     = pimpl->stats_small.hits;
+    uploaded = pimpl->stats_small.misses - pimpl->stats_small.cpu;
+    cpu      = pimpl->stats_small.cpu;
+}
+
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
 }

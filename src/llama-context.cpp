@@ -23,6 +23,8 @@
 #include <string>
 #include <unordered_map>
 
+#include <sys/resource.h>
+
 //
 // llama_context
 //
@@ -2159,6 +2161,39 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+llama_context::decode_stats_counts llama_context::decode_stats_now() const {
+    decode_stats_counts c;
+    c.t_us = ggml_time_us();
+    if (moe_cache) {
+        moe_cache->small_counts(c.hits, c.up, c.cpu);
+    }
+    rusage ru = {};
+    getrusage(RUSAGE_SELF, &ru);
+    c.majflt = ru.ru_majflt;
+    return c;
+}
+
+void llama_context::decode_stats_add(const decode_stats_counts & start, int32_t every) {
+    const decode_stats_counts end = decode_stats_now();
+    auto & w = decode_stats;
+    w.t_us   += end.t_us   - start.t_us;
+    w.hits   += end.hits   - start.hits;
+    w.up     += end.up     - start.up;
+    w.cpu    += end.cpu    - start.cpu;
+    w.majflt += end.majflt - start.majflt;
+    if (++decode_stats_n < every) {
+        return;
+    }
+    const double n    = decode_stats_n;
+    const double used = (double) (w.hits + w.up + w.cpu);
+    // the server does not show info logs of the library
+    fprintf(stderr, "abyss: decode stats, %d tokens: %.1f ms/token, expert cache hit rate %.1f%%, per token %.1f hits, "
+        "%.1f uploaded, %.1f by the CPU, %.1f major page faults\n", decode_stats_n, w.t_us/1000.0/n,
+        used > 0 ? 100.0*w.hits/used : 0.0, w.hits/n, w.up/n, w.cpu/n, w.majflt/n);
+    w = {};
+    decode_stats_n = 0;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2169,6 +2204,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // abyss: ABYSS_DECODE_STATS=N prints, every N single-token decodes, their time per token, what the expert cache did
+    // per token and the process's major page faults per token: Engram rows read from disk, the tables being mmapped
+    static const int32_t decode_stats_every = [] {
+        const char * e = getenv("ABYSS_DECODE_STATS");
+        return e != nullptr ? std::max(0, atoi(e)) : 0;
+    }();
+    struct decode_stats_scope {
+        llama_context * ctx;
+        decode_stats_counts start;
+        ~decode_stats_scope() {
+            if (ctx) {
+                ctx->decode_stats_add(start, decode_stats_every);
+            }
+        }
+    } decode_stats_guard { decode_stats_every > 0 && batch_inp.tokens.size() == 1 ? this : nullptr,
+                           decode_stats_every > 0 && batch_inp.tokens.size() == 1 ? decode_stats_now() : decode_stats_counts{} };
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",

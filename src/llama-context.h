@@ -350,6 +350,19 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
+    // abyss: ABYSS_DECODE_STATS, sums over the window of single-token decodes being counted, see decode()
+    struct decode_stats_counts {
+        int64_t t_us   = 0;
+        size_t  hits   = 0; // experts read from the cache, uploaded into it, computed by the CPU
+        size_t  up     = 0;
+        size_t  cpu    = 0;
+        long    majflt = 0; // major page faults of the process
+    };
+    decode_stats_counts decode_stats_now() const;
+    void decode_stats_add(const decode_stats_counts & start, int32_t every);
+    decode_stats_counts decode_stats;
+    int32_t decode_stats_n = 0;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 

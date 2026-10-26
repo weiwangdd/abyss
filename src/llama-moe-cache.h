@@ -31,6 +31,10 @@ public:
     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
+    // abyss: what the ubatches of up to 8 tokens did so far: selected experts found in the cache, uploaded to it and
+    // computed by the CPU
+    void small_counts(size_t & hits, size_t & uploaded, size_t & cpu) const;
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
