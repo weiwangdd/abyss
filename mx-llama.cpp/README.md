@@ -6,7 +6,7 @@
 |---|---|
 | `abyss-expert-stats.{h,cpp}` + `0001-hook-expert-stats.patch` | `llama-server` 的专家命中统计 |
 | `0002-deepseek-v41-dsml-tags.patch` | 解析 V4.1 的工具调用标签（`<｜DSML｜ calls>` 等，标签名带前导空格） |
-| `deepseek-v4.1.jinja` | V4.1 对话模板：GGUF 内嵌的是 V4 的模板，工具调用标签是 V4 写法 |
+| `deepseek-v4.1.jinja` | V4.1 对话模板，按官方 `encoding/encoding.py` 逐字对齐：GGUF 内嵌的是 V4 的模板，工具调用标签是 V4 写法，也没有 `<｜System｜>` 和思考强度行 |
 | `0003-ced-prefill.patch` | CED 感知预填充：解码器层只对后面的 token 还能通过滑动窗口看到的那些 token 算 FFN（`ABYSS_CED_PREFILL=1`） |
 | `0004-engram-prefetch.patch` | Engram 预取：`llama_decode` 拿到整批后，后台线程按哈希算出的行号对表做 `MADV_WILLNEED`（`ABYSS_ENGRAM_PREFETCH=<线程数>`） |
 | `0005-ced-attention.patch` | CED 感知预填充第二步：解码器层的注意力也只对同一子集的 token 计算查询，KV 照常全部写入 |
@@ -20,6 +20,8 @@
 | `0013-sched-reserve-size-reset.patch` | 修 `ggml_backend_sched_reserve_size`：它在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端，按错误的切分估算计算缓冲区 |
 | `0014-moe-big-split.patch` | 专家缓存覆盖的层在大批次（超过 32 个 token）时，按规划把专家分成两路同时计算：分到 token 少的交给 CPU（紧凑批次），其余照常上传到 GPU0（`ABYSS_MOE_BIG_SPLIT=1`） |
 | `0015-prefill-tail-one-pass.patch` | 提示词末段尽量一遍算完：server 不再在最后 T 个 token 里按用户消息开头和「末尾前 4 + n_ubatch」拆调用（`ABYSS_CKPT_TAIL_MERGE=T`，生产用 2700；末尾前 4 个 token 的检查点和第一个检查点照旧）；一次调用的余数放进第一个 ubatch，最后一个 ubatch 是满的（`ABYSS_CED_ALIGN=1`）；CED 末尾的余量默认等于 `n_rs_seq`（没开 DSpark 时是 0），`ABYSS_CED_MARGIN` 仍可覆盖 |
+| `0016-decode-stats.patch` | 解码统计：`ABYSS_DECODE_STATS=N` 时每 N 次单 token 解码打印一行，含每 token 耗时、专家缓存命中率、每 token 的命中、上传和 CPU 计算的专家数，以及每 token 的磁盘缺页次数（Engram 表是 mmap 的，冷读就是缺页）；只统计解码调用本身，不含两次请求之间的预填充 |
+| `0017-slot-save-thin-checkpoints.patch` | 槽位被只共享开头一段的请求占用前先存进内存缓存：DSV4 只能退回检查点，新请求按检查点能保留的比槽位上次提示词（最新检查点）少 `ABYSS_SLOT_SAVE_LOST` 个 token 以上时先存（默认 2048，0 = 关）；原来只按共同前缀算，保留不到一半才存。检查点列表满时按 `ABYSS_CKPT_THIN_STEP` 的间距删减（不设时同 `--checkpoint-min-step`），和长提示词拆分建检查点的步长分开 |
 
 ## 安装
 
@@ -34,7 +36,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0009-moe-cpu-miss.patch <abyss>/mx-llama.cpp/0010-fix-ced-inputs-m2-small-batches.patch \
   <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch \
   <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch \
-  <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch
+  <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch <abyss>/mx-llama.cpp/0016-decode-stats.patch \
+  <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选
@@ -44,11 +47,16 @@ cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选
 
 ```bash
 ABYSS_EXPERT_STATS=~/expert-stats.json llama-server ... -np 1 \
-  --jinja --chat-template-file <abyss>/mx-llama.cpp/deepseek-v4.1.jinja
+  --jinja --chat-template-file <abyss>/mx-llama.cpp/deepseek-v4.1.jinja --no-reasoning-preserve \
+  --temp 1.0 --top-p 0.95 --top-k 0 --min-p 0
 python3 tools/expert_hotness.py ~/expert-stats.json
 ```
 
 - 工具调用必须同时用 `0002` 补丁和 `deepseek-v4.1.jinja`：解析器只在模板里出现 `' calls>` 时才按 V4.1 标签解析。
+- 模板和官方编码的对拍用 `tools/eval/template_check.py`（10 组对话：system、developer、工具定义、工具调用和结果、多轮思考、思考强度），全部逐字一致。
+- `--no-reasoning-preserve`：llama.cpp 默认保留历史轮次的思考（把 `drop_thinking` 设成 false），官方在没有工具时只保留最后一条用户消息之后的思考；有工具时两者都保留。
+- 思考强度：请求的 `reasoning_effort` 取 low / high / max（官方，对应 50 / 75 / 100，默认 high）或 1–100 的整数；minimal / medium / xhigh 是自定义的 25 / 62 / 88。
+- 采样用官方推荐的 temperature 1.0、top_p 0.95；llama.cpp 默认是 0.8、top_k 40、min_p 0.05。请求里带的采样参数会覆盖默认值。
 - 不设 `ABYSS_EXPERT_STATS` 时不挂回调，行为和原版一致。
 - 统计文件已存在时，启动后接着累加，不会覆盖。
 - 统计按 ubatch 的 token 数区分阶段：1 个 token 算解码，多个算预填充。要用 `-np 1`，否则多路并发的解码会被算成预填充。

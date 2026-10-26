@@ -1,0 +1,131 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1fa2129..edf9d78 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -26,6 +26,7 @@
+ #include <string>
+ #include <unordered_map>
+ 
++#include <sys/resource.h>
+ 
+ //
+ // llama_context
+@@ -2133,6 +2134,39 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
++llama_context::decode_stats_counts llama_context::decode_stats_now() const {
++    decode_stats_counts c;
++    c.t_us = ggml_time_us();
++    if (moe_cache) {
++        moe_cache->small_counts(c.hits, c.up, c.cpu);
++    }
++    rusage ru = {};
++    getrusage(RUSAGE_SELF, &ru);
++    c.majflt = ru.ru_majflt;
++    return c;
++}
++
++void llama_context::decode_stats_add(const decode_stats_counts & start, int32_t every) {
++    const decode_stats_counts end = decode_stats_now();
++    auto & w = decode_stats;
++    w.t_us   += end.t_us   - start.t_us;
++    w.hits   += end.hits   - start.hits;
++    w.up     += end.up     - start.up;
++    w.cpu    += end.cpu    - start.cpu;
++    w.majflt += end.majflt - start.majflt;
++    if (++decode_stats_n < every) {
++        return;
++    }
++    const double n    = decode_stats_n;
++    const double used = (double) (w.hits + w.up + w.cpu);
++    // the server does not show info logs of the library
++    fprintf(stderr, "abyss: decode stats, %d tokens: %.1f ms/token, expert cache hit rate %.1f%%, per token %.1f hits, "
++        "%.1f uploaded, %.1f by the CPU, %.1f major page faults\n", decode_stats_n, w.t_us/1000.0/n,
++        used > 0 ? 100.0*w.hits/used : 0.0, w.hits/n, w.up/n, w.cpu/n, w.majflt/n);
++    w = {};
++    decode_stats_n = 0;
++}
++
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+@@ -2144,6 +2178,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         return -1;
+     }
+ 
++    // abyss: ABYSS_DECODE_STATS=N prints, every N single-token decodes, their time per token, what the expert cache did
++    // per token and the process's major page faults per token: Engram rows read from disk, the tables being mmapped
++    static const int32_t decode_stats_every = [] {
++        const char * e = getenv("ABYSS_DECODE_STATS");
++        return e != nullptr ? std::max(0, atoi(e)) : 0;
++    }();
++    struct decode_stats_scope {
++        llama_context * ctx;
++        decode_stats_counts start;
++        ~decode_stats_scope() {
++            if (ctx) {
++                ctx->decode_stats_add(start, decode_stats_every);
++            }
++        }
++    } decode_stats_guard { decode_stats_every > 0 && batch_inp.tokens.size() == 1 ? this : nullptr,
++                           decode_stats_every > 0 && batch_inp.tokens.size() == 1 ? decode_stats_now() : decode_stats_counts{} };
++
+     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
+                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index fc5edbc..5a7f66a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -337,6 +337,19 @@ private:
+     llama_memory_ptr memory;
+     llama_moe_cache_ptr moe_cache;
+ 
++    // abyss: ABYSS_DECODE_STATS, sums over the window of single-token decodes being counted, see decode()
++    struct decode_stats_counts {
++        int64_t t_us   = 0;
++        size_t  hits   = 0; // experts read from the cache, uploaded into it, computed by the CPU
++        size_t  up     = 0;
++        size_t  cpu    = 0;
++        long    majflt = 0; // major page faults of the process
++    };
++    decode_stats_counts decode_stats_now() const;
++    void decode_stats_add(const decode_stats_counts & start, int32_t every);
++    decode_stats_counts decode_stats;
++    int32_t decode_stats_n = 0;
++
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index db740a6..7b6af32 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -918,6 +918,12 @@ bool llama_moe_cache::cpu_misses() const {
+     return pimpl->split;
+ }
+ 
++void llama_moe_cache::small_counts(size_t & hits, size_t & uploaded, size_t & cpu) const {
++    hits     = pimpl->stats_small.hits;
++    uploaded = pimpl->stats_small.misses;
++    cpu      = pimpl->stats_small.cpu;
++}
++
+ bool llama_moe_cache::big_split(int32_t il, int64_t n_tokens) const {
+     return pimpl->big_split(il, n_tokens);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 18b51aa..93dd15a 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -29,6 +29,9 @@ public:
+     // abyss: with ABYSS_MOE_CPU_MISS=1 small batches split their misses between uploads and the CPU, see build_plan
+     bool cpu_misses() const;
+ 
++    // abyss: the experts of batches of up to 8 tokens so far: read from the cache, uploaded into it, computed by the CPU
++    void small_counts(size_t & hits, size_t & uploaded, size_t & cpu) const;
++
+     // a CPU op that plans layer il for the selected experts ids (I32, contiguous). Its I32 result holds, for each id, the
+     // slot the device reads (the zero slot for the experts the CPU computes), followed by the expert the CPU computes (-1
+     // for the others). The misses it admits to the cache are uploaded before it returns, asynchronously, so the CPU
