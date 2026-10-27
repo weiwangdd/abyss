@@ -26,6 +26,7 @@
 \usepackage{subcaption}
 \usepackage{tikz}
 \usepackage{pgfplots}
+\usetikzlibrary{positioning,arrows.meta,calc}
 \pgfplotsset{compat=1.18}
 \usepackage{hyperref}
 \hypersetup{colorlinks=true,linkcolor=dsblue,citecolor=dsblue,urlcolor=dsblue}
@@ -274,6 +275,101 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
   \end{tabularx}
 \end{table}
 
+图~\ref{fig:roles} 把放置和运行时的分工画在一起。解码时两张卡串行：GPU0 只算前 12 层，每 token 约 4 ms；GPU1 算其余 28 层和输出层，还要等未命中的专家从内存上传，是解码的瓶颈，CPU 同时分担一半未命中的专家。预填充时编码器层的全部 token 都在显存里算，解码器层只算提示词末尾还用得到的 token；第 22--39 层的大批次专家沿用 fork 的做法上传到 GPU0 计算，分到 token 少的专家由 CPU 同时算（\S\ref{sec:bigsplit}）。
+
+\begin{figure}[tp]
+  \centering
+  \tikzset{
+    every node/.style={font=\footnotesize},
+    dev/.style={draw, rounded corners=2pt, align=left, inner sep=4pt},
+    stage/.style={draw, rounded corners=2pt, align=center, inner sep=3pt, minimum height=1.25cm},
+    gpu0/.style={fill=dsblue!10, draw=dsblue},
+    gpu1/.style={fill=dsviolet!12, draw=dsviolet},
+    host/.style={fill=dsorange!12, draw=dsorange},
+    disk/.style={fill=dsgray!25, draw=dsgray!70!black},
+    link/.style={{Latex[length=1.6mm]}-{Latex[length=1.6mm]}, line width=0.6pt, dsdark},
+    flow/.style={-{Latex[length=1.8mm]}, line width=0.7pt, dsdark},
+    lab/.style={font=\scriptsize, fill=white, inner sep=1.2pt, align=center},
+  }
+  \begin{subfigure}{\textwidth}
+    \centering
+    \begin{tikzpicture}
+      \node[dev, gpu0, text width=6.7cm, anchor=north west] (g0) at (0,0) {%
+        \textbf{GPU0}\quad 95.6 GiB，用 91.7 GiB\\[2pt]
+        · 第 0--11 层整层及其 KV（专家 80.6 GiB）\\
+        · 预填充：第 22--39 层专家的上传暂存区};
+      \node[dev, gpu1, text width=6.7cm, anchor=north east] (g1) at (15.5,0) {%
+        \textbf{GPU1}\quad 95.6 GiB，用 94.4 GiB\\[2pt]
+        · 第 12--39 层的稠密部分、输出层及其 KV\\
+        · 第 12--21 层专家（67.2 GiB）\\
+        · 第 22--39 层的专家缓存 14 GB，约 780 槽\\
+        · 计算缓冲区约 6.1 GiB（主要是索引器）};
+      \node[dev, host, text width=10.9cm, anchor=north west] (host) at ($(g0.south west |- g1.south)+(0,-1.25)$) {%
+        \textbf{主机}\quad Ryzen 9 9950X（16 核），DDR5-5200 双通道 192 GB\\[2pt]
+        · 内存：第 22--39 层专家 121 GiB（锁页），Engram 表的页缓存\\
+        · CPU 解码：算一半未命中的专家（\code{0009}）\\
+        · CPU 预填充：算分到 token 少的专家（\code{0014}）\\
+        · CPU 其他：Engram 取行和预取（\code{0004}），采样};
+      \node[dev, disk, text width=2.9cm, anchor=north east] (nvme) at ($(g1.south east)+(0,-1.25)$) {%
+        \textbf{NVMe}\\[2pt]
+        两张 Engram 表\\
+        MXFP4，97.3 GiB};
+      \draw[link] (g0.south) -- (g0.south |- host.north) node[lab, pos=0.62] {PCIe 5.0 x8\\28.9 GB/s};
+      \coordinate (a) at ($(g1.south west)+(1.6,0)$);
+      \draw[link] (a) -- (a |- host.north) node[lab, midway] {PCIe 5.0 x8\\28.9 GB/s};
+      \draw[link] (g0.north east |- 0,-1.0) -- (g1.north west |- 0,-1.0) node[lab, midway, above=2pt] {P2P\\27.7 GB/s};
+      \draw[link] (nvme.west) -- (host.east |- nvme.west) node[lab, midway, above=2pt] {mmap};
+    \end{tikzpicture}
+    \caption{放置与链路（12.8 万上下文的配置）}
+  \end{subfigure}
+
+  \vspace{0.9em}
+  \begin{subfigure}{\textwidth}
+    \centering
+    \begin{tikzpicture}[node distance=0.55cm]
+      \node[stage, gpu0, text width=2.0cm] (d1) {GPU0\\第 0--11 层};
+      \node[stage, gpu1, text width=2.0cm, right=of d1] (d2) {GPU1\\第 12--21 层};
+      \node[stage, gpu1, text width=3.9cm, right=of d2] (d3) {GPU1\quad 第 22--39 层\\注意力、路由，\\命中缓存的专家（约 75\%）};
+      \node[stage, gpu1, text width=1.4cm, right=of d3] (d4) {GPU1\\输出层};
+      \node[stage, host, text width=1.2cm, right=of d4] (d5) {CPU\\采样};
+      \draw[flow] (d1) -- (d2);
+      \draw[flow] (d2) -- (d3);
+      \draw[flow] (d3) -- (d4);
+      \draw[flow] (d4) -- (d5);
+      \node[stage, gpu1, dashed, text width=4.4cm, minimum height=0.9cm] (up) at ($(d3.south)+(-2.5,-1.3)$) {未命中的一半：经 PCIe 上传\\进缓存，在 GPU1 上算};
+      \node[stage, host, text width=3.4cm, minimum height=0.9cm] (cpu) at ($(d3.south)+(2.4,-1.3)$) {另一半：CPU 直接算，\\与上传同时（\code{0009}）};
+      \draw[link] ([xshift=-5mm]d3.south) -- (up.north);
+      \draw[link] ([xshift=5mm]d3.south) -- (cpu.north);
+      \coordinate (loop) at ($(up.south)+(0,-0.4)$);
+      \draw[flow] (d5.south) -- (d5.south |- loop) -| (d1.south) node[lab, pos=0.2] {下一个 token};
+    \end{tikzpicture}
+    \caption{解码一个 token：两张卡串行}
+  \end{subfigure}
+
+  \vspace{0.9em}
+  \begin{subfigure}{\textwidth}
+    \centering
+    \begin{tikzpicture}[node distance=0.55cm]
+      \node[stage, gpu0, text width=2.2cm] (p1) {GPU0\\第 0--11 层\\全部 token};
+      \node[stage, gpu1, text width=2.2cm, right=of p1] (p2) {GPU1\\第 12--19 层\\全部 token};
+      \node[stage, gpu1, text width=5.4cm, right=of p2] (p3) {GPU1\quad 第 20--39 层\\KV 全部写入；注意力和 FFN\\只算末尾还用得到的 token（CED）};
+      \draw[flow] (p1) -- (p2);
+      \draw[flow] (p2) -- (p3);
+      \node[stage, gpu0, text width=3.7cm, minimum height=0.9cm] (pu) at ($(p3.south)+(-2.0,-1.35)$) {token 多的专家：从内存\\上传到 GPU0 算};
+      \node[stage, host, text width=2.8cm, minimum height=0.9cm] (pc) at ($(p3.south)+(2.4,-1.35)$) {token 少的专家：\\CPU 紧凑批次};
+      \draw[link] ([xshift=-5mm]p3.south) -- (pu.north);
+      \draw[link] ([xshift=5mm]p3.south) -- (pc.north);
+      \node[font=\scriptsize, anchor=north west] at ($(pu.south west)+(0,-0.15)$) {第 22--39 层、超过 32 个 token 的批次：两边同时算（\code{0014}）};
+      \node[stage, disk, text width=3.7cm, minimum height=0.9cm] (eng) at ($(p1.south)!0.5!(p2.south)+(0,-1.55)$) {Engram（第 1、14 层）\\CPU 按 n-gram 哈希\\预取 NVMe 上的行（\code{0004}）};
+      \draw[flow, dashed] (eng.north -| p1.south) -- (p1.south);
+      \draw[flow, dashed] (eng.north -| p2.south) -- (p2.south);
+    \end{tikzpicture}
+    \caption{一次预填充调用}
+  \end{subfigure}
+  \caption{方案 B 中 GPU0、GPU1 和主机的分工。蓝色是 GPU0，紫色是 GPU1，橙色是 CPU 和内存，灰色是 NVMe；两卡之间没有 NVLink，P2P 经 CPU 转发。(b) 中两张卡串行，9.6 万上下文时每 token 约 37 ms：上传未命中专家 14.5 ms、GPU1 内核 10.5 ms、GPU0 内核 4.2 ms、两卡都空闲 7.9 ms（表~\ref{tab:realdecode}）。(c) 中编码器层算全部 token，解码器层只算末尾子集（\S\ref{sec:ced}）。}
+  \label{fig:roles}
+\end{figure}
+
 % ---------------------------------------------------------------- 3
 \section{评估方法}
 
@@ -423,6 +519,7 @@ Codex 的实际会话（上下文约 10 万 token）解码只有 30--31 \tps{}�
 原版对提示词也跑完 40 层：每个 2,048 token 的 ubatch 都要把主机内存里 121 GiB 的解码器专家读一遍。4.8 万 token 的提示词因此要 135 s（约 355 \tps{}）。
 
 \subsection{CED 感知预填充}
+\label{sec:ced}
 
 官方参考实现对提示词也跑满 40 层，CED 体现在 KV 的共享方式上：解码器层只有滑动窗口用到各层自己的隐状态。因此可以精确地裁剪：第 0--19 层全部 token 都算；第 39 层只算最后一个 token；第 $L$ 层（20--38）只需算最后 $128 + 127 \times (38-L)$ 个 token——每往前一层，滑动窗口让依赖往前延伸 127 个 token。实现原本在末尾多留 256 个位置，给投机解码的回退用；没开 DSpark 时 DSV4 不能部分回退，后来改为默认不留（\S\ref{sec:tailmerge}）。这样解码器层合计约 2.4 万个「token × 层」，与提示词长度无关；4.8 万 token 的提示词在原版中是 $20 \times 48{,}240 \approx 96$ 万个（图~\ref{fig:ced}）。
 
@@ -499,6 +596,7 @@ fork 原本对 V4.1 的压缩 KV 做稠密注意力。压缩行在 512 以内时
 \end{table}
 
 \subsection{大批次分流}
+\label{sec:bigsplit}
 
 多轮会话里每轮新增的 token 不多，但只要批次超过 32 个 token，第 22--39 层几乎全部 384 个专家都会被用到，调度器把这些大批次的专家矩阵乘卸载到 GPU0，每层整批上传。一轮 1,610 token 的预填充（7.0 s）中，GPU0 上传 145 GiB 用了 5.4 s，而 CPU、GPU1 的链路和专家缓存都闲着。这部分的下限是把这些专家从内存读一遍，约 3 s。
 
