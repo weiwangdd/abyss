@@ -1,12 +1,14 @@
 #!/bin/bash
-# Context sizes beyond 128K (ctx_size.py). For each configuration NAME:CTX:MOE_CACHE_MIB:UBATCH in CONFIGS, a server
+# Context sizes beyond 128K (ctx_size.py; MODEL and PORT override the model and the port). For each configuration NAME:CTX:MOE_CACHE_MIB:UBATCH in CONFIGS, a server
 # with the production settings: the memory after loading and the peak while it runs a 96k-token prompt (its outputs
 # must match across the configurations) and a prompt filling the context (a passphrase at the start, asked about at
 # the end; prefill and decode speed at that context). Each fill length in FILLCMP that fits is run again on the larger
 # configurations, so outputs past 128K are compared too.
 O=${OUT:-$HOME/abyss-eval}
 B=${BUILD:-$HOME/src/mx-llama.cpp/build-m2/bin}
-M=$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf
+M=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf}
+PORT=${PORT:-8080}  # another port keeps clients of the production server out of the measurement
+export CTX_URL=http://127.0.0.1:$PORT
 E=$(cd "$(dirname "$0")" && pwd)
 CONFIGS=${CONFIGS:-"c128:131072:14000:2048 c192:196608:14000:2048 c256:262144:14000:2048"}
 FILLCMP=${FILLCMP:-196608}
@@ -26,7 +28,7 @@ start() {  # context, expert cache MiB, ubatch
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' \
     -c "$1" -b 65536 -ub "$3" -np 1 --moe-cache-mib "$2" --checkpoint-min-step 32768 \
     --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" --no-reasoning-preserve \
-    --host 127.0.0.1 --port 8080 > "$log" 2>&1 &
+    --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 &
   pid=$!
   until grep -q "listening on" "$log"; do
     if ! kill -0 $pid 2>/dev/null; then

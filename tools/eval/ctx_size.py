@@ -11,11 +11,12 @@
 
 import json
 import math
+import os
 import sys
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8080"
+URL = os.environ.get("CTX_URL", "http://127.0.0.1:8080")
 PASS = "青石桥 7429"
 NEEDLE = f"开始之前先记住一件事：通行暗号是「{PASS}」。下面是一份很长的材料。"
 QUESTION = "材料最开头提到的通行暗号是什么？只回答暗号本身。"
