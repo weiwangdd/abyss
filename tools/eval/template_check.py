@@ -13,15 +13,22 @@ template maps them to.
 
 import copy
 import difflib
+import importlib
 import json
 import sys
 import urllib.request
 
-sys.path.insert(0, sys.argv[1])
-import encoding_dsv41 as enc  # noqa: E402
-
-URL = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8099"
+enc = None  # the official encoder, see load()
+URL = "http://127.0.0.1:8099"
 EFFORT = {"minimal": 25, "medium": 62, "xhigh": 88}
+
+
+def load(encoder_dir):
+    """Import encoding_dsv41.py (the official encoding/encoding.py) from encoder_dir."""
+    global enc
+    sys.path.insert(0, encoder_dir)
+    enc = importlib.import_module("encoding_dsv41")
+    return enc
 
 TOOLS = [
     {"type": "function", "function": {"name": "read_file", "description": "Read a file",
@@ -89,7 +96,8 @@ CASES = [
 ]
 
 
-def official(messages, tools, thinking, effort):
+def official_args(messages, tools, thinking, effort):
+    """The official encoder's messages and keyword arguments for a case."""
     msgs = copy.deepcopy(messages)
     for m in msgs:
         if m["role"] == "developer":
@@ -101,22 +109,37 @@ def official(messages, tools, thinking, effort):
     if isinstance(effort, str) and effort.isdigit():
         effort = int(effort)
     effort = EFFORT.get(effort, effort)
-    out = enc.encode_messages(msgs, thinking_mode="thinking" if thinking else "chat", reasoning_effort=effort)
+    return msgs, {"thinking_mode": "thinking" if thinking else "chat", "reasoning_effort": effort}
+
+
+def official(messages, tools, thinking, effort):
+    msgs, kwargs = official_args(messages, tools, thinking, effort)
+    out = enc.encode_messages(msgs, **kwargs)
     return out[len(enc.bos_token):] if out.startswith(enc.bos_token) else out
 
 
-def served(messages, tools, thinking, effort):
+def request_body(messages, tools, thinking, effort):
+    """The chat request for a case, as a client sends it."""
     body = {"messages": messages, "chat_template_kwargs": {"enable_thinking": thinking}}
     if tools:
         body["tools"] = tools
     if effort is not None:
         body["reasoning_effort"] = effort
+    return body
+
+
+def served(messages, tools, thinking, effort):
+    body = request_body(messages, tools, thinking, effort)
     req = urllib.request.Request(URL + "/apply-template", json.dumps(body).encode(), {"Content-Type": "application/json"})
     out = json.load(urllib.request.urlopen(req, timeout=30))["prompt"]
     return out[len("<s>"):] if out.startswith("<s>") else out
 
 
 def main():
+    global URL
+    load(sys.argv[1])
+    if len(sys.argv) > 2:
+        URL = sys.argv[2]
     bad = 0
     for name, messages, tools, thinking, effort in CASES:
         a, b = official(messages, tools, thinking, effort), served(messages, tools, thinking, effort)

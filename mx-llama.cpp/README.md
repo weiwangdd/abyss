@@ -22,6 +22,7 @@
 | `0015-prefill-tail-one-pass.patch` | 提示词末段尽量一遍算完：server 不再在最后 T 个 token 里按用户消息开头和「末尾前 4 + n_ubatch」拆调用（`ABYSS_CKPT_TAIL_MERGE=T`，生产用 2700；末尾前 4 个 token 的检查点和第一个检查点照旧）；一次调用的余数放进第一个 ubatch，最后一个 ubatch 是满的（`ABYSS_CED_ALIGN=1`）；CED 末尾的余量默认等于 `n_rs_seq`（没开 DSpark 时是 0），`ABYSS_CED_MARGIN` 仍可覆盖 |
 | `0016-decode-stats.patch` | 解码统计：`ABYSS_DECODE_STATS=N` 时每 N 次单 token 解码打印一行，含每 token 耗时、专家缓存命中率、每 token 的命中、上传和 CPU 计算的专家数，以及每 token 的磁盘缺页次数（Engram 表是 mmap 的，冷读就是缺页）；只统计解码调用本身，不含两次请求之间的预填充 |
 | `0017-slot-save-thin-checkpoints.patch` | 槽位被只共享开头一段的请求占用前先存进内存缓存：DSV4 只能退回检查点，新请求按检查点能保留的比槽位上次提示词（最新检查点）少 `ABYSS_SLOT_SAVE_LOST` 个 token 以上时先存（默认 2048，0 = 关）；原来只按共同前缀算，保留不到一半才存。检查点列表满时按 `ABYSS_CKPT_THIN_STEP` 的间距删减（不设时同 `--checkpoint-min-step`），和长提示词拆分建检查点的步长分开 |
+| `0018-plain-request-text.patch` | 对话提示词按官方 DeepSeek Recipe 的方式编码（`ABYSS_PLAIN_INPUT=1`）：只有模板自己写的控制 token 按 ID 编码，来自请求的文字（消息、思考、工具调用和结果、工具定义）只用基础词表编码，里面出现的 `<｜User｜>`、`</think>`、`｜DSML｜` 等字样都是普通文字。原来整段提示词按「识别特殊 token」编码，`<think>`、`</think>`、`｜DSML｜` 在 GGUF 里是 user-defined 类型，关掉识别也照样匹配。Jinja 引擎本来就标记每段字符串是否来自请求，补丁补上 `tojson`、数组 `join` 的标记传递，BOS/EOS 改回模板文字，把渲染结果里来自请求的字节范围交给 server；`llama_tokenize_plain` 只用基础词表编码。另有 `llama-abyss-chat-tokens`：只读词表，打印 server 对一组请求生成的提示词、模板的控制 token 和两种编码结果 |
 
 ## 安装
 
@@ -37,10 +38,10 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch \
   <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch \
   <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch <abyss>/mx-llama.cpp/0016-decode-stats.patch \
-  <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch
+  <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
-cmake --build build -j --target llama-abyss-dump   # 对拍工具，可选
+cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
 ```
 
 ## 使用
@@ -54,6 +55,7 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 
 - 工具调用必须同时用 `0002` 补丁和 `deepseek-v4.1.jinja`：解析器只在模板里出现 `' calls>` 时才按 V4.1 标签解析。
 - 模板和官方编码的对拍用 `tools/eval/template_check.py`（10 组对话：system、developer、工具定义、工具调用和结果、多轮思考、思考强度），全部逐字一致。
+- `ABYSS_PLAIN_INPUT=1`（`0018`）：请求文字里的控制 token 字样不再变成控制 token。逐 token 对拍用 `tools/eval/special_check.py`：上面 10 组加 7 组把这类字样放在用户、system、工具结果、助手历史、字符串和对象参数、工具定义里的对话，参照是官方编码器（控制 token 常量加标记）加去掉 added token 的 HF 分词器，全部一致；不含这类字样时和原来的编码逐 token 相同。只对 DeepSeek V4 的模板生效，续写助手消息（prefill）的请求仍按原来的方式编码。
 - `--no-reasoning-preserve`：llama.cpp 默认保留历史轮次的思考（把 `drop_thinking` 设成 false），官方在没有工具时只保留最后一条用户消息之后的思考；有工具时两者都保留。
 - 思考强度：请求的 `reasoning_effort` 取 low / high / max（官方，对应 50 / 75 / 100，默认 high）或 1–100 的整数；minimal / medium / xhigh 是自定义的 25 / 62 / 88。
 - 采样用官方推荐的 temperature 1.0、top_p 0.95；llama.cpp 默认是 0.8、top_k 40、min_p 0.05。请求里带的采样参数会覆盖默认值。

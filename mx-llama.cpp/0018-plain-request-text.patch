@@ -1,0 +1,799 @@
+From a0692dc5ae5adbc5f2cc0b2b1cf150c76e19ca16 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Tue, 27 Oct 2026 21:02:37 +0100
+Subject: [PATCH] abyss: chat prompts encode the request text with the base
+ vocabulary, like the official DeepSeek Recipe (ABYSS_PLAIN_INPUT=1); only the
+ special tokens the template wrote are special; llama-abyss-chat-tokens prints
+ the prompts and tokens from the vocabulary alone
+
+---
+ common/chat.cpp                    | 135 ++++++++++++++++++++++++++++-
+ common/chat.h                      |  28 ++++++
+ common/common.cpp                  |  19 ++++
+ common/common.h                    |   6 ++
+ common/jinja/value.cpp             |  37 ++++++--
+ common/parsers/deepseek.cpp        |   5 +-
+ common/parsers/parsers.h           |   4 +-
+ include/llama.h                    |  10 +++
+ src/llama-vocab.cpp                |  35 +++++++-
+ src/llama-vocab.h                  |   3 +
+ tools/server/CMakeLists.txt        |  10 +++
+ tools/server/abyss-chat-tokens.cpp | 100 +++++++++++++++++++++
+ tools/server/server-common.cpp     |  37 ++++++++
+ tools/server/server-common.h       |   6 ++
+ tools/server/server-context.cpp    |  15 +++-
+ 15 files changed, 438 insertions(+), 12 deletions(-)
+ create mode 100644 tools/server/abyss-chat-tokens.cpp
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 87f1e99..420a688 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -17,6 +17,8 @@
+ #include "peg-parser.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <mutex>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <ctime>
+@@ -879,7 +881,8 @@ std::string common_chat_template_direct_apply_impl(
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override,
+     const std::optional<json> & tools_override,
+-    const std::optional<json> & additional_context) {
++    const std::optional<json> & additional_context,
++    std::vector<std::pair<size_t, size_t>> * input_ranges) {
+     jinja::context ctx(tmpl.source());
+ 
+     // messages_override is already built for this template, do not touch its content parts
+@@ -919,6 +922,8 @@ std::string common_chat_template_direct_apply_impl(
+     }
+ 
+     jinja::global_from_json(ctx, inp, inputs.mark_input);
++    // abyss: the BOS and EOS spellings are the template's own text, not the request's
++    jinja::global_from_json(ctx, json{{"bos_token", tmpl.bos_token()}, {"eos_token", tmpl.eos_token()}}, false);
+ 
+     // render
+     jinja::runtime runtime(ctx);
+@@ -927,13 +932,42 @@ std::string common_chat_template_direct_apply_impl(
+ 
+     std::string result = parts->as_string().str();
+ 
++    // abyss: where the request's text landed, for the prompt encoding
++    std::vector<std::pair<size_t, size_t>> ranges;
++    if (input_ranges) {
++        size_t pos = 0;
++        for (const auto & part : parts->val_str.parts) {
++            if (part.is_input && !part.val.empty()) {
++                ranges.emplace_back(pos, pos + part.val.size());
++            }
++            pos += part.val.size();
++        }
++    }
++    // keep the ranges within [begin, end) of the result, counted from begin
++    auto clip_ranges = [&](size_t begin, size_t end) {
++        std::vector<std::pair<size_t, size_t>> clipped;
++        for (const auto & [s, e] : ranges) {
++            const size_t cs = std::max(s, begin);
++            const size_t ce = std::min(e, end);
++            if (cs < ce) {
++                clipped.emplace_back(cs - begin, ce - begin);
++            }
++        }
++        ranges = std::move(clipped);
++    };
++
+     // TODO: improve this later
+     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
++        clip_ranges(tmpl.bos_token().size(), result.size());
+         result = result.substr(tmpl.bos_token().size());
+     }
+     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
++        clip_ranges(0, result.size() - tmpl.eos_token().size());
+         result = result.substr(0, result.size() - tmpl.eos_token().size());
+     }
++    if (input_ranges) {
++        *input_ranges = std::move(ranges);
++    }
+     return result;
+ }
+ 
+@@ -1627,6 +1661,99 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     return msg;
+ }
+ 
++// abyss: the spellings of the control and user-defined tokens (the ones llama_tokenize matches when it parses special
++// tokens), by first byte, longest first
++struct common_chat_special_spellings {
++    std::array<std::vector<std::pair<std::string, llama_token>>, 256> by_first;
++};
++
++static const common_chat_special_spellings & common_chat_get_special_spellings(const llama_vocab * vocab) {
++    static std::mutex mutex;
++    static std::map<const llama_vocab *, common_chat_special_spellings> cache;
++    std::lock_guard<std::mutex> lock(mutex);
++    auto it = cache.find(vocab);
++    if (it != cache.end()) {
++        return it->second;
++    }
++    common_chat_special_spellings sp;
++    const llama_token n_tokens = llama_vocab_n_tokens(vocab);
++    for (llama_token id = 0; id < n_tokens; id++) {
++        if (!(llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN))) {
++            continue;
++        }
++        std::string text = llama_vocab_get_text(vocab, id);
++        if (!text.empty()) {
++            sp.by_first[(unsigned char) text[0]].emplace_back(std::move(text), id);
++        }
++    }
++    for (auto & v : sp.by_first) {
++        std::stable_sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first.size() > b.first.size(); });
++    }
++    return cache.emplace(vocab, std::move(sp)).first->second;
++}
++
++// abyss: the special tokens in the template's own text, that is the prompt outside the request's ranges
++static std::vector<common_chat_prompt_special> common_chat_find_template_special(
++        const llama_vocab * vocab, const std::string & prompt, const std::vector<std::pair<size_t, size_t>> & input_ranges) {
++    const auto & sp = common_chat_get_special_spellings(vocab);
++    std::vector<common_chat_prompt_special> out;
++    auto scan = [&](size_t begin, size_t end) {
++        for (size_t pos = begin; pos < end;) {
++            bool found = false;
++            for (const auto & [text, id] : sp.by_first[(unsigned char) prompt[pos]]) {
++                if (text.size() <= end - pos && prompt.compare(pos, text.size(), text) == 0) {
++                    out.push_back({pos, pos + text.size(), id});
++                    pos += text.size();
++                    found = true;
++                    break;
++                }
++            }
++            if (!found) {
++                pos++;
++            }
++        }
++    };
++    size_t pos = 0;
++    for (const auto & [start, end] : input_ranges) {
++        scan(pos, start);
++        pos = end;
++    }
++    scan(pos, prompt.size());
++    return out;
++}
++
++std::vector<llama_token> common_chat_tokenize_prompt(
++        const llama_vocab *                             vocab,
++        const std::string &                             prompt,
++        const std::vector<common_chat_prompt_special> & special,
++        bool                                            add_special) {
++    std::vector<llama_token> out;
++    if (add_special && llama_vocab_get_add_bos(vocab)) {
++        out.push_back(llama_vocab_bos(vocab));
++    }
++    const llama_token n_tokens = llama_vocab_n_tokens(vocab);
++    size_t pos = 0;
++    auto add_plain = [&](size_t end) {
++        if (end > pos) {
++            const auto plain = common_tokenize_plain(vocab, prompt.substr(pos, end - pos));
++            out.insert(out.end(), plain.begin(), plain.end());
++        }
++    };
++    for (const auto & s : special) {
++        if (s.start < pos || s.end <= s.start || s.end > prompt.size() || s.token < 0 || s.token >= n_tokens) {
++            throw std::invalid_argument("invalid special token in the prompt");
++        }
++        add_plain(s.start);
++        out.push_back(s.token);
++        pos = s.end;
++    }
++    add_plain(prompt.size());
++    if (add_special && llama_vocab_get_add_eos(vocab)) {
++        out.push_back(llama_vocab_eos(vocab));
++    }
++    return out;
++}
++
+ common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
+                                          const llama_vocab *                  vocab,
+                                          const common_chat_templates_inputs & inputs,
+@@ -1661,6 +1788,12 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
+         grammar_triggers = std::move(resolved.grammar_triggers);
+ 
+         delimiters.tokenize(vocab);
++
++        // abyss: only the special tokens the template wrote are special, see common_chat_tokenize_prompt
++        if (applied.prompt_input_known) {
++            special       = common_chat_find_template_special(vocab, prompt_text, applied.prompt_input_ranges);
++            special_known = true;
++        }
+     } else {
+         grammar_triggers = std::move(applied.grammar_triggers);
+     }
+diff --git a/common/chat.h b/common/chat.h
+index 7753349..ca85727 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -287,6 +287,11 @@ struct common_chat_params {
+     std::vector<std::string>            additional_stops;
+     common_peg_arena                    parser;
+     common_chat_msg_delimiters          message_delimiters;
++
++    // abyss: the byte ranges of the prompt that came from the request (message content, reasoning, tool calls,
++    // results and definitions), tracked by the templates whose handler sets prompt_input_known
++    std::vector<std::pair<size_t, size_t>> prompt_input_ranges;
++    bool                                   prompt_input_known = false;
+ };
+ 
+ struct common_chat_input {
+@@ -366,6 +371,22 @@ const char *    common_chat_format_name(common_chat_format format);
+ common_chat_msg common_chat_parse(const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
+ common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
+ 
++// abyss: a special token the template itself wrote into the prompt, at bytes [start, end)
++struct common_chat_prompt_special {
++    size_t      start;
++    size_t      end;
++    llama_token token;
++};
++
++// abyss: tokenizes a rendered chat prompt the way the official DeepSeek Recipe encodes one: each special token the
++// template wrote as its id, all other text, including any special-token spelling that came from the request, with
++// the base vocabulary alone
++std::vector<llama_token> common_chat_tokenize_prompt(
++    const llama_vocab *                             vocab,
++    const std::string &                             prompt,
++    const std::vector<common_chat_prompt_special> & special,
++    bool                                            add_special);
++
+ struct common_chat_session_params {
+     bool echo  = false; // include the assistant prefill in the output when continuing a message
+     bool debug = false; // enable debug output for the PEG parser
+@@ -393,6 +414,10 @@ class common_chat_session {
+ 
+     const common_chat_msg_delimiters & message_delimiters() const { return delimiters; }
+ 
++    // abyss: the special tokens the template wrote into the prompt, known when its handler tracks the request's text
++    const std::vector<common_chat_prompt_special> & prompt_special() const { return special; }
++    bool prompt_special_known() const { return special_known; }
++
+     void apply_sampling(common_params_sampling & sampling) const;
+ 
+     bool has_template() const { return templated; }
+@@ -415,6 +440,9 @@ class common_chat_session {
+     common_chat_parser_params  parser_params;
+     common_chat_msg_delimiters delimiters;
+     common_chat_input          input;
++
++    std::vector<common_chat_prompt_special> special;
++    bool                                    special_known = false;
+     common_chat_msg            result;
+     bool                       templated = false;
+     bool                       finished  = false;
+diff --git a/common/common.cpp b/common/common.cpp
+index eeb31fc..80f48fe 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1896,6 +1896,25 @@ std::vector<llama_token> common_tokenize(
+     return result;
+ }
+ 
++std::vector<llama_token> common_tokenize_plain(
++    const struct llama_vocab * vocab,
++           const std::string & text) {
++    // upper limit for the number of tokens
++    std::vector<llama_token> result(text.length() + 1);
++    int n_tokens = llama_tokenize_plain(vocab, text.data(), text.length(), result.data(), result.size());
++    if (n_tokens == std::numeric_limits<int32_t>::min()) {
++        throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
++    }
++    if (n_tokens < 0) {
++        result.resize(-n_tokens);
++        int check = llama_tokenize_plain(vocab, text.data(), text.length(), result.data(), result.size());
++        GGML_ASSERT(check == -n_tokens);
++    } else {
++        result.resize(n_tokens);
++    }
++    return result;
++}
++
+ std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+diff --git a/common/common.h b/common/common.h
+index b33060f..5ebf260 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1170,6 +1170,12 @@ std::vector<llama_token> common_tokenize(
+                         bool   add_special,
+                         bool   parse_special = false);
+ 
++// abyss: tokenizes text with the base vocabulary alone, so the spelling of a special token in it stays ordinary text
++// (see llama_tokenize_plain)
++std::vector<llama_token> common_tokenize_plain(
++    const struct llama_vocab * vocab,
++           const std::string & text);
++
+ // tokenizes a token into a piece, optionally renders special/control tokens
+ // should work similar to Python's `tokenizer.id_to_piece`
+ std::string common_token_to_piece(
+diff --git a/common/jinja/value.cpp b/common/jinja/value.cpp
+index 6edd8b9..422b92e 100644
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -239,6 +239,27 @@ static std::string json_ensure_ascii_preserving_format(const std::string & json_
+     return output;
+ }
+ 
++// abyss: whether every string in a value, recursively, came from the input (true for a value without strings)
++static bool all_strings_are_input(const value & val) {
++    if (is_val<value_string>(val)) {
++        return cast_val<value_string>(val)->val_str.all_parts_are_input();
++    }
++    if (is_val<value_array>(val)) {
++        for (const auto & item : val->as_array()) {
++            if (!all_strings_are_input(item)) {
++                return false;
++            }
++        }
++    } else if (is_val<value_object>(val)) {
++        for (const auto & [key, item] : val->as_ordered_object()) {
++            if (!all_strings_are_input(item)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ static value tojson(const func_args & args) {
+     args.ensure_count(1, 5);
+     value val_ascii      = args.get_kwarg_or_pos("ensure_ascii", 1);
+@@ -265,7 +286,12 @@ static value tojson(const func_args & args) {
+     if (ensure_ascii) {
+         json_str = json_ensure_ascii_preserving_format(json_str);
+     }
+-    return mk_val<value_string>(json_str);
++    auto res = mk_val<value_string>(json_str);
++    // abyss: the JSON of input values (tool definitions, tool call arguments) is input as well
++    if (all_strings_are_input(args.get_pos(0))) {
++        res->val_str.mark_input();
++    }
++    return res;
+ }
+ 
+ static value & get_attribute(const value & val, const value & attr, value & default_val) {
+@@ -1095,8 +1121,9 @@ const func_builtins & value_array_t::get_builtins() const {
+             value attribute = args.get_kwarg_or_pos("attribute", 2);
+             value undef = mk_val<value_undefined>();
+             const auto & arr = args.get_pos(0)->as_array();
+-            const std::string delim = val_delim->is_undefined() ? "" : val_delim->as_string().str();
+-            std::string result;
++            // abyss: the joined string keeps which of its parts came from the input
++            const string delim = val_delim->is_undefined() ? string() : val_delim->as_string();
++            string result;
+             for (size_t i = 0; i < arr.size(); ++i) {
+                 value val_arr = arr[i];
+                 if (!attribute->is_undefined()) {
+@@ -1105,9 +1132,9 @@ const func_builtins & value_array_t::get_builtins() const {
+                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
+                     throw raised_exception("join() can only join arrays of strings or numerics");
+                 }
+-                result += val_arr->as_string().str();
++                result.append(val_arr->as_string());
+                 if (i < arr.size() - 1) {
+-                    result += delim;
++                    result.append(delim);
+                 }
+             }
+             return mk_val<value_string>(result);
+diff --git a/common/parsers/deepseek.cpp b/common/parsers/deepseek.cpp
+index 6dc969c..6e3ea32 100644
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -114,7 +114,8 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+     };
+ 
+     data.prompt = common_chat_template_direct_apply_impl(
+-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
++        tmpl, inputs, adjusted_messages, std::nullopt, additional_context, &data.prompt_input_ranges);
++    data.prompt_input_known = true;
+     data.generation_prompt = common_chat_template_generation_prompt_impl(
+         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+@@ -143,6 +144,8 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+         }
+ 
+         data.prompt += data.generation_prompt;
++        // abyss: the appended prefill mixes the request's text with the template's, it is not tracked
++        data.prompt_input_known = false;
+     }
+ 
+     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+diff --git a/common/parsers/parsers.h b/common/parsers/parsers.h
+index fd9fc1c..658091f 100644
+--- a/common/parsers/parsers.h
++++ b/common/parsers/parsers.h
+@@ -24,12 +24,14 @@ void foreach_function(const json & tools, const std::function<void(size_t, const
+ void foreach_parameter(const json & function, const std::function<void(size_t, const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn);
+ 
+ // render a template; the override arguments let a parser feed in messages, tools or context it has rewritten
++// (abyss: input_ranges, when given, receives the byte ranges of the result that came from the request)
+ std::string common_chat_template_direct_apply_impl(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override = std::nullopt,
+     const std::optional<json> & tools_override = std::nullopt,
+-    const std::optional<json> & additional_context = std::nullopt);
++    const std::optional<json> & additional_context = std::nullopt,
++    std::vector<std::pair<size_t, size_t>> * input_ranges = nullptr);
+ 
+ // the suffix a template appends when add_generation_prompt is set
+ std::string common_chat_template_generation_prompt_impl(
+diff --git a/include/llama.h b/include/llama.h
+index 42a192e..d0188a8 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1286,6 +1286,16 @@ extern "C" {
+                             bool   add_special,
+                             bool   parse_special);
+ 
++    /// @details Abyss: like llama_tokenize with parse_special = false, except that user-defined tokens are not matched
++    ///          either. The text is encoded with the base vocabulary alone, as by an HF tokenizer without its added
++    ///          vocabulary, so the spelling of any special token in it stays ordinary text. Adds no BOS or EOS.
++    LLAMA_API int32_t llama_tokenize_plain(
++        const struct llama_vocab * vocab,
++                      const char * text,
++                         int32_t   text_len,
++                     llama_token * tokens,
++                         int32_t   n_tokens_max);
++
+     // Token Id -> Piece.
+     // Uses the vocabulary in the provided context.
+     // Does not write null terminator to the buffer.
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index bf243e3..825b9ad 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2007,10 +2007,12 @@ struct llama_vocab::impl {
+                          bool   special) const;
+ 
+ 
++    // abyss: parse_added = false matches no added token at all, not even the user-defined ones
+     std::vector<llama_token> tokenize(
+             const std::string & raw_text,
+                          bool   add_special,
+-                         bool   parse_special = false) const;
++                         bool   parse_special = false,
++                         bool   parse_added   = true) const;
+ 
+     int32_t tokenize(
+                    const char * text,
+@@ -3571,7 +3573,8 @@ static std::string llama_decode_text(const std::string & text) {
+ std::vector<llama_token> llama_vocab::impl::tokenize(
+         const std::string & raw_text,
+         bool add_special,
+-        bool parse_special) const {
++        bool parse_special,
++        bool parse_added) const {
+     GGML_ASSERT(tokenizer && "Tokenizer not initialized. Call llama_vocab::init_tokenizer() first.");
+ 
+     std::vector<llama_token> output;
+@@ -3579,7 +3582,9 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+ 
+     if (!raw_text.empty()) {
+         fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
+-        tokenizer_st_partition(fragment_buffer, parse_special);
++        if (parse_added) {
++            tokenizer_st_partition(fragment_buffer, parse_special);
++        }
+     }
+ 
+     switch (get_type()) {
+@@ -4426,6 +4431,10 @@ std::vector<llama_token> llama_vocab::tokenize(
+     return pimpl->tokenize(raw_text, add_special, parse_special);
+ }
+ 
++std::vector<llama_token> llama_vocab::tokenize_plain(const std::string & raw_text) const {
++    return pimpl->tokenize(raw_text, false, false, false);
++}
++
+ const std::string & llama_vocab::token_to_piece(llama_token token) const {
+     return pimpl->token_to_piece(token);
+ }
+@@ -4694,6 +4703,26 @@ int32_t llama_tokenize(
+     return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+ }
+ 
++int32_t llama_tokenize_plain(
++    const struct llama_vocab * vocab,
++                  const char * text,
++                     int32_t   text_len,
++                 llama_token * tokens,
++                     int32_t   n_tokens_max) {
++    const auto res = vocab->tokenize_plain(std::string(text, text_len));
++    if (res.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
++        LLAMA_LOG_ERROR("%s: tokenization result size %zu exceeds int32_t limit\n", __func__, res.size());
++        return std::numeric_limits<int32_t>::min();
++    }
++    if (n_tokens_max < (int) res.size()) {
++        return -((int) res.size());
++    }
++    for (size_t i = 0; i < res.size(); i++) {
++        tokens[i] = res[i];
++    }
++    return res.size();
++}
++
+ int32_t llama_token_to_piece(
+     const struct llama_vocab * vocab,
+                  llama_token   token,
+diff --git a/src/llama-vocab.h b/src/llama-vocab.h
+index 2d40c62..1d0054e 100644
+--- a/src/llama-vocab.h
++++ b/src/llama-vocab.h
+@@ -177,6 +177,9 @@ struct llama_vocab {
+                          bool   add_special,
+                          bool   parse_special = false) const;
+ 
++    // abyss: no added (control or user-defined) token is matched in raw_text, see llama_tokenize_plain
++    std::vector<llama_token> tokenize_plain(const std::string & raw_text) const;
++
+     // does not write null-terminator to buf
+     int32_t token_to_piece(
+                   llama_token   token,
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 037f115..0af4828 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -69,3 +69,13 @@ install(TARGETS ${TARGET} RUNTIME)
+ 
+ target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+ target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++# abyss: llama-abyss-chat-tokens prints the server's chat prompts and their tokens, loading only the vocabulary
++
++set(TARGET llama-abyss-chat-tokens)
++
++add_executable(${TARGET} abyss-chat-tokens.cpp)
++
++target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
++target_link_libraries(${TARGET} PRIVATE server-context)
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/server/abyss-chat-tokens.cpp b/tools/server/abyss-chat-tokens.cpp
+new file mode 100644
+index 0000000..bbce50f
+--- /dev/null
++++ b/tools/server/abyss-chat-tokens.cpp
+@@ -0,0 +1,100 @@
++// abyss: what the server's chat path makes of chat requests, loading only the vocabulary (no weights, no GPU). For each
++// request, an OpenAI chat body per line on stdin, it prints one JSON line with the rendered prompt, the special tokens
++// the template wrote, the tokens the server submits with ABYSS_PLAIN_INPUT=1 ("plain") and without it ("parsed").
++// It takes the server's arguments:
++//
++//   llama-abyss-chat-tokens -m model.gguf --jinja --chat-template-file deepseek-v4.1.jinja --no-reasoning-preserve < requests.jsonl
++
++#include "arg.h"
++#include "chat.h"
++#include "common.h"
++#include "llama.h"
++#include "server-common.h"
++
++#include <chrono>
++#include <cstdio>
++#include <iostream>
++#include <string>
++
++// milliseconds since t0
++static double ms_since(std::chrono::steady_clock::time_point t0) {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
++        return 1;
++    }
++    llama_backend_init();
++
++    llama_model_params mparams = common_model_params_to_llama(params);
++    mparams.vocab_only = true;
++    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "failed to load the vocabulary from %s\n", params.model.path.c_str());
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    // the server's chat parameters, as server_context builds them
++    server_chat_params opt;
++    opt.use_jinja                = params.use_jinja;
++    opt.prefill_assistant        = params.prefill_assistant;
++    opt.reasoning_format         = params.reasoning_format;
++    opt.chat_template_kwargs     = params.default_template_kwargs;
++    opt.tmpls                    = common_chat_templates_init(model, params.chat_template);
++    opt.allow_image              = false;
++    opt.allow_audio              = false;
++    opt.allow_video              = false;
++    opt.enable_thinking          = params.enable_reasoning != 0 && params.use_jinja &&
++                                   common_chat_templates_support_enable_thinking(opt.tmpls.get());
++    opt.reasoning_budget         = params.sampling.reasoning_budget_tokens;
++    opt.reasoning_budget_message = params.sampling.reasoning_budget_message;
++    opt.media_path               = params.media_path;
++    opt.force_pure_content       = params.force_pure_content_parser;
++
++    std::string line;
++    while (std::getline(std::cin, line)) {
++        if (line.empty()) {
++            continue;
++        }
++        json out;
++        try {
++            json body = json::parse(line);
++            std::vector<raw_buffer> files;
++            common_chat_session session;
++            auto t0 = std::chrono::steady_clock::now();
++            json data = oaicompat_chat_params_parse(vocab, body, opt, files, session);
++            const double ms_render = ms_since(t0);
++            const std::string prompt = data.at("prompt");
++            json special = json::array();
++            for (const auto & s : session.prompt_special()) {
++                json item = json::array();
++                item.push_back(s.start);
++                item.push_back(s.end);
++                item.push_back(s.token);
++                special.push_back(std::move(item));
++            }
++            out["prompt"]  = prompt;
++            out["known"]   = session.prompt_special_known();
++            out["special"] = special;
++            out["ms_render"] = ms_render;
++            t0 = std::chrono::steady_clock::now();
++            out["parsed"]    = tokenize_mixed(vocab, prompt, true, true);
++            out["ms_parsed"] = ms_since(t0);
++            if (session.prompt_special_known()) {
++                t0 = std::chrono::steady_clock::now();
++                out["plain"]    = tokenize_chat_prompt_special(vocab, prompt, special, true);
++                out["ms_plain"] = ms_since(t0);
++            }
++        } catch (const std::exception & e) {
++            out = {{"error", e.what()}};
++        }
++        std::cout << out.dump() << "\n" << std::flush;
++    }
++
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 5f77d43..256ada7 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -908,6 +908,23 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
+     return result;
+ }
+ 
++bool abyss_plain_input() {
++    static const bool on = [] {
++        const char * env = getenv("ABYSS_PLAIN_INPUT");
++        return env != nullptr && atoi(env) != 0;
++    }();
++    return on;
++}
++
++llama_tokens tokenize_chat_prompt_special(const llama_vocab * vocab, const std::string & prompt, const json & special, bool add_special) {
++    std::vector<common_chat_prompt_special> list;
++    list.reserve(special.size());
++    for (const auto & s : special) {
++        list.push_back({s.at(0).get<size_t>(), s.at(1).get<size_t>(), s.at(2).get<llama_token>()});
++    }
++    return common_chat_tokenize_prompt(vocab, prompt, list, add_special);
++}
++
+ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
+     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
+     // or the first element of the json_prompt array is a string.
+@@ -1434,6 +1451,21 @@ json oaicompat_chat_params_parse(
+ 
+     llama_params["prompt"] = out_session.prompt();
+ 
++    // abyss: ABYSS_PLAIN_INPUT=1 encodes the request's text with the base vocabulary alone, like the official
++    // DeepSeek Recipe, so a special-token spelling in a message, tool result or tool definition stays ordinary text
++    const bool plain_input = abyss_plain_input() && out_session.prompt_special_known();
++    if (plain_input) {
++        json special = json::array();
++        for (const auto & s : out_session.prompt_special()) {
++            json item = json::array();
++            item.push_back(s.start);
++            item.push_back(s.end);
++            item.push_back(s.token);
++            special.push_back(std::move(item));
++        }
++        llama_params["abyss_prompt_special"] = std::move(special);
++    }
++
+     // Reasoning budget: pass parameters through to sampling layer
+     {
+         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
+@@ -1481,6 +1513,11 @@ json oaicompat_chat_params_parse(
+         llama_params.erase("json_schema");
+     }
+ 
++    // abyss: only the server says where the template's special tokens are
++    if (!plain_input) {
++        llama_params.erase("abyss_prompt_special");
++    }
++
+     return llama_params;
+ }
+ 
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 5bd2ed5..0233bc7 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -279,6 +279,12 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
+  */
+ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
+ 
++// abyss: with ABYSS_PLAIN_INPUT=1 a chat prompt carries the special tokens its template wrote ("abyss_prompt_special",
++// [start, end, token] each); tokenize_chat_prompt_special encodes the rest of the prompt with the base vocabulary alone,
++// so a special-token spelling that came from the request stays ordinary text (see common_chat_tokenize_prompt)
++bool abyss_plain_input();
++llama_tokens tokenize_chat_prompt_special(const llama_vocab * vocab, const std::string & prompt, const json & special, bool add_special);
++
+ // return the last index of character that can form a valid string
+ // if the last character is potentially cut in half, return the index before the cut
+ // if validate_utf8(text) == text.size(), then the whole text is valid utf8
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 8a8874e..da7a27a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4971,6 +4971,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
++        } else if (res_type != TASK_RESPONSE_TYPE_NONE && prompt.is_string() && data.contains("abyss_prompt_special")) {
++            // abyss: a chat prompt with its template's special tokens, see oaicompat_chat_params_parse
++            inputs.push_back(server_tokens(tokenize_chat_prompt_special(ctx_server.vocab, prompt.get<std::string>(), data.at("abyss_prompt_special"), true), false));
+         } else {
+             // Everything else, including multimodal completions.
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+@@ -5755,13 +5758,21 @@ void server_routes::init_routes() {
+         std::vector<raw_buffer> files; // dummy, unused
+         common_chat_session session;   // dummy, unused
+         json body = json::parse(req.body);
++        // abyss: "with_tokens": true also returns the tokens the chat path submits for this prompt
++        const bool with_tokens = json_value(body, "with_tokens", false);
+         json data = oaicompat_chat_params_parse(
+             ctx_server.vocab,
+             body,
+             meta->chat_params,
+             files,
+             session);
+-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
++        json out = {{ "prompt", data.at("prompt") }};
++        if (with_tokens) {
++            out["tokens"] = data.contains("abyss_prompt_special")
++                ? tokenize_chat_prompt_special(ctx_server.vocab, data.at("prompt").get<std::string>(), data.at("abyss_prompt_special"), true)
++                : tokenize_mixed(ctx_server.vocab, data.at("prompt"), true, true);
++        }
++        res->ok(out);
+         return res;
+     };
+ 
+@@ -6329,6 +6340,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
+             throw std::runtime_error("for mtmd, input prompt must be a string.");
+         }
+         n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
++    } else if (prompt.is_string() && body_parsed.contains("abyss_prompt_special")) {
++        n_tokens = tokenize_chat_prompt_special(ctx_server.vocab, prompt.get<std::string>(), body_parsed.at("abyss_prompt_special"), true).size();
+     } else {
+         n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
+     }
+-- 
+2.43.0
+
