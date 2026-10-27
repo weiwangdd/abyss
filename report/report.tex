@@ -86,7 +86,7 @@
 \begin{center}{\large\bfseries 摘要}\end{center}
 \vspace{-0.3em}
 \noindent
-长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器，我们依次实现了 CED 感知预填充、Engram 预取、官方稀疏索引器、解码注意力的 top-k 收集、按热度准入的专家缓存未命中分流、预填充大批次的 CPU 分流，以及让提示词末段一遍算完的调用合并，最后把内存从 3600 MT/s 提到 5200 MT/s。在保持原生 MXFP4 精度的前提下（每项改动对改动前的 KLD 都在数值底线以内），预填充的提升最大：4.8 万 token 提示词从 135 s（355 \tps{}）降到 22.7 s（2,111 \tps{}），快约 6 倍，其中 CED 感知预填充把解码器层的计算量从约 96 万个「token × 层」降到约 2.4 万个，贡献最大；Engram 页缓存冷时，预取把冷读开销从约 39 s 降到约 2 s；多轮智能体会话里，之后每轮（1,200--1,600 token）的预填充从 5.7--7.2 s 降到 2.7--3.2 s。解码从 4.8 万上下文的 14.1 \tps{} 提升到只追加的多轮会话里的 31--33 \tps{}，4.8 万和 9.6 万上下文一样；剩下的时间主要花在把未命中的专家从内存经 PCIe 搬到 GPU。最后把上下文从 12.8 万扩到 19.2 万：专家缓存从 14 GB 减到 12 GB，预填充不变，解码慢约 3\%。我们同时记录了评估方法（两档数值底线、对官方实现的单层对拍、逐 token 剖析）、一个让解码速度虚高的测法陷阱，以及在真实 Codex 负载中发现并修复的缺陷。
+长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器，我们依次实现了 CED 感知预填充、Engram 预取、官方稀疏索引器、解码注意力的 top-k 收集、按热度准入的专家缓存未命中分流、预填充大批次的 CPU 分流，以及让提示词末段一遍算完的调用合并，最后把内存从 3600 MT/s 提到 5200 MT/s。在保持原生 MXFP4 精度的前提下（每项改动对改动前的 KLD 都在数值底线以内），预填充的提升最大：4.8 万 token 提示词从 135 s（355 \tps{}）降到 22.7 s（2,111 \tps{}），快约 6 倍，其中 CED 感知预填充把解码器层的计算量从约 96 万个「token × 层」降到约 2.4 万个，贡献最大；Engram 页缓存冷时，预取把冷读开销从约 39 s 降到约 2 s；多轮智能体会话里，之后每轮（1,200--1,600 token）的预填充从 5.7--7.2 s 降到 2.7--3.2 s。解码从 4.8 万上下文的 14.1 \tps{} 提升到只追加的多轮会话里的 31--33 \tps{}，4.8 万和 9.6 万上下文一样；剩下的时间主要花在把未命中的专家从内存经 PCIe 搬到 GPU。最后把上下文从 12.8 万扩到 19.2 万：专家缓存从 14 GB 减到 12 GB，预填充不变，解码慢约 3\%。我们还按官方 \code{encoding.py} 重写了对话模板，消除了智能体会话里思考越写越重复的问题；并把权重换成 DeepSeek 10 月 17 日更新的 1017 版：用自己写的转换脚本按现有 GGUF 的格式转换（在原版权重上抽样，与现有 GGUF 逐字节一致），同一语料上 PPL 低 3.4\%，速度和显存不变。我们同时记录了评估方法（两档数值底线、对官方实现的单层对拍、逐 token 剖析）、一个让解码速度虚高的测法陷阱，以及在真实 Codex 负载中发现并修复的缺陷。
 
 \vspace{0.2em}
 \begin{figure}[!h]
@@ -175,9 +175,12 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
     0015 & 提示词末段一遍算完：末段不拆调用，最后一个 ubatch 对齐到满 & 每轮 4.6--5.6 $\to$ 2.9--3.5 s & 0.009\textsuperscript{§} \\
     BIOS & 内存 3600 $\to$ 5200 MT/s & 解码约 +6\%，每轮 2.7--3.2 s & 重跑一致 \\
     配置 & 上下文 12.8 万 $\to$ 19.2 万，专家缓存 14 $\to$ 12 GB & 解码约 $-$3\%，预填充不变 & 0.000005 \\
+    模板 & 对话模板按官方 \code{encoding.py} 重写，采样改为官方推荐值 & 思考不再越写越重复 & — \\
+    0017 & 槽位被只共享开头的请求占用前先存进内存缓存 & 下一轮重算 26,438 $\to$ 30 token & 输出相同 \\
+    权重 & 换用 1017 版（自己转换） & PPL $-$3.4\%，速度不变 & 0.075\textsuperscript{¶} \\
     \bottomrule
   \end{tabularx}
-  \par\smallskip\raggedright\footnotesize *\ 预填充路径对解码路径的 KLD，不是对改动前。†\ server 上 temperature 0 生成时的 top-20 KL；0008 经过编码器层，属于较高的一档底线（\S\ref{sec:floors}）。‡\ 同一提示词第二次、一字不差的生成，缓存命中偏高；只追加的多轮会话见 \S\ref{sec:realdecode}。§\ 和只换 ubatch 大小的差别一样（\S\ref{sec:tailmerge}）。
+  \par\smallskip\raggedright\footnotesize *\ 预填充路径对解码路径的 KLD，不是对改动前。†\ server 上 temperature 0 生成时的 top-20 KL；0008 经过编码器层，属于较高的一档底线（\S\ref{sec:floors}）。‡\ 同一提示词第二次、一字不差的生成，缓存命中偏高；只追加的多轮会话见 \S\ref{sec:realdecode}。§\ 和只换 ubatch 大小的差别一样（\S\ref{sec:tailmerge}）。¶\ 衡量的是权重的变化，不是数值误差（\S\ref{sec:w1017}）。
 \end{table}
 
 % ---------------------------------------------------------------- 2
@@ -249,7 +252,7 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
   \par\smallskip\raggedright\footnotesize *\ 按官方 \code{inference/model.py} 推断：只有路由专家用 FP4，其余线性层走 FP8 矩阵乘；共享专家没有单独核对。—：未单独核对，GGUF 中是 16 位或 32 位浮点。
 \end{table}
 
-真正降了精度的只有 Engram 表。转换 GGUF 时它从 FP8 压到了 MXFP4，体积减半，也更容易留在页缓存里。这是转换者的选择，我们直接继承；本报告的对拍都是同一个 GGUF 改动前后的比较，这一步对质量的影响没有测过，要测需要用官方 FP8 的表做参照。
+真正降了精度的只有 Engram 表。转换 GGUF 时它从 FP8 压到了 MXFP4，体积减半，也更容易留在页缓存里。这是转换者的选择，我们直接继承；本报告的对拍都是同一个 GGUF 改动前后的比较，没有直接测过这一步的影响；NVIDIA 在其 NVFP4 版本中做了同样的转换，测得表的相对 L2 误差约 12\%，而 GPQA、SciCode 等基准的分数几乎不变~\cite{nvfp4}。
 
 计算时还有两处量化。GPU 和 CPU 上的矩阵乘都先把激活按 32 个一组量化成 int8 再乘，即 W4A8；官方参考实现用 FP8 激活，同为 8 bit。fork 在 Blackwell 上的预填充默认是 W4A4（激活只有 4 bit），我们改回了 8 bit（\S\ref{sec:floors}）。稀疏索引器的查询和键用 FP4，这是官方的设计，我们照官方实现做。KV cache 用默认的 F16，没有量化。
 
@@ -514,6 +517,8 @@ Codex 的实际会话（上下文约 10 万 token）解码只有 30--31 \tps{}�
 
 内存提到 5200 MT/s 后（第 7 节），Codex 又用每次不同的短提示词测了一次：生成 128 或 256 个 token，9 次的中位数是 40.3 \tps{}（36.8--44.8）。同一时段 Codex 自己的会话（上下文约 10.4 万）是 32.4 \tps{}，和表~\ref{tab:ddr5200} 的 31--33 一致。短上下文更快，一部分是注意力相关的开销更少（9.6 万上下文时约 2 ms/token），一部分是生成内容不同、专家缓存命中率不同；到 4.8 万以上，解码就基本不再随上下文变慢。
 
+接入 Hermes 后，长会话（6--9 万上下文，代码和工具输出）里有一半请求的解码掉到 14--26 \tps{}。为此我们加了解码统计（\code{0016}）：每 100 个解码 token 在日志里打印一行，含每 token 耗时、专家缓存命中率、每 token 命中、上传和 CPU 计算的专家数，以及磁盘缺页次数。慢的窗口里命中率、上传数和缺页都和平时一样，也排除了 CPU 被别的进程抢、降频、PCIe 链路代数和语法采样；唯一的相关是忙着的 CPU 核更少，即 OpenMP 线程在层与层之间睡下、再被唤醒。设 \code{GOMP\_SPINCOUNT=100000000} 让线程多空转一会儿，平均从 43.8 降到 35--36 ms/token，超过 50 ms 的窗口从 29\% 降到 7--19\%。剩下的慢窗口在 10-27 关机、GPU1 出过一次开机故障（\S\ref{sec:incidents}）并重启之后没有再出现：之后 547 个窗口的中位数是 31.1 ms，最慢的 10\% 为 32.8 ms，没有超过 50 ms 的。它们和 GPU1 当时的状态有没有关系，我们没有直接证据。
+
 % ---------------------------------------------------------------- 5
 \section{预填充}
 
@@ -667,6 +672,7 @@ CED 让每次 \code{llama\_decode} 调用都按自己的末尾跑解码器层，
 V4.1 的缓存不能回退到滑动窗口中间，只能退回检查点。server 在每条用户消息的开头、最后一条用户消息开头和提示词末尾附近创建检查点。模拟会话中，从第 3 轮起每轮只重算上一轮生成的回复加 4 个 token：回复经模板重新渲染后与生成时的 token 不完全一样，server 退回到「Assistant」前缀处的检查点。
 
 \subsection{prompt 缓存的选择}
+\label{sec:promptcache}
 
 在 Codex 的 6 个真实请求中（预填充合计 76 s，生成 129 s），我们发现 server 只有一个槽位，Codex 的辅助请求（与主对话共享约 4,500 token 的系统提示和工具定义，只问一句）会把主对话挤出槽位。server 已把主对话存进内存里的 prompt 缓存，但主对话回来时，槽位里的辅助请求与它仍有 94\% 的前缀相同，而 server 只在保留比例低于一半时才去缓存里找，并且按保留比例挑选，长的条目反而落选。
 
@@ -678,7 +684,7 @@ V4.1 的缓存不能回退到滑动窗口中间，只能退回检查点。server
 \begin{itemize}
   \item \textbf{未分配的输入张量}。CED 让某些层在某个 ubatch 里没有 token，依赖它们的计算被整段丢掉，预先建好的输入张量就不会分配，往里写数据时断言失败。这在 CED 行映射（提示词约 2,500--16,000 token）和候选块输入（约 1.7 万 token 以上、长度除以 2,048 余约 114--622）上各出现一次，都只在特定长度下触发，测速用的 4.8 万和 12.8 万 token 恰好都没碰到，由 Codex 的请求暴露。
   \item \textbf{全零槽位重复}。未命中分流最初只有一个全零槽位。9--32 token 的批次里，同一 token 的多个 CPU 未命中指向同一个槽位，CUDA MMQ 的重排每个专家每个 token 只记一行，漏掉的行号未初始化，量化内核越界。改为每个 token 的第 $k$ 个专家用第 $k$ 个全零槽位。
-  \item \textbf{PCIe 降速}。有一次开机后 GPU1 的链路只训练到 Gen4，主机到 GPU1 只有 14.4 GB/s，未命中上传慢了一倍，解码从约 25 掉到 17 \tps{}（图~\ref{fig:decode}）；重启后恢复。改 BIOS 后第一次开机又出现一次，GPU1 只到 Gen3，主机到 GPU1 只有 1.78 GB/s，同样重启恢复。测速脚本现在会先检查链路。
+  \item \textbf{GPU1 开机故障}。四天里 GPU1 在开机时出了四次问题，GPU0 一次也没有：10-24 链路只训练到 Gen4，主机到 GPU1 只有 14.4 GB/s，未命中上传慢了一倍，解码从约 25 掉到 17 \tps{}（图~\ref{fig:decode}）；10-25 改 BIOS 后第一次开机只到 Gen3，只有 1.78 GB/s；10-27 关机后再开机，驱动初始化不了 GPU1 的 GSP 固件（\code{RmInitAdapter failed}、\code{WPR2 already up}），重启后又只到 Gen4（14.47 GB/s），再重启才正常。测速脚本会先检查链路；下次断电时打算在 BIOS 里把这个插槽固定为 Gen5，并重新插卡、检查供电线。
   \item \textbf{测试 server 退出时卡住}。测试 server 收到退出信号时正好接到外部请求，之后 GPU 和 CPU 都是 0\%，只能强制结束。生产 server 重启时也可能碰到。
   \item \textbf{Codex 的 MCP 工具被丢弃}。Codex 每个请求带的 9 个 \code{namespace} 类型工具，server 不支持，直接跳过，模型看不到。这个问题还没有修。
 \end{itemize}
@@ -686,9 +692,35 @@ V4.1 的缓存不能回退到滑动窗口中间，只能退回检查点。server
 \subsection{重启后的长对话首次预填充}
 \label{sec:restart}
 
-server 重启后 prompt 缓存是空的，Codex 的下一个请求要把整段对话从头算。2026-10-25 的日志里，一段约 10.4 万 token 的多轮对话用了 85.2 s（1,219 \tps{}），而单条消息的 12.8 万 token 提示词只要 51.8 s（2,464 \tps{}，\S\ref{sec:indexer}）。差别来自检查点：server 在对话中间每隔至少 8,192 个 token（\code{--checkpoint-min-step} 的默认值）、在用户消息开头处拆一次调用并建检查点，这段对话因此被拆成至少 16 次调用。每次调用都按自己的末尾跑解码器层，要把第 22--39 层的专家再读一遍，估计多花约 30 s；\S\ref{sec:tailmerge} 的合并只管最后 2,700 个 token。
+server 重启后 prompt 缓存是空的，Codex 的下一个请求要把整段对话从头算。2026-10-25 的日志里，一段约 10.4 万 token 的多轮对话用了 85.2 s（1,219 \tps{}），而单条消息的 12.8 万 token 提示词只要 51.8 s（2,464 \tps{}，\S\ref{sec:indexer}）。差别来自检查点：server 在对话中间每隔至少 8,192 个 token（\code{--checkpoint-min-step} 的默认值）、在用户消息开头处拆一次调用并建检查点，这段对话因此被拆成至少 16 次调用。每次调用都按自己的末尾跑解码器层，要把第 22--39 层的专家再读一遍；\S\ref{sec:tailmerge} 的合并只管最后 2,700 个 token。
 
-可以从两头改。一是调大 \code{--checkpoint-min-step}（例如 32768），拆的次数少很多，估计能降到 55 s 左右；代价是对话中间能恢复的位置变少，改写历史（例如压缩上下文）时可能要多算一段。二是重启前用 \code{--slot-save-path} 把槽位状态存盘、重启后读回，第一个请求就不用重算；fork 的基础提交已经支持把检查点一起存进槽位文件，但我们还没有实测。这两项都还没做。
+我们从两头改。一是重启脚本在停 server 之前把槽位 0 连同检查点存盘（\code{--slot-save-path}），启动后读回：9.6 万 token 的槽位文件约 0.34 GiB，存 86 ms、读 114 ms，重启后的第一个请求接着算，不用重算整段对话。二是把 \code{--checkpoint-min-step} 调到 32768，没有存档时（例如崩溃后）拆的次数少很多：9.6 万 token、16 条用户消息的对话首次预填充从 77.3 s 降到 52.9 s（\code{restart-prefill.sh}）。后一项有代价：检查点列表满了以后也按这个间距删减，对话中途分叉时可能要退回很远（\S\ref{sec:takeover}）。
+
+\subsection{对话模板与采样}
+\label{sec:template}
+
+2026-10-26 接入 Hermes 后，有一次请求的思考越写越长，被客户端以「Repetition Detected」中止，那段思考循环了约 4,700 token。翻看会话记录，思考里「Let me write. / Go.」这样的短句在同一个会话里越来越多：会话的前 2.5 小时一次都没有，之后每条回复里的平均个数从 0.2 涨到 16，最多的一条有 30 个。带工具的对话会保留每一轮的思考，历史里的这类短句一直留在提示词中，模型照着自己之前的写法继续写，越写越多。
+
+我们把 server 用的模板和官方 \code{encoding/encoding.py} 逐字对照，发现模板沿用了 V4 的写法：开头少了 <｜System｜> 和思考强度那一行（\code{Reasoning Effort: 75 ...}），工具定义和工具结果的位置、拼接方式也不同。按 \code{encoding.py} 重写后，\code{template\_check.py} 用 10 组对话（system 和 developer 消息、工具定义、多轮工具调用和结果、无工具的多轮思考、几种思考强度）比较 server 的 \code{/apply-template} 和官方编码，全部逐字一致。对拍中还发现两处：llama.cpp 默认保留历史轮次的思考，官方在没有工具时只保留最后一条用户消息之后的，server 要加 \code{--no-reasoning-preserve}；llama.cpp 的 Jinja 没有 \code{from\_json}，工具调用的参数要在模板里直接写出。
+
+采样参数原来是 llama.cpp 的默认值（temperature 0.8、top\_k 40、min\_p 0.05），Hermes 和 Codex 都不在请求里带采样参数，于是改为官方推荐的 temperature 1.0、top\_p 0.95，换用 1017 后按其模型卡改为 top\_p 1.0（\S\ref{sec:w1017}）。修复后开的新会话里，这类短句一次也没有再出现；旧会话的历史里已经积了大量短句，要开新会话才能摆脱。
+
+\subsection{槽位被只共享开头的请求占用}
+\label{sec:takeover}
+
+Hermes 每轮结束后会在后台重放整段对话，问模型要不要存技能和记忆（下称复盘）。10-26 晚上一个小时里有三次，主对话的下一条消息要从头重算约 3.6 万 token，每次 20--23 s。原因是三件事叠在一起：复盘请求和主对话只共享前约 4.06 万 token，进来时占了唯一的槽位；server 按共同前缀算保留比例（72\%），超过一半就不先把槽位存进内存缓存；而 V4.1 只能退回共同前缀里最新的检查点，当时检查点列表已满，按 \code{--checkpoint-min-step 32768} 删减后，2 万到 5 万之间一个都不剩，只能退到 20,466。主对话 2 万以后的部分既没有存进缓存，也没有检查点可退。
+
+\code{0017} 改了两处。一是按检查点算新请求实际能保留多少，比槽位最新的检查点少 2,048 个 token 以上（\code{ABYSS\_SLOT\_SAVE\_LOST}）就先存进内存缓存，主对话回来时由 \S\ref{sec:promptcache} 的逻辑换回。二是把检查点删减的间距和拆分长提示词的步长分开（\code{ABYSS\_CKPT\_THIN\_STEP=8192}）。\code{slot-takeover.sh} 复现了这个场景：6.5 万 token 的对话被一个只共享前 3.8 万的请求占用后，下一轮从重算 26,438 个 token（15.0 s）变成 30 个（0.5 s），32 个输出 token 和改动前相同。生产上第一次触发是 Codex 的一个辅助请求，主对话随后只算了 656 个 token。删减间距那一项在这个测试里没有被触发（36 轮还没有填满检查点列表），还要补测。
+
+\subsection{智能体客户端的额外请求}
+\label{sec:hermes}
+
+除了主对话，Hermes 还会发几类请求，都和主对话抢唯一的槽位：
+\begin{itemize}
+  \item \textbf{复盘}：见上一节。它可能生成上千 token（一次写技能文件生成了 5,700 token），用户的新消息会让它停下。
+  \item \textbf{上下文压缩}：窗口用到约 75\% 时，先让模型写摘要，再把摘要和最近的消息从头预填充。有一次摘要生成了 8,189 token、用了 259 s，接着重新预填充 36,711 token、22.7 s。我们让压缩请求不思考（Hermes 的 \code{auxiliary.compression.reasoning\_effort: none}）。另有一次，用户在压缩进行中发来消息，压缩被取消，但请求没有断开，server 仍把 8,490 token 的摘要生成完，用户的消息多等了约 3.5 分钟。
+  \item \textbf{命令审批}：默认的 smart 模式让模型审批命中危险规则的终端命令，一天约 23 次，每次的提示词约 800 token、从头算，4.4--4.7 s。改为由用户在 Telegram 上批准（manual）后，这类请求就没有了。
+\end{itemize}
 
 % ---------------------------------------------------------------- 7
 \section{把内存提到 5200 MT/s}
@@ -714,7 +746,7 @@ server 重启后 prompt 缓存是空的，Codex 的下一个请求要把整段�
   \end{tabular}
 \end{table}
 
-各项快了 6--12\%，少于我们预计的 15--20\%。解码时上传到 GPU1 受 PCIe 限制，每个专家约 0.7 ms，和内存频率无关，只有 CPU 算的那一半变快了。内存带宽也只提高了 23\%，理论上是 44\%，可能是内存控制器频率被自动设成了内存频率的一半，还没有确认。专家缓存的上传比例（0.5）是在 3600 MT/s 下定的，现在 CPU 快了，可能不再最优。
+各项快了 6--12\%，少于我们预计的 15--20\%。解码时上传到 GPU1 受 PCIe 限制，每个专家约 0.7 ms，和内存频率无关，只有 CPU 算的那一半变快了。内存带宽也只提高了 23\%，理论上是 44\%，可能是内存控制器频率被自动设成了内存频率的一半，还没有确认。专家缓存的上传比例（0.5）是在 3600 MT/s 下定的，我们在 5200 MT/s 下重扫了一遍（4.8 万上下文、只追加的会话、每档 6 轮）：0.3、0.4、0.5、0.6 分别是 33.8、33.6、33.3、31.2 \tps{}，0.3--0.5 的差别在轮间波动以内，保持 0.5。
 
 % ---------------------------------------------------------------- 8
 \section{把上下文扩到 19.2 万}
@@ -773,19 +805,73 @@ server 重启后 prompt 缓存是空的，Codex 的下一个请求要把整段�
 上线后的结果见表~\ref{tab:ctxdecode}。缓存槽位从约 780 个减到约 670 个，命中率降了约 2.5 个百分点，每 token 多上传约 1 个专家，解码慢约 3\%；每轮的预填充不变。另一个代价在最坏情况：崩溃后没有存档、或压缩后重建上下文时，19.3 万 token 从头预填充要约 80 s，12.8 万时约 48 s。
 
 % ---------------------------------------------------------------- 9
+\section{换用 1017 权重}
+\label{sec:w1017}
+
+DeepSeek 在 10 月 17 日发布了 DeepSeek-V4.1-Flash-1017，称为一次小更新：模型卡上 HLE（不用工具）从 36.8 提到 42.6，Terminal-Bench 4.0 从 31.2 提到 42.3，DeepSWE 从 74.2 提到 77.0，完成任务所需的时间和输出长度也更短，推荐 temperature 1.0、top\_p 1.0~\cite{v411017}。DeepSeek 开源的推理框架 DeepInfer~\cite{deepinfer} 默认用的就是它。1017 的 \code{config.json}、\code{tokenizer.json} 和 \code{encoding/encoding.py} 与原版逐字节相同，96,085 个张量的名字、类型、形状和所在分片也相同，只换了权重。
+
+现成的路都走不通。fork 公开的转换脚本只支持 V4，没有 Engram，导出 DSpark 侧车的选项只认 V4 的架构名；mxxm-t 转换 V4.1 用的脚本没有公开。网上的 1017 GGUF 专家都是 K-quant 或 IQ 量化，不是 MXFP4。NVIDIA 的 NVFP4 版本基于原版，专家按 W4A4 设计，每个权重 4.5 bit（比 MXFP4 大约 6\%），只支持 vLLM 和 SGLang~\cite{nvfp4}。
+
+我们写了一个以现有 GGUF 为模板的转换脚本（\code{tools/convert/v41convert.py}）：每个输出文件照抄模板的文件头，元数据、张量名、类型、形状和偏移都不变，每个张量的数据按表~\ref{tab:convert} 的规则从 HF 权重转换。Q8\_0 和 MXFP4 用 ctypes 调用fork 编译出的 \code{ggml\_quantize\_chunk}，舍入和 fork 完全相同。
+
+\begin{table}[h]
+  \centering
+  \small
+  \caption{1017 各类张量的转换规则，与 mxxm-t 转换原版的做法相同。}
+  \label{tab:convert}
+  \begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{4.4cm} X >{\raggedright\arraybackslash}p{3.0cm}@{}}
+    \toprule
+    HF $\to$ GGUF & 张量 & 精度 \\
+    \midrule
+    FP4（每字节两个），每 32 个一个 E8M0 $\to$ MXFP4 & 路由专家，按专家号拼成一个张量 & 不变，只重排半字节 \\
+    FP8，32 × 32 块 E8M0 $\to$ Q8\_0 & 注意力、共享专家、索引器的 q\_b、Engram 的 wkv、草稿模型的 fc & 反量化后量化 \\
+    FP8，每 32 个一个 E8M0 $\to$ MXFP4 & 两张 Engram 表（各 3.84 亿行 × 256） & 有损（\S\ref{sec:formats}） \\
+    BF16 $\to$ F32 & 各种 norm & 不变 \\
+    照抄 & 嵌入、输出、路由门、压缩器、索引器投影（BF16）；sink、超连接系数、路由偏置（F32） & 不变 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+规则先在原版上验证：用 HTTP Range 请求远程读取原版权重，不下载整份，68 种张量各取首、中、尾几块，转换结果和 mxxm-t 的 GGUF 逐字节相同；模板里 1,084 个张量全部找到了来源，没用到的 309 个是视觉部分和多模态用的 \code{gate.bias\_vl}。然后转换 1017：475 GiB 权重下载约 90 分钟，48 个分片的 sha256 都已核对；6 个进程并行，按块写到固定偏移，读写都不进页缓存，免得挤掉 server 正在用的 Engram；可以边下边转，专家等 285.6 GiB 用了 3.8 分钟，两张 Engram 表 97.6 GiB 用了 4.6 分钟。转换后核对了 13 个文件的文件头和大小，并随机抽 400 块重新转换，都与写入的一致。
+
+\begin{table}[h]
+  \centering
+  \small
+  \caption{原版与 1017 的对比：同一程序与配置，19.2 万上下文、12 GB 专家缓存。PPL 和 KLD 用 14 段、每段 1,024 token 的语料；这里的 KLD 衡量的是权重的变化，不是数值误差。}
+  \label{tab:w1017}
+  \begin{tabular}{@{}l r r@{}}
+    \toprule
+     & 原版 & 1017 \\
+    \midrule
+    PPL & 6.07 & 5.86（$-$3.4\% ± 0.5\%） \\
+    对原版的 KLD / top-1 一致率 & — & 0.075 / 87.7\% \\
+    GPU1 显存峰值 & 95,604 MiB & 95,604 MiB \\
+    9.6 万 token 预填充 & 42.6 s & 42.8 s \\
+    19.3 万 token 预填充 & 79.4 s & 79.8 s \\
+    满上下文解码\textsuperscript{*} & 33.6 \tps{} & 34.2 \tps{} \\
+    19.3 万 token 后找回开头的暗号 & 对 & 对 \\
+    \bottomrule
+  \end{tabular}
+  \par\smallskip\footnotesize *\ 生成 256 个 token，开了 \code{ignore\_eos}，只适合互相比较（\S\ref{sec:ctx}）。
+\end{table}
+
+结果见表~\ref{tab:w1017}。1017 的 PPL 低 3.4\%；如果转换有错（例如专家排错），PPL 会成倍上升，而不是下降。架构和格式都没变，显存和速度与原版相同。生产在 10-27 切换，采样随之改为 top\_p 1.0；旧模型存下的槽位对新权重无效，切换时不读回。1017 的 DSpark 侧车也一起转换好了。
+
+% ---------------------------------------------------------------- 10
 \section{结论、局限与未来方向}
 
-在一台双卡工作站上，Abyss 以原生 MXFP4 精度、19.2 万上下文运行 DeepSeek-V4.1-Flash：只追加的多轮会话里单流解码 31--33 \tps{}，4.8 万和 9.6 万上下文一样；4.8 万 token 提示词的预填充约 23 s，多轮会话每轮约 3 s。收益主要来自四类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k），按热度安排数据所在的层级（专家缓存与准入），让 CPU、DMA 和 GPU 同时工作（未命中分流、大批次分流），以及减少重复读取（末段一遍算完）。每一项都先剖析、后实现，并用分档的数值底线和对官方实现的对拍确认正确性。
+在一台双卡工作站上，Abyss 以原生 MXFP4 精度、19.2 万上下文运行 DeepSeek-V4.1-Flash（10-27 起为 1017 版）：只追加的多轮会话里单流解码 31--33 \tps{}，4.8 万和 9.6 万上下文一样；4.8 万 token 提示词的预填充约 23 s，多轮会话每轮约 3 s。收益主要来自四类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k），按热度安排数据所在的层级（专家缓存与准入），让 CPU、DMA 和 GPU 同时工作（未命中分流、大批次分流），以及减少重复读取（末段一遍算完）。每一项都先剖析、后实现，并用分档的数值底线和对官方实现的对拍确认正确性。
 
-\paragraph{局限。} 解码器专家的读取最终受内存带宽和 PCIe 限制：每个未命中的专家都要从双通道内存读一遍，上传的那一半还要经过 x8 的 PCIe（每个约 0.7 ms），而且一层接一层串行；预填充的大批次也已接近「每层专家读一遍」的下限。GPU1 的链路两天里两次没有训练到 Gen5，每次开机后都要先检查。显存余量很小：上下文扩到 19.2 万是用 2 GB 专家缓存换来的，解码慢约 3\%；再往上要把 ubatch 减半，大段预填充慢约 24\%（\S\ref{sec:ctx}）。GGUF 中的 Engram 表从官方的 FP8 降到了 MXFP4（\S\ref{sec:formats}），这对质量的影响还没有测过。DSpark 投机解码在 V4.1 上尚不支持，这部分收益还没有拿到。
+\paragraph{局限。} 解码器专家的读取最终受内存带宽和 PCIe 限制：每个未命中的专家都要从双通道内存读一遍，上传的那一半还要经过 x8 的 PCIe（每个约 0.7 ms），而且一层接一层串行；预填充的大批次也已接近「每层专家读一遍」的下限。GPU1 四天里开机出了四次问题（\S\ref{sec:incidents}），每次开机后都要先检查链路。显存余量很小：上下文扩到 19.2 万是用 2 GB 专家缓存换来的，解码慢约 3\%；再往上要把 ubatch 减半，大段预填充慢约 24\%（\S\ref{sec:ctx}）。Engram 表从官方的 FP8 降到了 MXFP4，我们没有直接测过影响（\S\ref{sec:formats}）。llama.cpp 会把渲染后提示词里的特殊 token 文字都当成控制 token，智能体读到含 <｜User｜>、\code{</think>} 的文件（例如本项目的模板和补丁）时，可能打乱对话结构；DeepSeek 的 Recipe 对正文分段编码、按 token ID 识别控制 token~\cite{deepinfer}，我们还没有处理。DSpark 投机解码还没有开。
 
-\paragraph{未来方向。}
+\paragraph{未来方向。} 前四项来自对 DeepSeek 开源的生产推理框架 DeepInfer~\cite{deepinfer} 的对照，以及外部的实测：
 \begin{itemize}
-  \item 在 5200 MT/s 下重新扫专家缓存的上传比例，并确认内存控制器是否和内存同频。
+  \item \textbf{索引器分块与稀疏预填充注意力。} fork 预填充时为每个用索引器的层生成整张 F32 打分表和至少两张 $n_{kv} \times n_q$ 的稠密掩码，再让 flash attention 带着掩码扫过全部压缩位置；GPU1 计算缓冲区随「ubatch × 上下文」变大的主要就是这些。DeepInfer 按查询分块打分，显存有上限，注意力按下标表只取 SWA 窗口和 top-512 行。照此改写可以腾出几 GiB 显存：把专家缓存加回 14 GB 以上，或在 ubatch 2048 下开到 25.6 万，长提示词的预填充也会更快。这项不引入近似。
+  \item \textbf{解码器有界重放。} DeepInfer 在生产上预填充时，解码器层只算整段提示词的最后 140 个 token，SWA 截在这一段之内，是近似；分块预填充时完全落在这之前的块只留 1 个占位 token。我们的 CED 是精确的级联（第 20 层 2,414 个 token），每次调用都要把第 22--39 层的专家读一遍。改成有界重放后，每轮的小预填充可能快约 1 s，\code{0015} 和 \code{--checkpoint-min-step 32768} 这两个折中也可以去掉；需要先用 KLD 对拍近似带来的差别。
+  \item \textbf{用重放代替检查点。} DeepInfer 的前缀在任意 128 对齐的位置都能接上，缺失的 SWA 状态靠重算最后 128 个 token补回。这样任何分叉最多多算 128 个 token，但要改 fork 的 DSV4 缓存管理，工作量最大。
+  \item \textbf{DSpark 投机解码。} 1017 的草稿侧车已经转换好（3 层，每层 128 个专家选 3 个，一次出 5 个 token，读主模型第 37--39 层的隐状态）。4 张 RTX PRO 6000 上的 vLLM 单流开启后，聊天从 83.6 提到 146.8 \tps{}，智能体从 82.2 提到 130.5 \tps{}，每步接受 2.1--2.8 个草稿 token~\cite{infatoshi}；DeepInfer 按置信度只验证一部分草稿，验证的 token 少约 30\%。在我们的分层布局下，一次验证多个 token 要多读专家，还要先腾出约 8 GB 显存放草稿模型。
   \item 合并 GPU 上的小内核：解码时每 token 约 2,900 个内核、14.6 ms，占四成多，平均每个只有约 5 µs。
   \item 让上传和本层命中专家的计算并行，并减少每层的同步，预计每 token 省 2--3 ms。
-  \item 减少长对话中途检查点带来的重复读取，或在重启时保存并恢复槽位（\S\ref{sec:restart}）。
-  \item 补上 V4.1 的 DSpark 投机解码。diffbot 在智能体编程会话中开启后解码约为单流的两倍；但在分层布局下，一次验证多个 token 会选中更多不同的专家，要多读的专家可能抵消一部分收益，需要实测。
   \item 与方案 A（3.0 bpw 专家、vLLM 双卡张量并行，预计 55--75 \tps{}）做一次同机对比，量化速度与精度的取舍。
 \end{itemize}
 
@@ -794,6 +880,10 @@ server 重启后 prompt 缓存是空的，Codex 的下一个请求要把整段�
 \bibitem{mxllama} mxxm-t. mx-llama.cpp 与 DeepSeek-V4.1-Flash 的 MXFP4 GGUF. \url{https://huggingface.co/mxxm-t/DeepSeek-V4.1-Flash-GGUF}
 \bibitem{diffbot} diffbot. DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000. \url{https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000}
 \bibitem{strata} Strata：三层分工的本地 MoE 推理. \url{https://github.com/Niko1221/Strata}
+\bibitem{v411017} DeepSeek-AI. DeepSeek-V4.1-Flash-1017. 2026. \url{https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017}
+\bibitem{deepinfer} DeepSeek-AI. DeepInfer 及其部署问答（\code{doc/inference\_deployment\_qa.md}）. 2026. \url{https://github.com/deepseek-ai/deepinfer}
+\bibitem{nvfp4} NVIDIA. DeepSeek-V4.1-Flash-NVFP4. 2026. \url{https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-NVFP4}
+\bibitem{infatoshi} Infatoshi. DeepSeek-V4.1-Flash-1017-MXFP4-uncensored，模型卡中的 DSpark 消融. 2026. \url{https://huggingface.co/Infatoshi/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored}
 \end{thebibliography}
 
 \newpage
@@ -826,25 +916,29 @@ Abyss 的全部改动以补丁形式保存在仓库的 \code{mx-llama.cpp/} 目�
     0014 & 预填充大批次分流到 CPU & \code{ABYSS\_MOE\_BIG\_SPLIT=1} \\
     0015 & 提示词末段一遍算完；CED 余量跟 \code{n\_rs\_seq} & \code{ABYSS\_CKPT\_TAIL\_MERGE=2700} \\
          & & \code{ABYSS\_CED\_ALIGN=1} \\
+    0016 & 解码统计：每 N 个解码 token 打印一行每 token 耗时、命中率、上传和 CPU 计算的专家数、缺页次数 & \code{ABYSS\_DECODE\_STATS=100} \\
+    0017 & 槽位被只共享开头的请求占用前先存进内存缓存；检查点删减间距单独设置 & \code{ABYSS\_SLOT\_SAVE\_LOST} \\
+         & & \code{ABYSS\_CKPT\_THIN\_STEP=8192} \\
     \bottomrule
   \end{tabularx}
 \end{table}
 
 \section{复现}
 
-生产配置的启动命令（需打过全部补丁的编译；还必须设 \code{GGML\_CUDA\_Q8\_1\_CACHE=0} 和 \code{GGML\_CUDA\_MMQ\_PREC=q8}；内存在 BIOS 里设 EXPO I + DDR5-5200）：
+生产配置的启动命令如下。需要打过全部补丁的编译，内存在 BIOS 里设 EXPO I + DDR5-5200，命令里的两个 GGML 环境变量是必需的。权重是用 \code{v41convert.py} 从官方 1017 转换的 GGUF（\S\ref{sec:w1017}），模板是仓库里的 \code{deepseek-v4.1.jinja}；仓库的 \code{restart-server.sh} 还带上了槽位存取和解码统计：
 
 \begin{small}
 \begin{verbatim}
-GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 \
+GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \
 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 \
-ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 \
-llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
+ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_CKPT_THIN_STEP=8192 \
+llama-server -m DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -c 196608 -b 65536 -ub 2048 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" \
-  -t 16 -np 1 --moe-cache-mib 12000 \
-  --jinja --chat-template-file deepseek-v4.1.jinja
+  -t 16 -np 1 --moe-cache-mib 12000 --checkpoint-min-step 32768 \
+  --jinja --chat-template-file deepseek-v4.1.jinja --no-reasoning-preserve \
+  --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0
 \end{verbatim}
 \end{small}
 
@@ -868,9 +962,13 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
     \code{decode\_modes.sh} & 只追加的长会话里测解码，\code{CAPTURE=1} 剖析 \\
     \code{prefill-sizes.sh} & 几种长度新提示词的预填充 \\
     \code{ctx-size.sh} & 各上下文配置的显存峰值、长提示词预填充和找回暗号 \\
+    \code{slot-takeover.sh} & 槽位被只共享开头的请求占用后，主对话还能复用多少 \\
+    \code{template\_check.py} & 对拍对话模板和官方 \code{encoding.py} \\
     \bottomrule
   \end{tabular}
 \end{center}
+
+转换脚本在 \code{tools/convert/}：\code{v41convert.py verify} 用原版权重抽样对比模板，\code{convert} 转换，\code{check} 核对输出。
 
 \section{术语表}
 \label{sec:glossary}
@@ -892,7 +990,7 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
   \item[候选块] 第 20 层按每 8 个压缩位置一块挑出 2,048 块，第 24--36 层只在这些块里重新选 top-512。
   \item[超连接（hc）] V4 系列对残差连接的扩展：隐状态保留 4 路，每层注意力和前馈网络的前后按学到的系数把它们混合、写回。解码时它带来不少小内核。
   \item[Engram] V4.1 的查表模块：第 1、14 层按最近 2--4 个 token 的 n-gram 哈希，从两张各约 3.84 亿行的大表里取行。表很大（官方 FP8 约 189 GiB），但每个 token 只读几十行，所以可以放在 NVMe 上。
-  \item[DSpark] V4.1 自带的约 14B 草稿模型，用于投机解码；mx-llama.cpp 对 V4.1 还不支持。
+  \item[DSpark] V4.1 自带的约 14B 草稿模型，用于投机解码：3 层，每层 128 个专家选 3 个，一次出 5 个 token，读主模型第 37--39 层的隐状态，并用置信度头预测每个草稿 token 被接受的概率。mx-llama.cpp 在 V4.1 上还没有验证。
 \end{description}
 
 \subsection*{数值格式与量化}
@@ -903,7 +1001,7 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
   \item[W4A8、W4A4] 矩阵乘的精度：权重 4 bit，激活量化到 8 bit 或 4 bit。官方参考实现是 W4A8；fork 在 Blackwell 上的预填充默认是 W4A4，我们用 \code{GGML\_CUDA\_MMQ\_PREC=q8} 改回 8 bit。
   \item[bpw] 每个权重平均占的位数。方案 A 把专家从约 4.25 bpw 压到 3.0 bpw。
   \item[EXL3] ExLlamaV3 的量化格式，方案 A 的公开配方用它。
-  \item[GGUF] llama.cpp 的模型文件格式；本报告用的是 mxxm-t 转换的 MXFP4 GGUF，共 12 个分片、383 GiB。
+  \item[GGUF] llama.cpp 的模型文件格式；本报告起初用 mxxm-t 转换的 MXFP4 GGUF，10-27 起用我们按它的格式自己转换的 1017 版，都是 12 个分片、383 GiB。
 \end{description}
 
 \subsection*{推理过程}
@@ -918,6 +1016,9 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf \
   \item[server 的槽位（slot）] server 同时服务的会话数（\code{-np}），本报告用 1 个；和专家缓存的槽位无关。
   \item[回退环（n\_rs\_seq）] 为投机解码准备的少量回退能力，可以撤销最近几个 token；没开投机解码时为 0，缓存只能退回检查点。
   \item[投机解码] 用小模型先猜几个 token，再让大模型一次验证，猜对的部分直接接受。
+  \item[对话模板（chat template）] 把多轮消息、工具定义和工具结果拼成模型看到的 token 序列的规则。V4.1 的官方规则在 \code{encoding/encoding.py}，server 用 Jinja 模板实现，必须逐字一致（\S\ref{sec:template}）。
+  \item[temperature、top\_p] 采样参数：temperature 调整概率分布的尖锐程度，top\_p 只在累计概率达到 p 的候选里抽取。1017 推荐两者都取 1.0，即按模型原本的分布采样。
+  \item[有界重放（bounded replay）] DeepInfer 的做法：需要重建滑动窗口的状态时，只重算最后 128 个 token，注意力窗口也截在这一段之内，得到近似的 SWA KV；解码器层的预填充也只算末尾 140 个 token。
   \item[temperature 0（贪心）] 每步都取概率最大的 token，同样的输入一定得到同样的输出，适合对拍。
 \end{description}
 

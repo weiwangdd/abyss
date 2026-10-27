@@ -1,6 +1,6 @@
 # 技术报告
 
-`report.pdf` 是到 2026-10-25 为止的优化过程，源文件是 `report.tex`。版式参考 DeepSeek-V4.1-Flash 的技术报告，图表用 pgfplots 画，数据直接写在源文件里，出处见 `docs/scheduler.md`。
+`report.pdf` 是到 2026-10-27 为止的优化过程，源文件是 `report.tex`。版式参考 DeepSeek-V4.1-Flash 的技术报告，图表用 pgfplots 画，数据直接写在源文件里，出处见 `docs/scheduler.md`。
 
 ## 编译
 
