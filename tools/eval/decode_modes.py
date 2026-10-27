@@ -9,12 +9,13 @@ of each request is the decode speed (decode_modes.sh reads it).
 """
 
 import argparse
+import os
 import json
 import subprocess
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8080"
+URL = os.environ.get("DECODE_URL", "http://127.0.0.1:8080")
 TOOLS = [
     {"type": "function", "function": {"name": "read_file", "description": "读取一个文件的内容",
                                       "parameters": {"type": "object", "properties": {"path": {"type": "string"}},

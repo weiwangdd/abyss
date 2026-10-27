@@ -2,11 +2,14 @@
 # Decode speed of a long agent-like conversation (decode_modes.py) on a server with the production settings: per turn
 # the mode (greedy or default sampling, streamed or not), the prefill of what the turn appended and the decode speed
 # from the server log. REPEAT (corpus copies in turn 1, default 6, about 96k tokens), ROUNDS (turns per mode, default
-# 2), MAX_TOKENS (default 256) and MODES are passed on; EXTRA adds server arguments. CAPTURE=1 runs the server inside
+# 2), MAX_TOKENS (default 256) and MODES are passed on; EXTRA adds server arguments, MODEL and PORT override the model
+# and the port (another port keeps clients of the production server out). CAPTURE=1 runs the server inside
 # nsys and captures the last turn into $OUT/decode-modes.nsys-rep, then prints the per-token breakdown of its decode.
 O=${OUT:-$HOME/abyss-eval}
 B=${BUILD:-$HOME/src/mx-llama.cpp/build-m2/bin}
-M=$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf
+M=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf}
+PORT=${PORT:-8080}
+export DECODE_URL=http://127.0.0.1:$PORT
 E=$(cd "$(dirname "$0")" && pwd)
 
 if pgrep -x llama-server >/dev/null; then
@@ -28,7 +31,7 @@ ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_C
   -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' \
   -c 131072 -b 65536 -ub 2048 -np 1 --moe-cache-mib 14000 \
   --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" \
-  --host 127.0.0.1 --port 8080 $EXTRA > "$log" 2>&1 &
+  --host 127.0.0.1 --port "$PORT" $EXTRA > "$log" 2>&1 &
 pid=$!
 until grep -q "listening on" "$log"; do
   kill -0 $pid 2>/dev/null || { echo "server died, see $log"; exit 1; }
