@@ -191,6 +191,9 @@ struct llama_vocab {
                          bool   add_special,
                          bool   parse_special = false) const;
 
+    // abyss: no added (control or user-defined) token is matched in raw_text, see llama_tokenize_plain
+    std::vector<llama_token> tokenize_plain(const std::string & raw_text) const;
+
     // does not write null-terminator to buf
     int32_t token_to_piece(
                   llama_token   token,

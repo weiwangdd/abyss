@@ -1286,6 +1286,16 @@ extern "C" {
                             bool   add_special,
                             bool   parse_special);
 
+    /// @details Abyss: like llama_tokenize with parse_special = false, except that user-defined tokens are not matched
+    ///          either. The text is encoded with the base vocabulary alone, as by an HF tokenizer without its added
+    ///          vocabulary, so the spelling of any special token in it stays ordinary text. Adds no BOS or EOS.
+    LLAMA_API int32_t llama_tokenize_plain(
+        const struct llama_vocab * vocab,
+                      const char * text,
+                         int32_t   text_len,
+                     llama_token * tokens,
+                         int32_t   n_tokens_max);
+
     // Token Id -> Piece.
     // Uses the vocabulary in the provided context.
     // Does not write null terminator to the buffer.

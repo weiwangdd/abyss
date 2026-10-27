@@ -1202,6 +1202,12 @@ std::vector<llama_token> common_tokenize(
                         bool   add_special,
                         bool   parse_special = false);
 
+// abyss: tokenizes text with the base vocabulary alone, so the spelling of a special token in it stays ordinary text
+// (see llama_tokenize_plain)
+std::vector<llama_token> common_tokenize_plain(
+    const struct llama_vocab * vocab,
+           const std::string & text);
+
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`
 std::string common_token_to_piece(

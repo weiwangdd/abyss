@@ -152,6 +152,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
 
     data.prompt = common_chat_template_direct_apply_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+    data.prompt_input_known = inputs.mark_input;
     data.generation_prompt = common_chat_template_generation_prompt_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
@@ -179,6 +180,8 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             }
         }
 
+        // abyss: the appended prefill mixes the request's text with the template's, it is not tracked
+        data.prompt_input_known = false;
         data.prompt.append(data.generation_prompt);
     }
 

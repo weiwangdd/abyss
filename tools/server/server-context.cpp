@@ -5588,6 +5588,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && prompt.is_string() && data.contains("abyss_prompt_special")) {
+            // abyss: a chat prompt with its template's special tokens, see oaicompat_chat_params_parse
+            inputs.push_back(server_tokens(tokenize_chat_prompt_special(ctx_server.vocab, prompt.get<std::string>(), data.at("abyss_prompt_special"), true), false));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
@@ -6647,13 +6650,21 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files; // dummy, unused
         common_chat_session session;   // dummy, unused
         json body = json::parse(req.body);
+        // abyss: "with_tokens": true also returns the tokens the chat path submits for this prompt
+        const bool with_tokens = json_value(body, "with_tokens", false);
         json data = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,
             meta->chat_params,
             files,
             session);
-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        json out = {{ "prompt", data.at("prompt") }};
+        if (with_tokens) {
+            out["tokens"] = data.contains("abyss_prompt_special")
+                ? tokenize_chat_prompt_special(ctx_server.vocab, data.at("prompt").get<std::string>(), data.at("abyss_prompt_special"), true)
+                : tokenize_mixed(ctx_server.vocab, data.at("prompt"), true, true);
+        }
+        res->ok(out);
         return res;
     };
 
@@ -7494,6 +7505,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
         n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
+    } else if (prompt.is_string() && body_parsed.contains("abyss_prompt_special")) {
+        n_tokens = tokenize_chat_prompt_special(ctx_server.vocab, prompt.get<std::string>(), body_parsed.at("abyss_prompt_special"), true).size();
     } else {
         n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
     }

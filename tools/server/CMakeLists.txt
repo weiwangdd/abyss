@@ -73,3 +73,13 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# abyss: llama-abyss-chat-tokens prints the server's chat prompts and their tokens, loading only the vocabulary
+
+set(TARGET llama-abyss-chat-tokens)
+
+add_executable(${TARGET} abyss-chat-tokens.cpp)
+
+target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
+target_link_libraries(${TARGET} PRIVATE server-context)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

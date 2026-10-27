@@ -294,6 +294,12 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
  */
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
 
+// abyss: with ABYSS_PLAIN_INPUT=1 a chat prompt carries the special tokens its template wrote ("abyss_prompt_special",
+// [start, end, token] each); tokenize_chat_prompt_special encodes the rest of the prompt with the base vocabulary alone,
+// so a special-token spelling that came from the request stays ordinary text (see common_chat_tokenize_prompt)
+bool abyss_plain_input();
+llama_tokens tokenize_chat_prompt_special(const llama_vocab * vocab, const std::string & prompt, const json & special, bool add_special);
+
 // return the last index of character that can form a valid string
 // if the last character is potentially cut in half, return the index before the cut
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8

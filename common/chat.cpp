@@ -18,6 +18,7 @@
 #include "peg-parser.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -25,6 +26,7 @@
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <mutex>
 
 #include <optional>
 #include <sstream>
@@ -1897,6 +1899,106 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     return msg;
 }
 
+// abyss: the spellings of the control and user-defined tokens (the ones llama_tokenize matches when it parses special
+// tokens), by first byte, longest first
+struct common_chat_special_spellings {
+    std::array<std::vector<std::pair<std::string, llama_token>>, 256> by_first;
+};
+
+static const common_chat_special_spellings & common_chat_get_special_spellings(const llama_vocab * vocab) {
+    static std::mutex mutex;
+    static std::map<const llama_vocab *, common_chat_special_spellings> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(vocab);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    common_chat_special_spellings sp;
+    const llama_token n_tokens = llama_vocab_n_tokens(vocab);
+    for (llama_token id = 0; id < n_tokens; id++) {
+        if (!(llama_vocab_get_attr(vocab, id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN))) {
+            continue;
+        }
+        std::string text = llama_vocab_get_text(vocab, id);
+        if (!text.empty()) {
+            sp.by_first[(unsigned char) text[0]].emplace_back(std::move(text), id);
+        }
+    }
+    for (auto & v : sp.by_first) {
+        std::stable_sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first.size() > b.first.size(); });
+    }
+    return cache.emplace(vocab, std::move(sp)).first->second;
+}
+
+// abyss: the special tokens in the template's own text, that is the prompt outside the parts that came from the
+// request; the positions are bytes of prompt.str()
+static std::vector<common_chat_prompt_special> common_chat_find_template_special(
+        const llama_vocab * vocab, const common_chat_prompt & prompt) {
+    const auto & sp = common_chat_get_special_spellings(vocab);
+    const std::string text = prompt.str();
+    std::vector<common_chat_prompt_special> out;
+    auto scan = [&](size_t begin, size_t end) {
+        for (size_t pos = begin; pos < end;) {
+            bool found = false;
+            for (const auto & [spelling, id] : sp.by_first[(unsigned char) text[pos]]) {
+                if (spelling.size() <= end - pos && text.compare(pos, spelling.size(), spelling) == 0) {
+                    out.push_back({pos, pos + spelling.size(), id});
+                    pos += spelling.size();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                pos++;
+            }
+        }
+    };
+    // consecutive parts of the template are scanned as one piece: a template may put a token together from several
+    size_t begin = 0;
+    size_t pos   = 0;
+    for (const auto & part : prompt.parts) {
+        if (part.is_input && !part.text.empty()) {
+            scan(begin, pos);
+            begin = pos + part.text.size();
+        }
+        pos += part.text.size();
+    }
+    scan(begin, text.size());
+    return out;
+}
+
+std::vector<llama_token> common_chat_tokenize_prompt(
+        const llama_vocab *                             vocab,
+        const std::string &                             prompt,
+        const std::vector<common_chat_prompt_special> & special,
+        bool                                            add_special) {
+    std::vector<llama_token> out;
+    if (add_special && llama_vocab_get_add_bos(vocab)) {
+        out.push_back(llama_vocab_bos(vocab));
+    }
+    const llama_token n_tokens = llama_vocab_n_tokens(vocab);
+    size_t pos = 0;
+    auto add_plain = [&](size_t end) {
+        if (end > pos) {
+            const auto plain = common_tokenize_plain(vocab, prompt.substr(pos, end - pos));
+            out.insert(out.end(), plain.begin(), plain.end());
+        }
+    };
+    for (const auto & s : special) {
+        if (s.start < pos || s.end <= s.start || s.end > prompt.size() || s.token < 0 || s.token >= n_tokens) {
+            throw std::invalid_argument("invalid special token in the prompt");
+        }
+        add_plain(s.start);
+        out.push_back(s.token);
+        pos = s.end;
+    }
+    add_plain(prompt.size());
+    if (add_special && llama_vocab_get_add_eos(vocab)) {
+        out.push_back(llama_vocab_eos(vocab));
+    }
+    return out;
+}
+
 common_chat_session::common_chat_session(const common_chat_templates *        tmpls,
                                          const llama_vocab *                  vocab,
                                          const common_chat_templates_inputs & inputs,
@@ -1931,6 +2033,12 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
         grammar_triggers = std::move(resolved.grammar_triggers);
 
         delimiters.tokenize(vocab);
+
+        // abyss: only the special tokens the template wrote are special, see common_chat_tokenize_prompt
+        if (applied.prompt_input_known) {
+            special       = common_chat_find_template_special(vocab, prompt_parts);
+            special_known = true;
+        }
     } else {
         grammar_triggers = std::move(applied.grammar_triggers);
     }

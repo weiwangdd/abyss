@@ -2196,10 +2196,12 @@ struct llama_vocab::impl {
                          bool   special) const;
 
 
+    // abyss: parse_added = false matches no added token at all, not even the user-defined ones
     std::vector<llama_token> tokenize(
             const std::string & raw_text,
                          bool   add_special,
-                         bool   parse_special = false) const;
+                         bool   parse_special = false,
+                         bool   parse_added   = true) const;
 
     int32_t tokenize(
                    const char * text,
@@ -3809,7 +3811,8 @@ static std::string llama_decode_text(const std::string & text) {
 std::vector<llama_token> llama_vocab::impl::tokenize(
         const std::string & raw_text,
         bool add_special,
-        bool parse_special) const {
+        bool parse_special,
+        bool parse_added) const {
     GGML_ASSERT(tokenizer && "Tokenizer not initialized. Call llama_vocab::init_tokenizer() first.");
 
     std::vector<llama_token> output;
@@ -3817,7 +3820,9 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 
     if (!raw_text.empty()) {
         fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
-        tokenizer_st_partition(fragment_buffer, parse_special);
+        if (parse_added) {
+            tokenizer_st_partition(fragment_buffer, parse_special);
+        }
     }
 
     switch (get_type()) {
@@ -4674,6 +4679,10 @@ std::vector<llama_token> llama_vocab::tokenize(
     return pimpl->tokenize(raw_text, add_special, parse_special);
 }
 
+std::vector<llama_token> llama_vocab::tokenize_plain(const std::string & raw_text) const {
+    return pimpl->tokenize(raw_text, false, false, false);
+}
+
 const std::string & llama_vocab::token_to_piece(llama_token token) const {
     return pimpl->token_to_piece(token);
 }
@@ -4940,6 +4949,26 @@ int32_t llama_tokenize(
                         bool   add_special,
                         bool   parse_special) {
     return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+}
+
+int32_t llama_tokenize_plain(
+    const struct llama_vocab * vocab,
+                  const char * text,
+                     int32_t   text_len,
+                 llama_token * tokens,
+                     int32_t   n_tokens_max) {
+    const auto res = vocab->tokenize_plain(std::string(text, text_len));
+    if (res.size() >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        LLAMA_LOG_ERROR("%s: tokenization result size %zu exceeds int32_t limit\n", __func__, res.size());
+        return std::numeric_limits<int32_t>::min();
+    }
+    if (n_tokens_max < (int) res.size()) {
+        return -((int) res.size());
+    }
+    for (size_t i = 0; i < res.size(); i++) {
+        tokens[i] = res[i];
+    }
+    return res.size();
 }
 
 int32_t llama_token_to_piece(

@@ -1885,6 +1885,25 @@ std::vector<llama_token> common_tokenize(
     return result;
 }
 
+std::vector<llama_token> common_tokenize_plain(
+    const struct llama_vocab * vocab,
+           const std::string & text) {
+    // upper limit for the number of tokens
+    std::vector<llama_token> result(text.length() + 1);
+    int n_tokens = llama_tokenize_plain(vocab, text.data(), text.length(), result.data(), result.size());
+    if (n_tokens == std::numeric_limits<int32_t>::min()) {
+        throw std::runtime_error("Tokenization failed: input text too large, tokenization result exceeds int32_t limit");
+    }
+    if (n_tokens < 0) {
+        result.resize(-n_tokens);
+        int check = llama_tokenize_plain(vocab, text.data(), text.length(), result.data(), result.size());
+        GGML_ASSERT(check == -n_tokens);
+    } else {
+        result.resize(n_tokens);
+    }
+    return result;
+}
+
 std::string common_token_to_piece(const struct llama_context * ctx, llama_token token, bool special) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);

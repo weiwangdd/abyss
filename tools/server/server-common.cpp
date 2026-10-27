@@ -1003,6 +1003,23 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
     return result;
 }
 
+bool abyss_plain_input() {
+    static const bool on = [] {
+        const char * env = getenv("ABYSS_PLAIN_INPUT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
+llama_tokens tokenize_chat_prompt_special(const llama_vocab * vocab, const std::string & prompt, const json & special, bool add_special) {
+    std::vector<common_chat_prompt_special> list;
+    list.reserve(special.size());
+    for (const auto & s : special) {
+        list.push_back({s.at(0).get<size_t>(), s.at(1).get<size_t>(), s.at(2).get<llama_token>()});
+    }
+    return common_chat_tokenize_prompt(vocab, prompt, list, add_special);
+}
+
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
     // or the first element of the json_prompt array is a string.
@@ -1533,6 +1550,21 @@ json oaicompat_chat_params_parse(
 
     llama_params["prompt"] = out_session.prompt().str();
 
+    // abyss: ABYSS_PLAIN_INPUT=1 encodes the request's text with the base vocabulary alone, like the official
+    // DeepSeek Recipe, so a special-token spelling in a message, tool result or tool definition stays ordinary text
+    const bool plain_input = abyss_plain_input() && out_session.prompt_special_known();
+    if (plain_input) {
+        json special = json::array();
+        for (const auto & s : out_session.prompt_special()) {
+            json item = json::array();
+            item.push_back(s.start);
+            item.push_back(s.end);
+            item.push_back(s.token);
+            special.push_back(std::move(item));
+        }
+        llama_params["abyss_prompt_special"] = std::move(special);
+    }
+
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
@@ -1578,6 +1610,11 @@ json oaicompat_chat_params_parse(
     if (!out_session.grammar().empty()) {
         llama_params.erase("grammar");
         llama_params.erase("json_schema");
+    }
+
+    // abyss: only the server says where the template's special tokens are
+    if (!plain_input) {
+        llama_params.erase("abyss_prompt_special");
     }
 
     return llama_params;

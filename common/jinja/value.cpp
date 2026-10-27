@@ -266,6 +266,27 @@ static std::string json_ensure_ascii_preserving_format(const std::string & json_
 
 static std::string float_repr(double val);
 
+// abyss: whether every string in a value, recursively, came from the input (true for a value without strings)
+static bool all_strings_are_input(const value & val) {
+    if (is_val<value_string>(val)) {
+        return cast_val<value_string>(val)->val_str.all_parts_are_input();
+    }
+    if (is_val<value_array>(val)) {
+        for (const auto & item : val->as_array()) {
+            if (!all_strings_are_input(item)) {
+                return false;
+            }
+        }
+    } else if (is_val<value_object>(val)) {
+        for (const auto & [key, item] : val->as_ordered_object()) {
+            if (!all_strings_are_input(item)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static value tojson(const func_args & args) {
     args.ensure_count(1, 5);
     value val_ascii      = args.get_kwarg_or_pos("ensure_ascii", 1);
@@ -292,7 +313,12 @@ static value tojson(const func_args & args) {
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }
-    return mk_val<value_string>(json_str);
+    auto res = mk_val<value_string>(json_str);
+    // abyss: the JSON of input values (tool definitions, tool call arguments) is input as well
+    if (all_strings_are_input(args.get_pos(0))) {
+        res->val_str.mark_input();
+    }
+    return res;
 }
 
 static value & get_attribute(const value & val, const value & attr, value & default_val) {
@@ -1169,8 +1195,9 @@ const func_builtins & value_array_t::get_builtins() const {
             value attribute = args.get_kwarg_or_pos("attribute", 2);
             value undef = mk_val<value_undefined>();
             const auto & arr = args.get_pos(0)->as_array();
-            const std::string delim = val_delim->is_undefined() ? "" : val_delim->as_string().str();
-            std::string result;
+            // abyss: the joined string keeps which of its parts came from the input
+            const string delim = val_delim->is_undefined() ? string() : val_delim->as_string();
+            string result;
             for (size_t i = 0; i < arr.size(); ++i) {
                 value val_arr = arr[i];
                 if (!attribute->is_undefined()) {
@@ -1179,9 +1206,9 @@ const func_builtins & value_array_t::get_builtins() const {
                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
                     throw raised_exception("join() can only join arrays of strings or numerics");
                 }
-                result += val_arr->as_string().str();
+                result.append(val_arr->as_string());
                 if (i < arr.size() - 1) {
-                    result += delim;
+                    result.append(delim);
                 }
             }
             return mk_val<value_string>(result);

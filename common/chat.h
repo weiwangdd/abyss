@@ -315,6 +315,10 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     common_peg_arena                    parser;
     common_chat_msg_delimiters          message_delimiters;
+
+    // abyss: set by a handler whose prompt parts mark all the text of the request (message content, reasoning, tool
+    // calls, results and definitions) as input, so that a special token outside them is one the template wrote
+    bool prompt_input_known = false;
 };
 
 struct common_chat_input {
@@ -394,6 +398,22 @@ const char *    common_chat_format_name(common_chat_format format);
 common_chat_msg common_chat_parse(const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
 common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const common_chat_input & input, bool is_partial, const common_chat_parser_params & params);
 
+// abyss: a special token the template itself wrote into the prompt, at bytes [start, end)
+struct common_chat_prompt_special {
+    size_t      start;
+    size_t      end;
+    llama_token token;
+};
+
+// abyss: tokenizes a rendered chat prompt the way the official DeepSeek Recipe encodes one: each special token the
+// template wrote as its id, all other text, including any special-token spelling that came from the request, with
+// the base vocabulary alone
+std::vector<llama_token> common_chat_tokenize_prompt(
+    const llama_vocab *                             vocab,
+    const std::string &                             prompt,
+    const std::vector<common_chat_prompt_special> & special,
+    bool                                            add_special);
+
 struct common_chat_session_params {
     bool echo  = false; // include the assistant prefill in the output when continuing a message
     bool debug = false; // enable debug output for the PEG parser
@@ -421,6 +441,10 @@ class common_chat_session {
 
     const common_chat_msg_delimiters & message_delimiters() const { return delimiters; }
 
+    // abyss: the special tokens the template wrote into the prompt, known when its handler tracks the request's text
+    const std::vector<common_chat_prompt_special> & prompt_special() const { return special; }
+    bool prompt_special_known() const { return special_known; }
+
     void apply_sampling(common_params_sampling & sampling) const;
 
     bool has_template() const { return templated; }
@@ -443,6 +467,9 @@ class common_chat_session {
     common_chat_parser_params  parser_params;
     common_chat_msg_delimiters delimiters;
     common_chat_input          input;
+
+    std::vector<common_chat_prompt_special> special;
+    bool                                    special_known = false;
     common_chat_msg            result;
     bool                       templated = false;
     bool                       finished  = false;
