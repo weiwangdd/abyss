@@ -1,5 +1,5 @@
 #!/bin/bash
-# Context sizes beyond 128K (ctx_size.py; MODEL and PORT override the model and the port). For each configuration NAME:CTX:MOE_CACHE_MIB:UBATCH in CONFIGS, a server
+# Context sizes beyond 128K (ctx_size.py; MODEL and PORT override the model and the port, EXTRA adds server arguments). For each configuration NAME:CTX:MOE_CACHE_MIB:UBATCH in CONFIGS, a server
 # with the production settings: the memory after loading and the peak while it runs a 96k-token prompt (its outputs
 # must match across the configurations) and a prompt filling the context (a passphrase at the start, asked about at
 # the end; prefill and decode speed at that context). Each fill length in FILLCMP that fits is run again on the larger
@@ -28,7 +28,7 @@ start() {  # context, expert cache MiB, ubatch
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' \
     -c "$1" -b 65536 -ub "$3" -np 1 --moe-cache-mib "$2" --checkpoint-min-step 32768 \
     --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" --no-reasoning-preserve \
-    --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 &
+    --host 127.0.0.1 --port "$PORT" $EXTRA > "$log" 2>&1 &
   pid=$!
   until grep -q "listening on" "$log"; do
     if ! kill -0 $pid 2>/dev/null; then

@@ -26,8 +26,8 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   nohup ./build-m2/bin/llama-server \
   -m ~/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
-  -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" \
-  -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 16000 \
+  -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" -ot "blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
+  -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 \
   --checkpoint-min-step 32768 --slot-save-path $HOME/abyss-stats/slots \
   --jinja --chat-template-file $HOME/abyss-stats/tmpl/v41.jinja --no-reasoning-preserve \
   --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0 \
