@@ -1319,6 +1319,12 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // abyss: the device cache for the experts kept in host memory (the server's --moe-cache-mib), from the
+        // environment variable the server reads too
+        if (const char * e = getenv("LLAMA_ARG_MOE_CACHE_MIB")) {
+            cparams.moe_cache_size = (size_t) atoll(e)*1024*1024;
+        }
+
         return cparams;
     }
 };
