@@ -1,0 +1,303 @@
+From fa115e02e08307b846e2391a5f4919d607c180e2 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 28 Oct 2026 11:17:44 +0100
+Subject: [PATCH] abyss: ABYSS_DSV41_IDX_CHUNK=N scores, selects and attends
+ the V4.1 prefill in chunks of N queries, each mask chunk viewed once per
+ graph, so GPU1's compute buffer at 192K drops from 6.9 to 3.2 GB
+
+---
+ src/llama-context.cpp    |   3 +
+ src/models/deepseek4.cpp | 182 ++++++++++++++++++++++++++++++++-------
+ src/models/models.h      |   7 ++
+ 3 files changed, 161 insertions(+), 31 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index edf9d78..582e35a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3109,6 +3109,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         model.arch == LLM_ARCH_CLEF ||
+         model.arch == LLM_ARCH_QWEN4EXP ||
+         model.arch == LLM_ARCH_DEEPSEEK4 ||
++        // abyss: V4.1 as well; its indexer prefill in chunks of queries (ABYSS_DSV41_IDX_CHUNK) adds a few dozen nodes
++        // per chunk and layer, past the default budget
++        model.arch == LLM_ARCH_DEEPSEEK41 ||
+         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
+         model.arch == LLM_ARCH_NANBEIGE ||
+         model.arch == LLM_ARCH_MINIMAX_01 ||
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 0465279..b70bc40 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -762,6 +762,21 @@ static bool dsv41_decode_gather_on() {
+     return on;
+ }
+ 
++// abyss: the V4.1 indexer's prefill scores and attends in chunks of this many queries (ABYSS_DSV41_IDX_CHUNK, 0 = all at
++// once). Its scores and top-k masks hold a row per compressed position and query, about 1.6 GB each at 192K positions
++// and a 2048-token ubatch; in chunks they take that per chunk, and every query's result stays the same
++static int64_t dsv41_idx_chunk() {
++    static const int64_t n = [] {
++        const char * e = getenv("ABYSS_DSV41_IDX_CHUNK");
++        const int64_t v = e != nullptr ? std::max(0, atoi(e)) : 0;
++        if (v > 0) {
++            LLAMA_LOG_INFO("deepseek41: ABYSS_DSV41_IDX_CHUNK=%lld, the indexer prefill works on chunks of queries\n", (long long) v);
++        }
++        return v;
++    }();
++    return n;
++}
++
+ // FP4 (e2m1) quantize-dequantize in blocks of 32 along dim 0, with the power-of-two scale 2^ceil(log2(amax/6)) of the
+ // reference's fp4_act_quant. Built from plain ops: the e2m1 grid steps 0.5 up to 2, 1 up to 4 and 2 up to 6, and
+ // ggml_round breaks ties away from zero where the hardware rounds to even, which only matters on exact ties.
+@@ -860,14 +875,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_index_top_k(
+     ggml_tensor * w = build_lora_mm(layer.indexer_proj, cur);
+     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(head_dim*n_head)));
+ 
+-    ggml_tensor * mask = tier.kq_mask;
+     int64_t nq = nt;
+     if (q_rows) {
+         nq = q_rows->ne[0];
+         q = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), head_dim*n_head, nt), q_rows);
+         q = ggml_reshape_3d(ctx0, q, head_dim, n_head, nq);
+         w = ggml_get_rows(ctx0, w, q_rows);
+-        mask = ggml_cast(ctx0, ggml_get_rows(ctx0, mask, q_rows), GGML_TYPE_F16);
+     }
+     q = build_fp4_qdq(q);
+     cb(q, "idx_q", il);
+@@ -879,15 +892,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_index_top_k(
+     const int64_t n_comp = tier.kq_mask->ne[0];
+     GGML_ASSERT(n_comp > 0 && n_comp <= k->ne[2]);
+     k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], n_comp, k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+-
+     const int64_t n_stream = k->ne[3];
+-    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+-            q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+-    w = ggml_view_4d(ctx0, w, w->ne[0], w->ne[1]/n_stream, w->ne[2], n_stream,
+-            w->nb[1], w->nb[2]/n_stream, w->nb[3]/n_stream, 0);
+-
+-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, k, w, mask);
+-    cb(score, "idx_score", il);
+ 
+     // candidate blocks: only the ratio 1 tier has a candidate source, and below candidate_topk_blocks blocks every
+     // block is kept anyway
+@@ -895,47 +900,113 @@ ggml_tensor * llama_model_deepseek4::graph::build_dsv41_index_top_k(
+     const int64_t n_cand   = hparams.dsv41_candidate_topk;
+     const int     cand_src = (int) hparams.dsv41_candidate_src_layer;
+     const bool cand_on = !tier_idx && blk > 0 && n_cand > 0 && cand_src > 0 && n_comp % blk == 0 && n_comp/blk > n_cand;
+-    if (cand_on && il == cand_src) {
+-        const int64_t n_blocks = n_comp/blk;
+-        ggml_tensor * blocks = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nq), GGML_OP_POOL_MAX, blk, blk, 0);
++    const int64_t n_blocks = cand_on ? n_comp/blk : 0;
+ 
+-        // the block with each query's newest position is only partly filled, so it is pinned in
++    // the block with each query's newest position is only partly filled, so the candidate source pins it in
++    ggml_tensor * newest = nullptr;
++    if (cand_on && il == cand_src) {
+         auto inp_newest = std::make_unique<llm_graph_input_dsv41_cand>(hparams.dsv4_compress_ratios[il], blk);
+         inp_newest->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nt);
+         ggml_set_input(inp_newest->pos);
+-        ggml_tensor * newest = ggml_reshape_2d(ctx0, inp_newest->pos, 1, nt);
++        newest = ggml_reshape_2d(ctx0, inp_newest->pos, 1, nt);
+         res->add_input(std::move(inp_newest));
+         if (q_rows) {
+             newest = ggml_get_rows(ctx0, newest, q_rows);
+         }
+-        ggml_tensor * pin = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, nq), INFINITY);
+-        blocks = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, blocks, 1, n_blocks, nq), pin, newest);
+-        blocks = ggml_reshape_2d(ctx0, blocks, n_blocks, nq);
+-
+-        ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, blocks, n_cand));
+-        ggml_tensor * keep = ggml_fill(ctx0, blocks, -INFINITY);
+-        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_cand, nq), 0.0f);
+-        keep = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, keep, 1, n_blocks, nq), zeros, top_blocks);
+-        idx_cand = ggml_reshape_2d(ctx0, keep, n_blocks, nq);
+-        cb(idx_cand, "idx_cand", il);
+-    } else if (cand_on && il > cand_src) {
++    }
++
++    // a later index source of that tier adds the candidate source's kept blocks to its scores
++    ggml_tensor * cand = nullptr;
++    if (cand_on && il > cand_src) {
+         GGML_ASSERT(idx_cand);
+-        ggml_tensor * cand = idx_cand;
++        cand = idx_cand;
+         if (q_rows) {
+             cand = ggml_get_rows(ctx0, cand, inp_ced->get_map(il, cand_src));
+         }
+-        score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, blk, n_comp/blk, nq),
+-                ggml_reshape_3d(ctx0, cand, 1, n_comp/blk, nq));
+-        score = ggml_reshape_2d(ctx0, score, n_comp, nq);
+     }
+ 
+     const int64_t n_top_k = std::min<int64_t>(n_comp, hparams.indexer_top_k);
+-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nq), n_top_k));
++
++    // abyss: the top-k of queries [c0, c0 + nc), and for the candidate source the blocks they keep
++    auto top_k_rows = [&](int64_t c0, int64_t nc, ggml_tensor ** keep_out) -> ggml_tensor * {
++        const bool whole = c0 == 0 && nc == nq;
++        ggml_tensor * qc = whole ? q : ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nc, q->nb[1], q->nb[2], c0*q->nb[2]);
++        ggml_tensor * wc = whole ? w : ggml_view_2d(ctx0, w, w->ne[0], nc, w->nb[1], c0*w->nb[1]);
++        ggml_tensor * mask = tier.kq_mask;
++        if (q_rows) {
++            ggml_tensor * rows = whole ? q_rows : ggml_view_1d(ctx0, q_rows, nc, c0*q_rows->nb[0]);
++            mask = ggml_cast(ctx0, ggml_get_rows(ctx0, mask, rows), GGML_TYPE_F16);
++        } else if (!whole) {
++            mask = mask_chunk(mask, c0, nc);
++        }
++
++        qc = ggml_view_4d(ctx0, qc, qc->ne[0], qc->ne[1], qc->ne[2]/n_stream, n_stream,
++                qc->nb[1], qc->nb[2], qc->nb[3]/n_stream, 0);
++        wc = ggml_view_4d(ctx0, wc, wc->ne[0], wc->ne[1]/n_stream, wc->ne[2], n_stream,
++                wc->nb[1], wc->nb[2]/n_stream, wc->nb[3]/n_stream, 0);
++
++        ggml_tensor * score = ggml_lightning_indexer(ctx0, qc, k, wc, mask);
++        cb(score, "idx_score", il);
++
++        if (newest) {
++            ggml_tensor * blocks = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nc), GGML_OP_POOL_MAX, blk, blk, 0);
++            ggml_tensor * newest_c = whole ? newest : ggml_view_2d(ctx0, newest, 1, nc, newest->nb[1], c0*newest->nb[1]);
++            ggml_tensor * pin = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, nc), INFINITY);
++            blocks = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, blocks, 1, n_blocks, nc), pin, newest_c);
++            blocks = ggml_reshape_2d(ctx0, blocks, n_blocks, nc);
++
++            ggml_tensor * top_blocks = ggml_cont(ctx0, ggml_top_k(ctx0, blocks, n_cand));
++            ggml_tensor * keep = ggml_fill(ctx0, blocks, -INFINITY);
++            ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_cand, nc), 0.0f);
++            keep = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, keep, 1, n_blocks, nc), zeros, top_blocks);
++            *keep_out = ggml_reshape_2d(ctx0, keep, n_blocks, nc);
++        } else if (cand) {
++            ggml_tensor * cand_c = whole ? cand : ggml_view_2d(ctx0, cand, cand->ne[0], nc, cand->nb[1], c0*cand->nb[1]);
++            score = ggml_add(ctx0, ggml_reshape_3d(ctx0, score, blk, n_blocks, nc),
++                    ggml_reshape_3d(ctx0, cand_c, 1, n_blocks, nc));
++            score = ggml_reshape_2d(ctx0, score, n_comp, nc);
++        }
++
++        return ggml_cont(ctx0, ggml_top_k(ctx0, ggml_reshape_2d(ctx0, score, n_comp, nc), n_top_k));
++    };
++
++    // abyss: in chunks (ABYSS_DSV41_IDX_CHUNK) each chunk joins the graph before the next one is built, so its scores
++    // are freed before the next chunk scores
++    const int64_t chunk = n_stream == 1 ? dsv41_idx_chunk() : 0;
++    ggml_tensor * top_k = nullptr;
++    ggml_tensor * keep  = nullptr;
++    if (chunk <= 0 || nq <= chunk) {
++        top_k = top_k_rows(0, nq, &keep);
++    } else {
++        for (int64_t c0 = 0; c0 < nq; c0 += chunk) {
++            const int64_t nc = std::min(chunk, nq - c0);
++            ggml_tensor * keep_c = nullptr;
++            ggml_tensor * top_c = top_k_rows(c0, nc, &keep_c);
++            ggml_build_forward_expand(gf, top_c);
++            top_k = top_k ? ggml_concat(ctx0, top_k, top_c, 1) : top_c;
++            if (keep_c) {
++                ggml_build_forward_expand(gf, keep_c);
++                keep = keep ? ggml_concat(ctx0, keep, keep_c, 1) : keep_c;
++            }
++        }
++    }
++    if (keep) {
++        idx_cand = keep;
++        cb(idx_cand, "idx_cand", il);
++    }
+     cb(top_k, "idx_top_k", il);
+ 
+     return top_k;
+ }
+ 
++ggml_tensor * llama_model_deepseek4::graph::mask_chunk(ggml_tensor * mask, int64_t c0, int64_t nc) const {
++    ggml_tensor *& view = mask_chunks[{mask, c0, nc}];
++    if (!view) {
++        view = ggml_view_2d(ctx0, mask, mask->ne[0], nc, mask->nb[1], c0*mask->nb[1]);
++    }
++    return view;
++}
++
+ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
+         ggml_tensor * kq_mask,
+         ggml_tensor * top_k,
+@@ -1119,6 +1190,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+         return out;
+     }
+ 
++    // abyss: with the V4.1 indexer the prefill attends in chunks of queries (ABYSS_DSV41_IDX_CHUNK), so the top-k masks,
++    // a row per compressed position and query, exist for one chunk at a time
++    const int64_t nq_all = q_rows ? q_rows->ne[0] : q->ne[2];
++    const int64_t chunk  = top_k && hca_k->ne[3] == 1 ? dsv41_idx_chunk() : 0;
++    if (chunk > 0 && nq_all > chunk) {
++        ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
++        cb(k_all, "hca_k_all", il);
++
++        if (q_rows) {
++            ggml_tensor * q_cont = ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q);
++            q = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, q_cont, q->ne[0]*q->ne[1], q->ne[2]), q_rows);
++            q = ggml_reshape_3d(ctx0, q, q_cont->ne[0], q_cont->ne[1], nq_all);
++        }
++
++        ggml_tensor * raw_mask = inp_attn->get_kq_mask();
++        ggml_tensor * hca_mask = inp_hca.kq_mask;
++        const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
++
++        // the mask rows of queries [c0, c0 + nc); rows taken by q_rows come back as f32 and are narrowed to f16
++        auto mask_rows = [&](ggml_tensor * mask, int64_t c0, int64_t nc) -> ggml_tensor * {
++            if (q_rows) {
++                ggml_tensor * rows = ggml_view_1d(ctx0, q_rows, nc, c0*q_rows->nb[0]);
++                return ggml_cast(ctx0, ggml_get_rows(ctx0, mask, rows), GGML_TYPE_F16);
++            }
++            return mask_chunk(mask, c0, nc);
++        };
++
++        ggml_tensor * out = nullptr;
++        for (int64_t c0 = 0; c0 < nq_all; c0 += chunk) {
++            const int64_t nc = std::min(chunk, nq_all - c0);
++            ggml_tensor * q_c   = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nc, q->nb[1], q->nb[2], c0*q->nb[2]);
++            ggml_tensor * top_c = ggml_view_2d(ctx0, top_k, top_k->ne[0], nc, top_k->nb[1], c0*top_k->nb[1]);
++
++            ggml_tensor * hca_mask_c = build_top_k_mask(mask_rows(hca_mask, c0, nc), top_c, "hca_top_k_mask", il);
++            ggml_tensor * kq_mask_c  = ggml_concat(ctx0, mask_rows(raw_mask, c0, nc), hca_mask_c, 0);
++            cb(kq_mask_c, "hca_kq_mask", il);
++
++            ggml_tensor * out_c = build_attn_mha(q_c, k_all, k_all, nullptr, kq_mask_c, sinks, nullptr, n_kv_max, kq_scale, il);
++            ggml_build_forward_expand(gf, out_c);
++            out = out ? ggml_concat(ctx0, out, out_c, 1) : out_c;
++        }
++        if (k_rot) {
++            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
++        }
++        cb(out, "attn_hca", il);
++
++        return out;
++    }
++
+     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+     cb(k_all, "hca_k_all", il);
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index 5879f33..a199726 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -7,6 +7,7 @@
+ // note: almost all graphs require at least sqrtf, so include cmath globally
+ #include <cmath>
+ #include <map>
++#include <tuple>
+ 
+ class llama_memory_hybrid_idx_context;
+ 
+@@ -1269,6 +1270,12 @@ struct llama_model_deepseek4 : public llama_model_base {
+         mutable int32_t       idx_top_k_src = -1;
+         mutable ggml_tensor * idx_cand      = nullptr;
+ 
++        // abyss: the views of a prefill mask's rows for a chunk of queries (ABYSS_DSV41_IDX_CHUNK), made once per graph
++        // and shared by the layers; a device gets its own copy of each view it reads, so a view per layer would copy
++        // the mask again for every layer of a split
++        mutable std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> mask_chunks;
++        ggml_tensor * mask_chunk(ggml_tensor * mask, int64_t c0, int64_t nc) const;
++
+         ggml_tensor * build_head_fold(const llama_model & model, ggml_tensor * x) const;
+ 
+         ggml_tensor * build_hc_post(
+-- 
+2.43.0
+

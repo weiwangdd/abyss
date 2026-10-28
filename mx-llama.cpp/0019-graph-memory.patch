@@ -1,0 +1,172 @@
+From 239be888fee94db09abae7a314635933becd0e33 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 28 Oct 2026 11:17:44 +0100
+Subject: [PATCH] abyss: GGML_ALLOC_TRACE=1 prints the graph allocator's
+ allocations, frees and buffer sizes and the growth of the CUDA pools; the
+ large-batch split's zeros are repeated from one row instead of filling a new
+ tensor, which as a leaf held memory from the start of the graph (2.6 GB on
+ GPU0), and an attention layer without query rows (CED) leaves its queries out
+ of the graph instead of computing them and holding them to its end
+
+---
+ ggml/src/ggml-alloc.c           | 33 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 18 ++++++++++++++++++
+ src/llama-graph.cpp             |  5 ++++-
+ src/models/deepseek4.cpp        | 12 +++++++++---
+ 4 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b5d3991..678cc58 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -18,6 +18,17 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// abyss: GGML_ALLOC_TRACE=1 prints every allocation and free of a graph's tensors to stderr with the buffer, chunk,
++// offset and size, so the tensors live at a buffer's peak can be worked out afterwards (tools/eval/alloc_peak.py)
++static bool ggml_alloc_trace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_ALLOC_TRACE");
++        on = e != NULL && atoi(e) != 0;
++    }
++    return on;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -813,6 +824,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+         hn->buffer_id = buffer_id;
+         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
++        if (ggml_alloc_trace()) {
++            fprintf(stderr, "galloc: alloc %d %d %zu %zu %s\n", buffer_id, hn->addr.chunk, hn->addr.offset, size, node->name);
++        }
+     }
+ }
+ 
+@@ -834,6 +848,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
+ #ifdef GGML_ALLOCATOR_DEBUG
+     remove_allocated_tensor(alloc, hn->addr, node);
+ #endif
++    if (ggml_alloc_trace()) {
++        fprintf(stderr, "galloc: free %d %d %zu %zu %s\n", buffer_id, hn->addr.chunk, hn->addr.offset, size, node->name);
++    }
+ 
+     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
+     hn->allocated = false;
+@@ -973,7 +990,23 @@ static bool ggml_gallocr_reserve_n_impl(
+     }
+ 
+     // allocate in hash table
++    if (ggml_alloc_trace()) {
++        fprintf(stderr, "galloc: reserve %d nodes %d leafs:", graph->n_nodes, graph->n_leafs);
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            fprintf(stderr, " %d=%s", i, ggml_backend_buft_name(galloc->bufts[i]));
++        }
++        fprintf(stderr, "\n");
++    }
+     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
++    if (ggml_alloc_trace()) {
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            size_t sz = 0;
++            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
++                sz += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
++            }
++            fprintf(stderr, "galloc: buffer %d %s max %zu\n", i, ggml_backend_buft_name(galloc->bufts[i]), sz);
++        }
++    }
+ 
+     // set the node_allocs from the hash table
+     if (galloc->n_nodes < graph->n_nodes) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c48b56f..13f6498 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -457,6 +457,18 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+ 
+ // #define DEBUG_CUDA_MALLOC
+ 
++// abyss: GGML_ALLOC_TRACE=1 (see ggml-alloc.c) also prints each growth of a device's memory pool, with the op being
++// computed, since the pool is memory the graph allocator does not see
++static thread_local const ggml_tensor * ggml_cuda_trace_node = nullptr;
++static bool ggml_cuda_pool_trace() {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_ALLOC_TRACE");
++        on = e != nullptr && atoi(e) != 0;
++    }
++    return on;
++}
++
+ // buffer pool for cuda (legacy)
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+@@ -713,6 +725,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ 
+             // add to the pool
+             pool_size += reserve_size;
++            if (ggml_cuda_pool_trace()) {
++                const ggml_tensor * t = ggml_cuda_trace_node;
++                GGML_LOG_INFO("cuda pool[%d]: %zu MiB (+%zu MiB) for %zu bytes, %s %s\n", device, pool_size >> 20,
++                        reserve_size >> 20, size, t ? ggml_op_desc(t) : "-", t ? t->name : "-");
++            }
+ 
+             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
+             //       device, (unsigned long long) (pool_size/1024/1024),
+@@ -5861,6 +5878,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                ggml_cuda_trace_node = node;
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 2050249..964aa21 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2651,7 +2651,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * x = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cur_in, n_embd, n_tokens), big_tok); // [n_embd, m]
+         ggml_backend_sched_set_tensor_backend(sched, x, moe_cache->backend(il));
+         ggml_tensor * down_c = build_cpu_experts(ggml_reshape_3d(ctx0, x, n_embd, 1, big_m), big_exp); // [n_embd, 1, m]
+-        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_expert_used*n_tokens + 1), 0.0f);
++        // abyss: the zeros are repeated from one row; a fill of a new tensor would leave that tensor a leaf, and the
++        // allocator places every leaf before the graph runs, so each layer's zeros would hold memory from the start
++        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd), 0.0f);
++        zeros = ggml_repeat_4d(ctx0, zeros, n_embd, n_expert_used*n_tokens + 1, 1, 1);
+         ggml_tensor * rows  = ggml_set_rows(ctx0, zeros, ggml_reshape_2d(ctx0, down_c, n_embd, big_m), big_dst);
+         experts = ggml_add(ctx0, experts, ggml_view_3d(ctx0, rows, n_embd, n_expert_used, n_tokens, rows->nb[1], n_expert_used*rows->nb[1], 0));
+         // the sum stays with the device's experts, on the first backend, which the host experts are offloaded to; the
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 824d800..0465279 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1045,13 +1045,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+     if (k_rot) {
+-        q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
++        if (!q_none) {
++            q = llama_mul_mat_hadamard(ctx0, q, k_rot);
++        }
+         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+     }
+ 
+-    ggml_build_forward_expand(gf, q);
++    // abyss: with no query rows (CED) the queries stay out of the graph; expanded, they would be computed, and the
++    // allocator keeps a tensor nothing reads to the end of the graph, a full ubatch of queries for each such layer
++    if (!q_none) {
++        ggml_build_forward_expand(gf, q);
++        cb(q, "hca_q", il);
++    }
+     ggml_build_forward_expand(gf, kv);
+-    cb(q, "hca_q", il);
+ 
+     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+ 
+-- 
+2.43.0
+

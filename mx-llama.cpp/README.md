@@ -23,6 +23,8 @@
 | `0016-decode-stats.patch` | 解码统计：`ABYSS_DECODE_STATS=N` 时每 N 次单 token 解码打印一行，含每 token 耗时、专家缓存命中率、每 token 的命中、上传和 CPU 计算的专家数，以及每 token 的磁盘缺页次数（Engram 表是 mmap 的，冷读就是缺页）；只统计解码调用本身，不含两次请求之间的预填充 |
 | `0017-slot-save-thin-checkpoints.patch` | 槽位被只共享开头一段的请求占用前先存进内存缓存：DSV4 只能退回检查点，新请求按检查点能保留的比槽位上次提示词（最新检查点）少 `ABYSS_SLOT_SAVE_LOST` 个 token 以上时先存（默认 2048，0 = 关）；原来只按共同前缀算，保留不到一半才存。检查点列表满时按 `ABYSS_CKPT_THIN_STEP` 的间距删减（不设时同 `--checkpoint-min-step`），和长提示词拆分建检查点的步长分开 |
 | `0018-plain-request-text.patch` | 对话提示词按官方 DeepSeek Recipe 的方式编码（`ABYSS_PLAIN_INPUT=1`）：只有模板自己写的控制 token 按 ID 编码，来自请求的文字（消息、思考、工具调用和结果、工具定义）只用基础词表编码，里面出现的 `<｜User｜>`、`</think>`、`｜DSML｜` 等字样都是普通文字。原来整段提示词按「识别特殊 token」编码，`<think>`、`</think>`、`｜DSML｜` 在 GGUF 里是 user-defined 类型，关掉识别也照样匹配。Jinja 引擎本来就标记每段字符串是否来自请求，补丁补上 `tojson`、数组 `join` 的标记传递，BOS/EOS 改回模板文字，把渲染结果里来自请求的字节范围交给 server；`llama_tokenize_plain` 只用基础词表编码。另有 `llama-abyss-chat-tokens`：只读词表，打印 server 对一组请求生成的提示词、模板的控制 token 和两种编码结果 |
+| `0019-graph-memory.patch` | 计算图显存的两处浪费，加一个排查工具。`0014` 大批次分流里每层的全零张量原来是对一个新张量做 fill，那个张量是计算图的叶子，分配器在图开始前就给所有叶子分配好，第 22–39 层 18 个 240 MiB 从头占到尾（GPU0 约 2.6 GB）；现在从一行重复展开，用到时才分配。CED 下没有查询行的注意力层原来照样算全部 token 的查询并放进图里，没人读它，分配器就一直不释放（17 层 × 256 MiB）；现在这些层不算查询，预填充快 3–5%。`GGML_ALLOC_TRACE=1` 在 stderr 打印每次计算图分配的分配、释放和各缓冲区大小，以及 CUDA 内存池的每次增长和当时的算子，`tools/eval/alloc_peak.py` 据此列出缓冲区峰值时有哪些张量 |
+| `0020-indexer-chunks.patch` | V4.1 预填充的索引器打分、选 top-k 和压缩注意力按查询分块，每块 N 个（`ABYSS_DSV41_IDX_CHUNK=N`，生产用 256）：分数和 top-k 掩码只存在一块，掩码每块的视图每张图只建一次、各层共用（每层各建一个的话，调度器会给每个视图往 GPU 拷一份）。19.2 万上下文时 GPU1 计算缓冲区 6.9 → 3.2 GB，大段预填充慢 4–8%；单 token 解码不分块 |
 
 ## 安装
 
@@ -38,7 +40,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0011-fix-candidate-input.patch <abyss>/mx-llama.cpp/0012-prompt-cache-usable-tokens.patch \
   <abyss>/mx-llama.cpp/0013-sched-reserve-size-reset.patch <abyss>/mx-llama.cpp/0014-moe-big-split.patch \
   <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch <abyss>/mx-llama.cpp/0016-decode-stats.patch \
-  <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch
+  <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch \
+  <abyss>/mx-llama.cpp/0019-graph-memory.patch <abyss>/mx-llama.cpp/0020-indexer-chunks.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
@@ -72,3 +75,5 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 - `0012` 改的是 server 的 prompt 缓存：新请求到来时，比较当前槽位和内存缓存里各条目能直接用上的 token 数（检查点受限的缓存取不晚于分叉点的最近检查点），缓存里的条目多出 256 个以上就换进来；只用到条目一小部分时复制一份，原条目留在缓存里。智能体的辅助请求（共享系统提示、只问一句）因此只算几十个 token，也不会把主对话冲掉。`-lv 4` 能看到检查点和缓存的换入换出
 - `ABYSS_MOE_BIG_SPLIT=1` 只对专家缓存覆盖的层、超过 32 个 token 的批次生效。每层一个 CPU 算子统计每个专家的 token 数，按 token 数从少到多把专家交给 CPU，直到 CPU 的预计时间追上其余专家的上传时间（`ABYSS_MOE_BIG_UPLOAD_US`、`ABYSS_MOE_BIG_CPU_EXPERT_US`、`ABYSS_MOE_BIG_CPU_TOKEN_US`，默认 650 / 450 / 50 微秒），而且这些「token × 专家」不超过 `ABYSS_MOE_BIG_CPU_ROWS`（默认 1,024）行。GPU 那一路的这些条目为 -1：CUDA MMQ 跳过它们并把输出清零，上传回调不传它们，而且直接用规划算子在主机上的结果，不必从 GPU 读回 id。CPU 那一路在 GPU1 上取出这些 token，在 CPU 上按一行一个专家计算，再用 `set_rows` 写回、和 GPU0 的结果相加；合并固定在 0 号后端（GPU0）。退出时在 stderr 打印 `abyss: moe cache large batches` 统计
 - `ABYSS_ENGRAM_PREFETCH=8` 打开 Engram 预取，只对 DeepSeek V4.1、单序列、64 个 token 以上的批次生效。只做预读，不改计算结果；新批次到来时会叫停上一批还没做完的预取。
+- `ABYSS_DSV41_IDX_CHUNK=N`（`0020`）只对开了索引器、单序列、查询多于 N 个的批次生效；不设或 0 时不分块。分块改变编码器层的累加顺序，对不分块 KLD 0.0079、top-1 96.2%（语料 14 × 1,024 token，块大小 128），在编码器层的数值底线以内；同一配置下换上下文大小或专家缓存大小，输出逐 token 相同。
+- 排查显存用 `GGML_ALLOC_TRACE=1`（`0019`）加 `tools/eval/alloc-trace.sh`：每次分配计算图（加载时的预留、运行中因为图变大而重新分配）都打印一段，`alloc_peak.py` 列出每段的缓冲区大小，以及节点最多（或指定）那段每个缓冲区峰值时的张量。分配器把所有叶子在图开始前就分配好，没人读的节点不释放，跨设备的输入拷贝每个源张量各一份，这三类最容易悄悄占显存。
