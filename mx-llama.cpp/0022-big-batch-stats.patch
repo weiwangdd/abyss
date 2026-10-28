@@ -1,0 +1,60 @@
+From 4aaa925195365a18686bf1c024b948c12b7b02ad Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 28 Oct 2026 14:57:08 +0100
+Subject: [PATCH] abyss: ABYSS_MOE_BIG_STATS=1 prints, for each large-batch
+ plan, its tokens and experts, the experts and rows the cache holds, and how
+ many of the batch's experts and of the cached ones the plan sends to the CPU
+
+---
+ src/llama-moe-cache.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 7b6af32..e516f66 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -216,6 +216,7 @@ struct llama_moe_cache::impl {
+     float big_expert_us = 450.0f; // the CPU reading one expert, ABYSS_MOE_BIG_CPU_EXPERT_US
+     float big_token_us  =  50.0f; // the CPU per token of an expert, ABYSS_MOE_BIG_CPU_TOKEN_US
+     int64_t big_rows    = 1024;   // the CPU's compact batch, ABYSS_MOE_BIG_CPU_ROWS
++    bool  big_stats     = false;  // ABYSS_MOE_BIG_STATS=1 prints what the cache holds of each large batch
+     struct {
+         size_t batches = 0;
+         size_t dev     = 0; // experts uploaded
+@@ -279,6 +280,9 @@ struct llama_moe_cache::impl {
+         if (const char * e = getenv("ABYSS_MOE_BIG_CPU_ROWS")) {
+             big_rows = std::max(1, atoi(e));
+         }
++        if (const char * e = getenv("ABYSS_MOE_BIG_STATS")) {
++            big_stats = atoi(e) != 0;
++        }
+         plan_ctxs.resize(model.layers.size());
+         big_dev.resize(model.layers.size());
+         big_pending.assign(model.layers.size(), 0);
+@@ -664,6 +668,23 @@ struct llama_moe_cache::impl {
+         stats_big.dev += big_order.size();
+         stats_big.batches++;
+ 
++        // abyss: how much of the batch the cache already holds, and where the plan sends those experts
++        if (big_stats) {
++            const int32_t * slots = groups[layers[il].ig].lru.slot_map[il];
++            int64_t cached = 0, cached_cpu = 0, rows_cached = 0, n_cpu = 0;
++            for (int32_t e : big_order) {
++                n_cpu += big_on_cpu[e];
++                if (slots != nullptr && slots[e] >= 0) {
++                    cached++;
++                    cached_cpu += big_on_cpu[e];
++                    rows_cached += big_cnt[e];
++                }
++            }
++            fprintf(stderr, "abyss: big batch il=%d tokens=%lld experts=%zu cached=%lld rows=%lld cached_rows=%lld cpu=%lld cached_cpu=%lld\n",
++                il, (long long) (n_ids/n_expert_used), big_order.size(), (long long) cached, (long long) n_ids,
++                (long long) rows_cached, (long long) n_cpu, (long long) cached_cpu);
++        }
++
+         int64_t r = 0;
+         for (int64_t i = 0; i < n_ids; ++i) {
+             const int32_t e = ids[i];
+-- 
+2.43.0
+

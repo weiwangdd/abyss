@@ -26,6 +26,7 @@
 | `0019-graph-memory.patch` | 计算图显存的两处浪费，加一个排查工具。`0014` 大批次分流里每层的全零张量原来是对一个新张量做 fill，那个张量是计算图的叶子，分配器在图开始前就给所有叶子分配好，第 22–39 层 18 个 240 MiB 从头占到尾（GPU0 约 2.6 GB）；现在从一行重复展开，用到时才分配。CED 下没有查询行的注意力层原来照样算全部 token 的查询并放进图里，没人读它，分配器就一直不释放（17 层 × 256 MiB）；现在这些层不算查询，预填充快 3–5%。`GGML_ALLOC_TRACE=1` 在 stderr 打印每次计算图分配的分配、释放和各缓冲区大小，以及 CUDA 内存池的每次增长和当时的算子，`tools/eval/alloc_peak.py` 据此列出缓冲区峰值时有哪些张量 |
 | `0020-indexer-chunks.patch` | V4.1 预填充的索引器打分、选 top-k 和压缩注意力按查询分块，每块 N 个（`ABYSS_DSV41_IDX_CHUNK=N`，生产用 256）：分数和 top-k 掩码只存在一块，掩码每块的视图每张图只建一次、各层共用（每层各建一个的话，调度器会给每个视图往 GPU 拷一份）。19.2 万上下文时 GPU1 计算缓冲区 6.9 → 3.2 GB，大段预填充慢 4–8%；单 token 解码不分块 |
 | `0021-bench-moe-cache.patch` | `llama-bench` 从环境变量 `LLAMA_ARG_MOE_CACHE_MIB` 读专家缓存大小（server 的 `--moe-cache-mib` 也读它），不开缓存时解码掉回约 16 tok/s，测出来不代表实际配置；`tools/eval/std-bench.sh` 用它 |
+| `0022-big-batch-stats.patch` | 大批次统计（`ABYSS_MOE_BIG_STATS=1`）：专家缓存覆盖的层每次规划大批次（超过 32 个 token）时，在 stderr 打印一行 `abyss: big batch`：层号、token 数、用到的专家数、其中在缓存里的专家数和挑选数、交给 CPU 的专家数和其中在缓存里的。只读，不改计算；`tools/eval/big_coverage.py` 按请求汇总 |
 
 ## 安装
 
@@ -43,7 +44,7 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch <abyss>/mx-llama.cpp/0016-decode-stats.patch \
   <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch \
   <abyss>/mx-llama.cpp/0019-graph-memory.patch <abyss>/mx-llama.cpp/0020-indexer-chunks.patch \
-  <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch
+  <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

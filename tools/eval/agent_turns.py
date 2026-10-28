@@ -16,10 +16,11 @@ into REPORT, with one generated token so the capture holds the prefill only.
 
 import argparse
 import json
+import os
 import subprocess
 import urllib.request
 
-URL = "http://127.0.0.1:8080"
+URL = os.environ.get("AGENT_URL", "http://127.0.0.1:8080")
 
 TOOLS = [
     {"type": "function", "function": {

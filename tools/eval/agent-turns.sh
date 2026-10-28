@@ -1,12 +1,15 @@
 #!/bin/bash
 # Multi-turn agent session against a server with the production settings (agent_turns.py): per turn, what the prompt
 # cache reused and what was processed again. TURNS (default 6), REPEAT (corpus copies in turn 1, default 3) and
-# MAX_TOKENS (default 512) are passed on; EXTRA adds server arguments. CAPTURE=1 runs the server inside nsys and
-# captures the last turn's prefill into $OUT/agent-turn.nsys-rep, then prints its breakdown. ABYSS_MOE_BIG_SPLIT,
-# ABYSS_CKPT_TAIL_MERGE and ABYSS_CED_ALIGN default to the production values; set them in the environment to compare.
+# MAX_TOKENS (default 512) are passed on; EXTRA adds server arguments, MODEL and PORT override the model and the port.
+# CAPTURE=1 runs the server inside nsys and captures the last turn's prefill into $OUT/agent-turn.nsys-rep, then prints
+# its breakdown. ABYSS_MOE_BIG_SPLIT, ABYSS_CKPT_TAIL_MERGE and ABYSS_CED_ALIGN default to the production values; set
+# them in the environment to compare.
 O=${OUT:-$HOME/abyss-eval}
 B=${BUILD:-$HOME/src/mx-llama.cpp/build-m2/bin}
-M=$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf
+M=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf}
+PORT=${PORT:-8080}  # another port keeps clients of the production server out
+export AGENT_URL=http://127.0.0.1:$PORT
 E=$(cd "$(dirname "$0")" && pwd)
 
 if pgrep -x llama-server >/dev/null; then
@@ -28,7 +31,7 @@ ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_C
   -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' \
   -c 131072 -b 65536 -ub 2048 -np 1 --moe-cache-mib 14000 \
   --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" \
-  --host 127.0.0.1 --port 8080 $EXTRA > "$log" 2>&1 &
+  --host 127.0.0.1 --port "$PORT" $EXTRA > "$log" 2>&1 &
 pid=$!
 until grep -q "listening on" "$log"; do
   kill -0 $pid 2>/dev/null || { echo "server died, see $log"; exit 1; }
