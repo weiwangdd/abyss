@@ -1,0 +1,247 @@
+From 7746832c6c4da9090089c1b1e914b8b614bd118d Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 28 Oct 2026 20:44:13 +0100
+Subject: [PATCH] abyss: ABYSS_MOE_BIG_CACHE=1 computes the experts the MoE
+ cache holds from their slots on the cache device for a large batch, at the
+ same time as the uploads of the others to the first device and the CPU's
+ share, which now split only the experts the cache does not hold
+
+---
+ src/llama-graph.cpp     | 28 +++++++++++++++++++
+ src/llama-moe-cache.cpp | 59 +++++++++++++++++++++++++++++++----------
+ src/llama-moe-cache.h   |  5 ++++
+ 3 files changed, 78 insertions(+), 14 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 964aa21..6c53a97 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2459,6 +2459,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * big_tok = nullptr; // [m] I32, the token of each pair
+     ggml_tensor * big_exp = nullptr; // [1, m] I32, its expert, -1 for padding
+     ggml_tensor * big_dst = nullptr; // [m] I32, its flat index among the ids, n_expert_used*n_tokens for padding
++    ggml_tensor * big_slots = nullptr; // [n_expert_used, n_tokens] I32, the cache slot of each pair the cache holds, -1 else
+     int64_t big_m = 0;
+     if (!slots && cpu_split_ok && moe_cache && moe_cache->big_split(il, n_tokens)) {
+         ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+@@ -2472,6 +2473,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         big_tok = ggml_view_1d(ctx0, plan, big_m, n*es);
+         big_exp = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, plan, big_m, (n + big_m)*es), 1, big_m);
+         big_dst = ggml_view_1d(ctx0, plan, big_m, (n + 2*big_m)*es);
++        if (moe_cache->big_cache()) {
++            // abyss: the plan leaves the experts the cache holds out of the uploads and the CPU's share
++            GGML_ASSERT(moe_cache->get_experts(up_exps) && moe_cache->get_experts(gate_exps) && moe_cache->get_experts(down_exps));
++            big_slots = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, plan, n, (n + 3*big_m)*es), n_expert_used, n_tokens);
++        }
+     }
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+@@ -2643,11 +2649,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
++    ggml_tensor * moe_cached = nullptr; // [n_embd, n_tokens] abyss: the weighted sum of the experts computed from the cache
+     if (big_tok) {
+         // the large-batch plan's CPU share is expanded after the device's experts, so it runs while they are uploaded.
+         // The pairs are gathered on the cache device, computed as a batch of one expert per row and scattered into the
+         // rows the device left zero; the padding goes to a spare row
+         ggml_build_forward_expand(gf, experts);
++        if (big_slots) {
++            // abyss: the experts the cache holds are computed from their slots on the cache device, expanded between the
++            // device's experts and the CPU's share so that the three run at the same time, and summed there
++            ggml_tensor * up_k   = ggml_mul_mat_id(ctx0, moe_cache->get_experts(up_exps),   cur_in, big_slots);
++            ggml_tensor * gate_k = ggml_mul_mat_id(ctx0, moe_cache->get_experts(gate_exps), cur_in, big_slots);
++            const float limit = hparams.swiglu_clamp_exp[il];
++            ggml_tensor * act_k  = limit > 1e-6f ? ggml_swiglu_clamp(ctx0, gate_k, up_k, limit) : ggml_swiglu_split(ctx0, gate_k, up_k);
++            ggml_tensor * down_k = ggml_mul(ctx0, ggml_mul_mat_id(ctx0, moe_cache->get_experts(down_exps), act_k, big_slots), weights);
++            moe_cached = ggml_view_2d(ctx0, down_k, n_embd, n_tokens, down_k->nb[2], 0);
++            for (uint32_t i = 1; i < hparams.n_expert_used(il); ++i) {
++                moe_cached = ggml_add(ctx0, moe_cached, ggml_view_2d(ctx0, down_k, n_embd, n_tokens, down_k->nb[2], i*down_k->nb[1]));
++            }
++            cb(moe_cached, "ffn_moe_cached", il);
++            ggml_build_forward_expand(gf, moe_cached);
++        }
+         ggml_tensor * x = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cur_in, n_embd, n_tokens), big_tok); // [n_embd, m]
+         ggml_backend_sched_set_tensor_backend(sched, x, moe_cache->backend(il));
+         ggml_tensor * down_c = build_cpu_experts(ggml_reshape_3d(ctx0, x, n_embd, 1, big_m), big_exp); // [n_embd, 1, m]
+@@ -2721,6 +2743,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         moe_out = ggml_cont(ctx0, moe_out);
+     }
+ 
++    if (moe_cached) {
++        // abyss: the experts computed from the cache, already weighted and summed on the cache device
++        moe_out = ggml_add(ctx0, moe_out, moe_cached);
++        ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->backend(il));
++    }
++
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     return moe_out;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index e516f66..597ea38 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -217,11 +217,13 @@ struct llama_moe_cache::impl {
+     float big_token_us  =  50.0f; // the CPU per token of an expert, ABYSS_MOE_BIG_CPU_TOKEN_US
+     int64_t big_rows    = 1024;   // the CPU's compact batch, ABYSS_MOE_BIG_CPU_ROWS
+     bool  big_stats     = false;  // ABYSS_MOE_BIG_STATS=1 prints what the cache holds of each large batch
++    bool  big_cache     = false;  // ABYSS_MOE_BIG_CACHE=1 computes the experts the cache holds from it
+     struct {
+         size_t batches = 0;
+         size_t dev     = 0; // experts uploaded
+         size_t cpu     = 0; // experts computed by the CPU
+         size_t tokens  = 0; // their tokens
++        size_t cache   = 0; // experts computed from the cache (ABYSS_MOE_BIG_CACHE)
+     } stats_big;
+     std::vector<int32_t> big_cnt;
+     std::vector<int32_t> big_order;
+@@ -283,6 +285,9 @@ struct llama_moe_cache::impl {
+         if (const char * e = getenv("ABYSS_MOE_BIG_STATS")) {
+             big_stats = atoi(e) != 0;
+         }
++        if (const char * e = getenv("ABYSS_MOE_BIG_CACHE")) {
++            big_cache = atoi(e) != 0;
++        }
+         plan_ctxs.resize(model.layers.size());
+         big_dev.resize(model.layers.size());
+         big_pending.assign(model.layers.size(), 0);
+@@ -631,8 +636,13 @@ struct llama_moe_cache::impl {
+     }
+ 
+     // the plan of a large batch with ABYSS_MOE_BIG_SPLIT, see llama_moe_cache::build_big_plan
+-    void plan_big(int32_t il, const int32_t * ids, int64_t n_ids, int32_t * dev_ids, int32_t * cpu_tok, int32_t * cpu_exp, int32_t * cpu_dst) {
++    void plan_big(int32_t il, const int32_t * ids, int64_t n_ids, int32_t * dev_ids, int32_t * cpu_tok, int32_t * cpu_exp, int32_t * cpu_dst,
++            int32_t * cache_slots) {
+         const int32_t n_expert = groups[layers[il].ig].ref[0]->ne[2];
++        // abyss: with ABYSS_MOE_BIG_CACHE (cache_slots) the experts the cache holds are computed from their slots on its
++        // device, and only the others are split between the uploads and the CPU
++        const int32_t * slots = groups[layers[il].ig].lru.slot_map[il];
++        const bool from_cache = cache_slots != nullptr && slots != nullptr;
+ 
+         big_cnt.assign(n_expert, 0);
+         for (int64_t i = 0; i < n_ids; ++i) {
+@@ -640,10 +650,16 @@ struct llama_moe_cache::impl {
+             big_cnt[ids[i]]++;
+         }
+         big_order.clear();
++        int64_t n_cached = 0;
+         for (int32_t e = 0; e < n_expert; ++e) {
+-            if (big_cnt[e] > 0) {
+-                big_order.push_back(e);
++            if (big_cnt[e] == 0) {
++                continue;
+             }
++            if (from_cache && slots[e] >= 0) {
++                n_cached++;
++                continue;
++            }
++            big_order.push_back(e);
+         }
+         std::stable_sort(big_order.begin(), big_order.end(), [&](int32_t a, int32_t b) { return big_cnt[a] < big_cnt[b]; });
+ 
+@@ -666,13 +682,17 @@ struct llama_moe_cache::impl {
+             stats_big.tokens += big_cnt[e];
+         }
+         stats_big.dev += big_order.size();
++        stats_big.cache += n_cached;
+         stats_big.batches++;
+ 
+         // abyss: how much of the batch the cache already holds, and where the plan sends those experts
+         if (big_stats) {
+-            const int32_t * slots = groups[layers[il].ig].lru.slot_map[il];
+-            int64_t cached = 0, cached_cpu = 0, rows_cached = 0, n_cpu = 0;
+-            for (int32_t e : big_order) {
++            int64_t n_used = 0, cached = 0, cached_cpu = 0, rows_cached = 0, n_cpu = 0;
++            for (int32_t e = 0; e < n_expert; ++e) {
++                if (big_cnt[e] == 0) {
++                    continue;
++                }
++                n_used++;
+                 n_cpu += big_on_cpu[e];
+                 if (slots != nullptr && slots[e] >= 0) {
+                     cached++;
+@@ -680,15 +700,19 @@ struct llama_moe_cache::impl {
+                     rows_cached += big_cnt[e];
+                 }
+             }
+-            fprintf(stderr, "abyss: big batch il=%d tokens=%lld experts=%zu cached=%lld rows=%lld cached_rows=%lld cpu=%lld cached_cpu=%lld\n",
+-                il, (long long) (n_ids/n_expert_used), big_order.size(), (long long) cached, (long long) n_ids,
++            fprintf(stderr, "abyss: big batch il=%d tokens=%lld experts=%lld cached=%lld rows=%lld cached_rows=%lld cpu=%lld cached_cpu=%lld\n",
++                il, (long long) (n_ids/n_expert_used), (long long) n_used, (long long) cached, (long long) n_ids,
+                 (long long) rows_cached, (long long) n_cpu, (long long) cached_cpu);
+         }
+ 
+         int64_t r = 0;
+         for (int64_t i = 0; i < n_ids; ++i) {
+             const int32_t e = ids[i];
+-            dev_ids[i] = big_on_cpu[e] ? -1 : e;
++            const bool cached = from_cache && slots[e] >= 0;
++            if (cache_slots) {
++                cache_slots[i] = cached ? slots[e] : -1;
++            }
++            dev_ids[i] = cached || big_on_cpu[e] ? -1 : e;
+             if (big_on_cpu[e]) {
+                 cpu_tok[r] = (int32_t) (i / n_expert_used);
+                 cpu_exp[r] = e;
+@@ -732,14 +756,17 @@ struct llama_moe_cache::impl {
+         const ggml_tensor * ids = dst->src[0];
+         const int64_t n = ggml_nelements(ids);
+         const int64_t m = pc->self->big_rows;
+-        GGML_ASSERT(ggml_is_contiguous(ids) && ids->type == GGML_TYPE_I32 && ggml_nelements(dst) == n + 3*m);
++        const bool from_cache = pc->self->big_cache;
++        GGML_ASSERT(ggml_is_contiguous(ids) && ids->type == GGML_TYPE_I32 && ggml_nelements(dst) == n + 3*m + (from_cache ? n : 0));
+         int32_t * out = (int32_t *) dst->data;
+-        pc->self->plan_big(pc->il, (const int32_t *) ids->data, n, out, out + n, out + n + m, out + n + 2*m);
++        pc->self->plan_big(pc->il, (const int32_t *) ids->data, n, out, out + n, out + n + m, out + n + 2*m,
++            from_cache ? out + n + 3*m : nullptr);
+     }
+ 
+     ggml_tensor * build_big_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) {
+         ggml_tensor * args[1] = { ids };
+-        return ggml_custom_4d(ctx, GGML_TYPE_I32, ggml_nelements(ids) + 3*big_rows, 1, 1, 1, args, 1, big_plan_op, 1, &plan_ctxs[il]);
++        const int64_t n = ggml_nelements(ids);
++        return ggml_custom_4d(ctx, GGML_TYPE_I32, n + 3*big_rows + (big_cache ? n : 0), 1, 1, 1, args, 1, big_plan_op, 1, &plan_ctxs[il]);
+     }
+ 
+     static void plan_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -908,8 +935,8 @@ struct llama_moe_cache::impl {
+         log("ubatch <= 8", stats_small);
+         log("ubatch  > 8", stats_large);
+         if (big && stats_big.batches > 0) {
+-            fprintf(stderr, "abyss: moe cache large batches: %zu layer batches, %zu experts, %zu computed by the CPU (%zu tokens)\n",
+-                stats_big.batches, stats_big.dev, stats_big.cpu, stats_big.tokens);
++            fprintf(stderr, "abyss: moe cache large batches: %zu layer batches, %zu experts, %zu computed by the CPU (%zu tokens), %zu from the cache\n",
++                stats_big.batches, stats_big.dev, stats_big.cpu, stats_big.tokens, stats_big.cache);
+         }
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+@@ -957,6 +984,10 @@ int64_t llama_moe_cache::big_cpu_rows() const {
+     return pimpl->big_rows;
+ }
+ 
++bool llama_moe_cache::big_cache() const {
++    return pimpl->big_cache;
++}
++
+ bool llama_moe_cache::big_used(const ggml_tensor * w, std::vector<bool> & used) const {
+     return pimpl->big_used(w, used);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 93dd15a..69fef95 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -52,6 +52,11 @@ public:
+     // the rows of the CPU's compact batch in build_big_plan (ABYSS_MOE_BIG_CPU_ROWS)
+     int64_t big_cpu_rows() const;
+ 
++    // abyss: with ABYSS_MOE_BIG_CACHE=1 a large batch computes the experts the cache holds from their slots on the cache's
++    // device: build_big_plan then appends, for each id, the slot of its expert (-1 if the cache does not hold it), and
++    // those experts are -1 among the device's ids and never go to the CPU
++    bool big_cache() const;
++
+     // the experts of the host weight w that the pending large-batch plan of its layer uploads, so the copy callback
+     // need not read the ids back from the device; false if no plan is pending for w
+     bool big_used(const ggml_tensor * w, std::vector<bool> & used) const;
+-- 
+2.43.0
+

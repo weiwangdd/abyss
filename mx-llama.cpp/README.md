@@ -27,6 +27,7 @@
 | `0020-indexer-chunks.patch` | V4.1 预填充的索引器打分、选 top-k 和压缩注意力按查询分块，每块 N 个（`ABYSS_DSV41_IDX_CHUNK=N`，生产用 256）：分数和 top-k 掩码只存在一块，掩码每块的视图每张图只建一次、各层共用（每层各建一个的话，调度器会给每个视图往 GPU 拷一份）。19.2 万上下文时 GPU1 计算缓冲区 6.9 → 3.2 GB，大段预填充慢 4–8%；单 token 解码不分块 |
 | `0021-bench-moe-cache.patch` | `llama-bench` 从环境变量 `LLAMA_ARG_MOE_CACHE_MIB` 读专家缓存大小（server 的 `--moe-cache-mib` 也读它），不开缓存时解码掉回约 16 tok/s，测出来不代表实际配置；`tools/eval/std-bench.sh` 用它 |
 | `0022-big-batch-stats.patch` | 大批次统计（`ABYSS_MOE_BIG_STATS=1`）：专家缓存覆盖的层每次规划大批次（超过 32 个 token）时，在 stderr 打印一行 `abyss: big batch`：层号、token 数、用到的专家数、其中在缓存里的专家数和挑选数、交给 CPU 的专家数和其中在缓存里的。只读，不改计算；`tools/eval/big_coverage.py` 按请求汇总 |
+| `0023-big-batch-cache.patch` | 大批次用缓存（`ABYSS_MOE_BIG_CACHE=1`）：专家缓存覆盖的层规划大批次时，缓存里有的专家记下槽位，在缓存所在的卡上直接算（gate、up、激活、down，加权求和），其余的照 `0014` 分给 CPU 和上传；三路同时进行，最后相加。原来缓存只能复制给它所在的卡，大批次在第一张卡上算，用不上缓存。规划结果末尾多一列槽位号，统计行多报从缓存算的专家数 |
 
 ## 安装
 
@@ -44,7 +45,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0015-prefill-tail-one-pass.patch <abyss>/mx-llama.cpp/0016-decode-stats.patch \
   <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch \
   <abyss>/mx-llama.cpp/0019-graph-memory.patch <abyss>/mx-llama.cpp/0020-indexer-chunks.patch \
-  <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch
+  <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch \
+  <abyss>/mx-llama.cpp/0023-big-batch-cache.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
