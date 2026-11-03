@@ -1,0 +1,735 @@
+From 785586e9e1242650c8a7c05c39ea692abcfc15ce Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Tue, 3 Nov 2026 13:13:44 +0100
+Subject: [PATCH] abyss: ABYSS_MOE_PREFETCH=K makes the plan of a single-token
+ batch of each cached layer prefetch, on a second stream of the cache device,
+ the top K experts that the next layer's router picks from this layer's router
+ input and that the cache does not hold, at most ABYSS_MOE_PREFETCH_MAX of
+ them; a new scheduler launch callback issues the uploads once the device has
+ started computing the layer, so they do not hold up its input copies, and the
+ next layer's plan makes the device wait for them. The decode stats report the
+ prefetched experts and how many a plan read
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml-backend.h |   7 +
+ ggml/src/ggml-backend.cpp   |  13 ++
+ src/llama-context.cpp       |  20 ++-
+ src/llama-context.h         |   3 +
+ src/llama-graph.cpp         |  22 ++-
+ src/llama-graph.h           |  14 +-
+ src/llama-moe-cache.cpp     | 258 ++++++++++++++++++++++++++++++++++--
+ src/llama-moe-cache.h       |  16 ++-
+ src/models/deepseek4.cpp    |  22 ++-
+ 9 files changed, 351 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 34bce74..b964d61 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -343,6 +343,10 @@ extern "C" {
+     // `graph` is the compute graph of the split
+     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+ 
++    // abyss: called after the scheduler started the computation of a split on its backend, from the thread that drives
++    // the graph; the inputs of the split were copied before, so work queued now on the backend's device comes after them
++    typedef void (*ggml_backend_sched_launch_callback)(ggml_backend_t backend, void * user_data);
++
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+@@ -384,6 +388,9 @@ extern "C" {
+     // Set a callback to be called when the inputs weights of a split are being copied
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+ 
++    // abyss: Set a callback to be called after the computation of each split was started
++    GGML_API void                 ggml_backend_sched_set_launch_callback(ggml_backend_sched_t sched, ggml_backend_sched_launch_callback callback, void * user_data);
++
+     //
+     // Meta backend
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 39129ce..8845708 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1037,6 +1037,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_copy_callback callback_copy;
+     void * callback_copy_user_data;
+ 
++    ggml_backend_sched_launch_callback callback_launch;
++    void * callback_launch_user_data;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -2707,6 +2710,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (sched->callback_launch != NULL) {
++            sched->callback_launch(split_backend, sched->callback_launch_user_data);
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             const int64_t t0 = ggml_backend_sched_timing_now(sched);
+@@ -2954,6 +2961,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_copy_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_launch_callback(ggml_backend_sched_t sched, ggml_backend_sched_launch_callback callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_launch = callback;
++    sched->callback_launch_user_data = user_data;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     return sched->n_splits;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 582e35a..dd47f45 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -736,6 +736,7 @@ void llama_context::sched_reserve() {
+         }
+         ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+         ggml_backend_sched_set_copy_callback(result, sched_copy_experts, this);
++        ggml_backend_sched_set_launch_callback(result, sched_launched, this);
+         return result;
+     };
+ 
+@@ -2139,6 +2140,7 @@ llama_context::decode_stats_counts llama_context::decode_stats_now() const {
+     c.t_us = ggml_time_us();
+     if (moe_cache) {
+         moe_cache->small_counts(c.hits, c.up, c.cpu);
++        moe_cache->prefetch_counts(c.pf_up, c.pf_used);
+     }
+     rusage ru = {};
+     getrusage(RUSAGE_SELF, &ru);
+@@ -2154,15 +2156,21 @@ void llama_context::decode_stats_add(const decode_stats_counts & start, int32_t
+     w.up     += end.up     - start.up;
+     w.cpu    += end.cpu    - start.cpu;
+     w.majflt += end.majflt - start.majflt;
++    w.pf_up   += end.pf_up   - start.pf_up;
++    w.pf_used += end.pf_used - start.pf_used;
+     if (++decode_stats_n < every) {
+         return;
+     }
+     const double n    = decode_stats_n;
+     const double used = (double) (w.hits + w.up + w.cpu);
+     // the server does not show info logs of the library
++    char pf[96] = "";
++    if (w.pf_up > 0) {
++        snprintf(pf, sizeof(pf), ", %.1f prefetched (%.0f%% read)", w.pf_up/n, 100.0*w.pf_used/w.pf_up);
++    }
+     fprintf(stderr, "abyss: decode stats, %d tokens: %.1f ms/token, expert cache hit rate %.1f%%, per token %.1f hits, "
+-        "%.1f uploaded, %.1f by the CPU, %.1f major page faults\n", decode_stats_n, w.t_us/1000.0/n,
+-        used > 0 ? 100.0*w.hits/used : 0.0, w.hits/n, w.up/n, w.cpu/n, w.majflt/n);
++        "%.1f uploaded, %.1f by the CPU, %.1f major page faults%s\n", decode_stats_n, w.t_us/1000.0/n,
++        used > 0 ? 100.0*w.hits/used : 0.0, w.hits/n, w.up/n, w.cpu/n, w.majflt/n, pf);
+     w = {};
+     decode_stats_n = 0;
+ }
+@@ -3435,6 +3443,14 @@ ggml_status llama_context::graph_compute(
+     return status;
+ }
+ 
++// abyss: the MoE cache issues the prefetch it planned once the device has started computing the planned layer
++void llama_context::sched_launched(ggml_backend_t backend, void * user_data) {
++    auto * lctx = static_cast<llama_context *>(user_data);
++    if (lctx->moe_cache) {
++        lctx->moe_cache->launched(backend);
++    }
++}
++
+ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
+     auto * lctx = static_cast<llama_context *>(user_data);
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 5a7f66a..fcf23f1 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -309,6 +309,7 @@ private:
+ 
+     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
++    static void sched_launched(ggml_backend_t backend, void * user_data);
+ 
+     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
+     // that differs from the layer it belongs to (usually due to missing backend support)
+@@ -344,6 +345,8 @@ private:
+         size_t  up     = 0;
+         size_t  cpu    = 0;
+         long    majflt = 0; // major page faults of the process
++        size_t  pf_up   = 0; // experts prefetched (ABYSS_MOE_PREFETCH), and how many of them a plan read
++        size_t  pf_used = 0;
+     };
+     decode_stats_counts decode_stats_now() const;
+     void decode_stats_add(const decode_stats_counts & start, int32_t every);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6c53a97..171ca4c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2256,7 +2256,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * moe_pred) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -2277,7 +2278,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         up_exps_s,
+         gate_exps_s,
+         down_exps_s,
+-        selected_experts_in
++        selected_experts_in,
++        moe_pred
+     );
+ }
+ 
+@@ -2305,7 +2307,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * moe_pred) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -2451,7 +2454,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         gate_exps && up_exps && down_exps && !gate_up_exps && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s;
+     ggml_tensor * cpu_ids = nullptr;
+-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, cpu_split_ok ? &cpu_ids : nullptr);
++    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, cpu_split_ok ? &cpu_ids : nullptr, moe_pred);
+ 
+     // abyss: a batch too large for the cache splits its experts between the uploads and the CPU (ABYSS_MOE_BIG_SPLIT).
+     // The device path below gets the ids of the experts it uploads, -1 for the CPU's; the CPU gets a compact batch of
+@@ -2761,7 +2764,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * down_exps,
+          ggml_tensor * gate_up_exps,
+                  int   il,
+-         ggml_tensor ** cpu_ids) const {
++         ggml_tensor ** cpu_ids,
++         ggml_tensor * moe_pred) const {
+     if (moe_cache == nullptr) {
+         return nullptr;
+     }
+@@ -2783,8 +2787,12 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+ 
+     if (cpu_ids && moe_cache->cpu_misses()) {
+-        // abyss: a CPU op plans the slots, uploads the misses it admits and leaves the others to the CPU
+-        ggml_tensor * plan = moe_cache->build_plan(ctx0, il, ids);
++        // abyss: a CPU op plans the slots, uploads the misses it admits and leaves the others to the CPU, and prefetches the
++        // experts predicted for the next layer
++        if (moe_pred && !ggml_is_contiguous(moe_pred)) {
++            moe_pred = ggml_cont(ctx0, moe_pred);
++        }
++        ggml_tensor * plan = moe_cache->build_plan(ctx0, il, ids, moe_pred);
+         ggml_format_name(plan, "ffn_moe_plan-%d", il);
+         const int64_t n = ggml_nelements(ids);
+         *cpu_ids = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, plan, n, n*ggml_element_size(plan)), selected_experts->ne[0], selected_experts->ne[1]);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 48079f9..dc27f0c 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1224,8 +1224,11 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * moe_pred = nullptr) const;
+ 
++    // abyss: moe_pred (I32 [k, n_tokens]) are the experts the next layer is predicted to select, which the plan of this
++    // layer prefetches into the MoE cache (see llama_moe_cache::prefetch_k)
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+              ggml_tensor * gate_inp,
+@@ -1250,10 +1253,12 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * moe_pred = nullptr) const;
+ 
+     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+-    // abyss: with cpu_ids and the cache's cpu_misses(), *cpu_ids gets the experts the CPU computes (-1 for the others)
++    // abyss: with cpu_ids and the cache's cpu_misses(), *cpu_ids gets the experts the CPU computes (-1 for the others),
++    // and the plan also prefetches the experts of moe_pred for the next layer
+     ggml_tensor * build_moe_cache_slots(
+              ggml_tensor * selected_experts,
+              ggml_tensor * up_exps,
+@@ -1261,7 +1266,8 @@ struct llm_graph_context {
+              ggml_tensor * down_exps,
+              ggml_tensor * gate_up_exps,
+                      int   il,
+-             ggml_tensor ** cpu_ids = nullptr) const;
++             ggml_tensor ** cpu_ids = nullptr,
++             ggml_tensor * moe_pred = nullptr) const;
+ 
+     //
+     // inputs
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 597ea38..9288f14 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -165,6 +165,10 @@ struct llama_moe_cache::impl {
+         ggml_context_ptr ctx;
+         ggml_backend_buffer_ptr buf;
+         size_t buf_size = 0;
++
++        // abyss: ABYSS_MOE_PREFETCH, a second backend of the device for the stream of the prefetches
++        ggml_backend_t pf_backend = nullptr;
++        bool pf_inflight = false; // prefetches issued since the last evaluation started
+     };
+ 
+     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
+@@ -177,6 +181,12 @@ struct llama_moe_cache::impl {
+         int32_t n_slots = 0;
+         moe_cache_lru lru;
+         double admit_acc = 0.0; // carries the fraction of a miss to admit between plans
++
++        // abyss: ABYSS_MOE_PREFETCH, per slot: the evaluation that last planned a read of it and the one that last
++        // prefetched into it, and whether it holds a prefetched expert no plan has read yet
++        std::vector<uint32_t> use_eval;
++        std::vector<uint32_t> pf_eval;
++        std::vector<uint8_t>  pf_unread;
+     };
+ 
+     struct layer {
+@@ -231,6 +241,25 @@ struct llama_moe_cache::impl {
+     std::vector<std::vector<int32_t>> big_dev; // [n_layer] the uploaded experts' ids of the last plan
+     std::vector<int> big_pending;              // [n_layer] its host weights not copied yet
+ 
++    // abyss: ABYSS_MOE_PREFETCH=K, the plan of a single-token batch also uploads, on the prefetch stream of the device,
++    // the top K experts predicted for the next layer that the cache does not hold (see llama_moe_cache::prefetch_k), at
++    // most ABYSS_MOE_PREFETCH_MAX of them (default K). The plan keeps the prediction, and launched() issues the uploads
++    // once the scheduler has started the next computation on the device
++    int32_t prefetch     = 0;
++    int32_t prefetch_max = 0;
++    int32_t pf_next_il   = -1; // the layer the last plan predicted, its experts in pf_next
++    std::vector<int32_t> pf_next;
++    std::vector<ggml_backend_event_t> pf_done; // [n_layer] recorded on the prefetch stream after the layer's prefetch
++    std::vector<uint8_t> pf_pending;           // [n_layer] the device must wait for pf_done before it reads the slots
++    uint32_t eval    = 0;                      // counts the evaluations, see begin_plan
++    int32_t  last_il = INT32_MAX;              // the layer of the last plan
++    std::vector<moe_cache_lru::fill> pf_fills;
++    struct {
++        size_t uploaded = 0;
++        size_t used     = 0; // read by a plan before they were evicted
++        size_t bytes    = 0;
++    } stats_pf;
++
+     static constexpr int64_t max_batch = 32;
+ 
+     int32_t n_expert_used;
+@@ -288,6 +317,13 @@ struct llama_moe_cache::impl {
+         if (const char * e = getenv("ABYSS_MOE_BIG_CACHE")) {
+             big_cache = atoi(e) != 0;
+         }
++        if (const char * e = getenv("ABYSS_MOE_PREFETCH")) {
++            prefetch = std::clamp(atoi(e), 0, 64);
++        }
++        prefetch_max = prefetch;
++        if (const char * e = getenv("ABYSS_MOE_PREFETCH_MAX")) {
++            prefetch_max = std::clamp(atoi(e), 1, std::max(prefetch, 1));
++        }
+         plan_ctxs.resize(model.layers.size());
+         big_dev.resize(model.layers.size());
+         big_pending.assign(model.layers.size(), 0);
+@@ -535,16 +571,148 @@ struct llama_moe_cache::impl {
+         if (split) {
+             LLAMA_LOG_INFO("%s: ABYSS_MOE_CPU_MISS=1, admitting %.2f of the misses, heat decay %.3f\n", __func__, admit, heat_decay);
+         }
++
++        // abyss: the plans issue the prefetches, which ABYSS_MOE_CPU_MISS enables
++        if (!split || model.hparams.no_alloc) {
++            prefetch = 0;
++        }
++        if (prefetch > 0) {
++            init_prefetch();
++        }
++    }
++
++    // abyss: a second backend and the events for the prefetch stream of each device that caches layers
++    void init_prefetch() {
++        pf_done.assign(layers.size(), nullptr);
++        pf_pending.assign(layers.size(), 0);
++        for (group & g : groups) {
++            if (g.n_slots == 0) {
++                continue;
++            }
++            device & d = devices[g.id];
++            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
++            if (d.pf_backend == nullptr) {
++                d.pf_backend = ggml_backend_dev_init(dev, nullptr);
++            }
++            bool ok = d.pf_backend != nullptr;
++            for (int32_t il : g.layers) {
++                pf_done[il] = ok ? ggml_backend_event_new(dev) : nullptr;
++                ok = ok && pf_done[il] != nullptr;
++            }
++            if (!ok) {
++                LLAMA_LOG_WARN("%s: %s has no second stream or no events, ABYSS_MOE_PREFETCH is disabled\n", __func__, ggml_backend_dev_name(dev));
++                prefetch = 0;
++                return;
++            }
++            g.use_eval.assign(g.n_slots, 0);
++            g.pf_eval.assign(g.n_slots, 0);
++            g.pf_unread.assign(g.n_slots, 0);
++        }
++        // the server does not show info logs of the library
++        fprintf(stderr, "abyss: ABYSS_MOE_PREFETCH=%d, the plans prefetch the top %d experts predicted for the next layer, at most %d per layer\n",
++            prefetch, prefetch, prefetch_max);
++    }
++
++    // abyss: a plan of a layer at or before the last planned one starts the next evaluation. The prefetches of the last
++    // one are done by then, so none is in flight while this one plans, whatever its batch
++    void begin_plan(int32_t il) {
++        const bool next = il <= last_il;
++        last_il = il;
++        if (!next) {
++            return;
++        }
++        eval++;
++        if (prefetch == 0) {
++            return;
++        }
++        pf_next_il = -1;
++        for (device & d : devices) {
++            if (d.pf_inflight) {
++                ggml_backend_synchronize(d.pf_backend);
++                d.pf_inflight = false;
++            }
++        }
++        std::fill(pf_pending.begin(), pf_pending.end(), 0);
++    }
++
++    // abyss: uploads, on the prefetch stream, the experts of pred (layer il) that the cache does not hold, into the least
++    // recently used slots; the plan of layer il makes the device wait for them
++    void prefetch_layer(int32_t il, const int32_t * pred, int64_t n_pred) {
++        if (il >= (int32_t) layers.size() || layers[il].ig < 0) {
++            return;
++        }
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
++        device & d = devices[g.id];
++        moe_cache_lru & lru = g.lru;
++        int32_t * slots = lru.slot_map[il];
++
++        pf_fills.clear();
++        for (int64_t i = 0; i < n_pred && (int32_t) pf_fills.size() < prefetch_max; ++i) {
++            const int32_t e = pred[i];
++            GGML_ASSERT(e >= 0 && e < lru.n_expert);
++            if (slots[e] >= 0) {
++                continue;
++            }
++            // the uploads below are not ordered after the device's work: the slots planned in this evaluation may still
++            // be read, the others were last read by an evaluation that has finished
++            const int32_t s = lru.head;
++            if (g.use_eval[s] == eval) {
++                break;
++            }
++            if (lru.key_of[s] >= 0) {
++                lru.slot_map[lru.key_of[s] / lru.n_expert][lru.key_of[s] % lru.n_expert] = -1;
++            }
++            lru.key_of[s] = il*lru.n_expert + e;
++            slots[e] = s;
++            lru.touch(s);
++            g.use_eval[s]  = eval;
++            g.pf_eval[s]   = eval;
++            g.pf_unread[s] = 1;
++            pf_fills.push_back({ e, s });
++        }
++        if (pf_fills.empty()) {
++            return;
++        }
++
++        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++            const ggml_tensor * w    = l.experts[ip];
++            ggml_tensor       * bank = g.banks[ip];
++            const size_t expert_size = w->nb[2];
++            for (const auto & f : pf_fills) {
++                ggml_backend_tensor_set_async(d.pf_backend, bank, (const uint8_t *) w->data + f.expert*expert_size, f.slot*expert_size, expert_size);
++                stats_pf.bytes += expert_size;
++            }
++        }
++        ggml_backend_event_record(pf_done[il], d.pf_backend);
++        pf_pending[il] = 1;
++        d.pf_inflight  = true;
++        stats_pf.uploaded += pf_fills.size();
++    }
++
++    int32_t prefetch_k(int32_t il, int64_t n_tokens) const {
++        if (prefetch == 0 || n_tokens != 1 || il < 0 || il + 1 >= (int32_t) layers.size() || layers[il].ig < 0 || layers[il + 1].ig < 0) {
++            return 0;
++        }
++        return groups[layers[il].ig].n_slots > 0 && groups[layers[il + 1].ig].n_slots > 0 ? prefetch : 0;
+     }
+ 
+     // the plan of a small batch with ABYSS_MOE_CPU_MISS, see llama_moe_cache::build_plan
+-    void plan_split(int32_t il, const int32_t * ids, int64_t n_ids, int32_t * dev_slots, int32_t * cpu_ids) {
++    // abyss: pred (n_pred experts, may be nullptr) are the experts predicted for layer il + 1, prefetched at the end
++    void plan_split(int32_t il, const int32_t * ids, int64_t n_ids, int32_t * dev_slots, int32_t * cpu_ids, const int32_t * pred, int64_t n_pred) {
+         const layer & l = layers[il];
+         group & g = groups[l.ig];
+         moe_cache_lru & lru = g.lru;
+         int32_t * slots = lru.slot_map[il];
+         std::vector<float> & h = heat[il];
+ 
++        begin_plan(il);
++        // abyss: the device reads the experts prefetched for this layer after their uploads
++        if (prefetch > 0 && pf_pending[il]) {
++            ggml_backend_event_wait(devices[g.id].backend, pf_done[il]);
++            pf_pending[il] = 0;
++        }
++
+         for (float & x : h) {
+             x *= heat_decay;
+         }
+@@ -571,6 +739,13 @@ struct llama_moe_cache::impl {
+             if (slots[e] >= 0) {
+                 lru.touch(slots[e]);
+                 n_hit++;
++                if (prefetch > 0) {
++                    g.use_eval[slots[e]] = eval;
++                    if (g.pf_unread[slots[e]]) {
++                        g.pf_unread[slots[e]] = 0;
++                        stats_pf.used++;
++                    }
++                }
+             } else {
+                 misses.push_back(e);
+             }
+@@ -578,7 +753,7 @@ struct llama_moe_cache::impl {
+ 
+         // the hottest misses are admitted, a share of all misses over time
+         g.admit_acc += admit*misses.size();
+-        const size_t n_admit = std::min(misses.size(), (size_t) g.admit_acc);
++        size_t n_admit = std::min(misses.size(), (size_t) g.admit_acc);
+         g.admit_acc -= n_admit;
+         std::partial_sort(misses.begin(), misses.begin() + n_admit, misses.end(), [&](int32_t a, int32_t b) { return h[a] > h[b]; });
+         std::sort(misses.begin(), misses.begin() + n_admit);
+@@ -587,12 +762,21 @@ struct llama_moe_cache::impl {
+         for (size_t i = 0; i < n_admit; ++i) {
+             const int32_t e = misses[i];
+             const int32_t s = lru.head;
++            // abyss: never a slot the prefetch stream may still be writing, the CPU computes the rest
++            if (prefetch > 0 && g.pf_eval[s] == eval) {
++                n_admit = i;
++                break;
++            }
+             if (lru.key_of[s] >= 0) {
+                 lru.slot_map[lru.key_of[s] / lru.n_expert][lru.key_of[s] % lru.n_expert] = -1;
+             }
+             lru.key_of[s] = il*lru.n_expert + e;
+             slots[e] = s;
+             lru.touch(s);
++            if (prefetch > 0) {
++                g.use_eval[s]  = eval;
++                g.pf_unread[s] = 0;
++            }
+             fills.push_back({ e, s });
+         }
+ 
+@@ -627,6 +811,14 @@ struct llama_moe_cache::impl {
+         st.misses += n_admit;
+         st.cpu    += misses.size() - n_admit;
+         st.bytes  += bytes;
++
++        // abyss: the prefetch for the next layer waits for launched(): the device copies host memory in the order the
++        // copies were queued, whatever their stream, so uploads queued now would hold up the small copies the device
++        // needs to compute this layer (the slots and the CPU's results)
++        if (pred != nullptr && prefetch > 0) {
++            pf_next_il = il + 1;
++            pf_next.assign(pred, pred + n_pred);
++        }
+     }
+ 
+     std::vector<int32_t> ids_misses;
+@@ -639,6 +831,7 @@ struct llama_moe_cache::impl {
+     void plan_big(int32_t il, const int32_t * ids, int64_t n_ids, int32_t * dev_ids, int32_t * cpu_tok, int32_t * cpu_exp, int32_t * cpu_dst,
+             int32_t * cache_slots) {
+         const int32_t n_expert = groups[layers[il].ig].ref[0]->ne[2];
++        begin_plan(il);
+         // abyss: with ABYSS_MOE_BIG_CACHE (cache_slots) the experts the cache holds are computed from their slots on its
+         // device, and only the others are split between the uploads and the CPU
+         const int32_t * slots = groups[layers[il].ig].lru.slot_map[il];
+@@ -775,16 +968,29 @@ struct llama_moe_cache::impl {
+             return;
+         }
+         const auto * pc = (const plan_ctx *) userdata;
+-        const ggml_tensor * ids = dst->src[0];
++        const ggml_tensor * ids  = dst->src[0];
++        const ggml_tensor * pred = dst->src[1];
+         const int64_t n = ggml_nelements(ids);
+         GGML_ASSERT(ggml_is_contiguous(ids) && ids->type == GGML_TYPE_I32 && ggml_nelements(dst) == 2*n);
+-        pc->self->plan_split(pc->il, (const int32_t *) ids->data, n, (int32_t *) dst->data, (int32_t *) dst->data + n);
++        GGML_ASSERT(pred == nullptr || (ggml_is_contiguous(pred) && pred->type == GGML_TYPE_I32));
++        pc->self->plan_split(pc->il, (const int32_t *) ids->data, n, (int32_t *) dst->data, (int32_t *) dst->data + n,
++            pred ? (const int32_t *) pred->data : nullptr, pred ? ggml_nelements(pred) : 0);
+     }
+ 
+-    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) {
+-        ggml_tensor * args[1] = { ids };
++    // abyss: the scheduler started a computation on backend: the first one on the device of the predicted layer after
++    // its plan computes the planned layer, and the prefetch queued now runs while it does
++    void launched(ggml_backend_t backend) {
++        if (pf_next_il < 0 || backend != devices[groups[layers[pf_next_il].ig].id].backend) {
++            return;
++        }
++        prefetch_layer(pf_next_il, pf_next.data(), (int64_t) pf_next.size());
++        pf_next_il = -1;
++    }
++
++    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred) {
++        ggml_tensor * args[2] = { ids, pred };
+         // one task: the plan runs on the thread that drives the graph, the one the backends' streams were used from
+-        return ggml_custom_4d(ctx, GGML_TYPE_I32, 2*ggml_nelements(ids), 1, 1, 1, args, 1, plan_op, 1, &plan_ctxs[il]);
++        return ggml_custom_4d(ctx, GGML_TYPE_I32, 2*ggml_nelements(ids), 1, 1, 1, args, pred ? 2 : 1, plan_op, 1, &plan_ctxs[il]);
+     }
+ 
+     ggml_backend_t backend(int32_t il) const {
+@@ -793,6 +999,22 @@ struct llama_moe_cache::impl {
+ 
+     ~impl() {
+         log_stats();
++        // abyss: the prefetches still in flight write into the banks
++        for (device & d : devices) {
++            if (d.pf_backend) {
++                ggml_backend_synchronize(d.pf_backend);
++            }
++        }
++        for (ggml_backend_event_t ev : pf_done) {
++            if (ev) {
++                ggml_backend_event_free(ev);
++            }
++        }
++        for (device & d : devices) {
++            if (d.pf_backend) {
++                ggml_backend_free(d.pf_backend);
++            }
++        }
+     }
+ 
+     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+@@ -941,6 +1163,11 @@ struct llama_moe_cache::impl {
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
++        if (prefetch > 0) {
++            fprintf(stderr, "abyss: moe cache prefetch: %zu experts prefetched (%.2f MiB), %zu read by a plan (%.1f%%)\n",
++                stats_pf.uploaded, stats_pf.bytes/1024.0/1024.0, stats_pf.used,
++                stats_pf.uploaded > 0 ? 100.0*stats_pf.used/stats_pf.uploaded : 0.0);
++        }
+     }
+ };
+ 
+@@ -992,8 +1219,21 @@ bool llama_moe_cache::big_used(const ggml_tensor * w, std::vector<bool> & used)
+     return pimpl->big_used(w, used);
+ }
+ 
+-ggml_tensor * llama_moe_cache::build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) const {
+-    return pimpl->build_plan(ctx, il, ids);
++ggml_tensor * llama_moe_cache::build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred) const {
++    return pimpl->build_plan(ctx, il, ids, pred);
++}
++
++void llama_moe_cache::launched(ggml_backend_t backend) {
++    pimpl->launched(backend);
++}
++
++int32_t llama_moe_cache::prefetch_k(int32_t il, int64_t n_tokens) const {
++    return pimpl->prefetch_k(il, n_tokens);
++}
++
++void llama_moe_cache::prefetch_counts(size_t & uploaded, size_t & used) const {
++    uploaded = pimpl->stats_pf.uploaded;
++    used     = pimpl->stats_pf.used;
+ }
+ 
+ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 69fef95..11acdb2 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -36,7 +36,21 @@ public:
+     // slot the device reads (the zero slot for the experts the CPU computes), followed by the expert the CPU computes (-1
+     // for the others). The misses it admits to the cache are uploaded before it returns, asynchronously, so the CPU
+     // computes the other misses while they are in flight.
+-    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
++    // abyss: pred (I32, contiguous, see prefetch_k) are the experts predicted for layer il + 1; those the cache does not
++    // hold are uploaded on a stream of their own once the device has started computing layer il (see launched), and the
++    // plan of layer il + 1 makes the device wait for them
++    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred = nullptr) const;
++
++    // abyss: ggml_backend_sched launch callback: the scheduler started a computation on backend
++    void launched(ggml_backend_t backend);
++
++    // abyss: with ABYSS_MOE_PREFETCH=K (and ABYSS_MOE_CPU_MISS=1) the plan of layer il prefetches the top K experts that
++    // the router of layer il + 1 picks from the router input of layer il; returns K if layer il prefetches for a batch
++    // of n_tokens (a single token, both layers cached), 0 otherwise
++    int32_t prefetch_k(int32_t il, int64_t n_tokens) const;
++
++    // abyss: the experts prefetched so far, and how many of them a plan read before they were evicted
++    void prefetch_counts(size_t & uploaded, size_t & used) const;
+ 
+     // abyss: with ABYSS_MOE_BIG_SPLIT=1 the batches too large for the cache split their experts between the uploads and
+     // the CPU, see build_big_plan
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index b70bc40..92b7897 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2,6 +2,7 @@
+ #include "models.h"
+ 
+ #include "llama-kv-cache-dsv4.h"
++#include "llama-moe-cache.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -1881,6 +1882,24 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "ffn_norm", il);
+ 
++        // abyss: ABYSS_MOE_PREFETCH, the router of the next layer on the router input of this one predicts the experts
++        // the next layer selects, and the MoE cache plan of this layer prefetches them. Built like the router, so that the
++        // CUDA backend fuses it the same way; its weights are not used
++        ggml_tensor * moe_pred = nullptr;
++        if (moe_cache && ubatch.embd == nullptr && (uint32_t) il + 1 >= hparams.dsv4_hash_layer_count &&
++                (llama_expert_gating_func_type) hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
++            if (const int32_t k = moe_cache->prefetch_k(il, n_tokens); k > 0) {
++                const auto & next = model.layers[il + 1];
++                ggml_tensor * logits = build_lora_mm(next.ffn_gate_inp, cur); // [n_expert, n_tokens]
++                ggml_prec_set_acc(logits, GGML_PREC_F32);
++                ggml_tensor * probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits));
++                ggml_tensor * sel   = next.ffn_exp_probs_b ? ggml_add(ctx0, probs, next.ffn_exp_probs_b) : probs;
++                moe_pred = ggml_argsort_top_k(ctx0, sel, k); // [k, n_tokens]
++                cb(moe_pred, "ffn_moe_pred", il);
++                ggml_build_forward_expand(gf, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), moe_pred));
++            }
++        }
++
+         // abyss: under the CED-aware prefill this layer runs its FFN on the reachable tokens only, the others get a
+         // zero FFN output
+         ggml_tensor * ffn_full = cur;
+@@ -1928,7 +1947,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                     nullptr,
+                     nullptr,
+                     nullptr,
+-                    selected_experts);
++                    selected_experts,
++                    moe_pred);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             ggml_tensor * ffn_shexp = build_ffn(cur,
+-- 
+2.43.0
+

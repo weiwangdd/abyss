@@ -6,8 +6,11 @@
 // Each evaluation of a matching tensor becomes <dir>/<name>.<n>.bin, n counting from 0 per name (one per ubatch):
 // "ADMP", int32 ggml type, int64 ne[4], then the data as the tensor holds it (contiguous tensors only).
 //
-// With ABYSS_DUMP_GEN=N the prompt is not dumped; N tokens are then decoded greedily one at a time and only those
-// single-token evaluations are dumped, for checking the decode path.
+// With ABYSS_DUMP_GEN=N the prompt is not dumped; up to N tokens are then decoded one at a time and only those
+// single-token evaluations are dumped, for checking the decode path. Decoding is greedy unless ABYSS_DUMP_TEMP is set
+// above 0: then each token is sampled from the softmax at that temperature (ABYSS_DUMP_SEED, default 1), as a server
+// does with temperature T, top-p 1 and no top-k. It stops at an end-of-generation token, and the generated text goes
+// to <dir>/generated.txt.
 
 #include "arg.h"
 #include "common.h"
@@ -18,9 +21,11 @@
 #include "ggml-backend.h"
 
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <random>
 #include <regex>
 #include <string>
 #include <vector>
@@ -115,9 +120,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // greedy decoding, one token per evaluation
+    // decoding, one token per evaluation: greedy, or sampled at ABYSS_DUMP_TEMP
     state.active = true;
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    const char * temp_env = getenv("ABYSS_DUMP_TEMP");
+    const char * seed_env = getenv("ABYSS_DUMP_SEED");
+    const double temp = temp_env ? atof(temp_env) : 0.0;
+    std::mt19937_64 rng(seed_env ? strtoull(seed_env, nullptr, 10) : 1);
+    std::vector<double> weight(n_vocab);
+    std::string text;
     for (int i = 0; i < n_gen; ++i) {
         const float * logits = llama_get_logits_ith(ctx, -1);
         llama_token tok = 0;
@@ -126,11 +137,40 @@ int main(int argc, char ** argv) {
                 tok = v;
             }
         }
+        if (temp > 0) {
+            const double top = logits[tok];
+            double total = 0;
+            for (llama_token v = 0; v < n_vocab; ++v) {
+                weight[v] = std::exp((logits[v] - top) / temp);
+                total += weight[v];
+            }
+            double r = std::uniform_real_distribution<double>(0, total)(rng);
+            for (llama_token v = 0; v < n_vocab; ++v) {
+                r -= weight[v];
+                if (r <= 0) {
+                    tok = v;
+                    break;
+                }
+            }
+        }
         LOG_INF("abyss-dump: generated token %d: %d\n", i, tok);
+        if (llama_vocab_is_eog(vocab, tok)) {
+            LOG_INF("abyss-dump: end of generation after %d tokens\n", i);
+            break;
+        }
+        text += common_token_to_piece(ctx, tok);
         common_batch next = common_batch_get_one(ctx, { tok });
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, next.get())) {
             LOG_ERR("failed to decode\n");
             return 1;
+        }
+    }
+    if (n_gen > 0) {
+        const std::string path = state.dir + "/generated.txt";
+        FILE * f = fopen(path.c_str(), "wb");
+        if (f) {
+            fwrite(text.data(), 1, text.size(), f);
+            fclose(f);
         }
     }
 
