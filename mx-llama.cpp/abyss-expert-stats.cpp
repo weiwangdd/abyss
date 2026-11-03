@@ -3,9 +3,6 @@
 #include "common.h"
 #include "log.h"
 
-#include "ggml.h"
-#include "ggml-backend.h"
-
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -13,15 +10,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace {
-
-constexpr const char * k_topk_prefix = "ffn_moe_topk-";
 
 struct phase_counts {
     std::vector<uint64_t>              tokens; // [layer]
@@ -33,7 +27,6 @@ struct expert_stats {
     int          flush_sec = 30;
     std::mutex   mu;
     phase_counts phases[2]; // 0 = prefill, 1 = decode
-    std::vector<uint8_t> buf;
     std::chrono::steady_clock::time_point last_flush = std::chrono::steady_clock::now();
 };
 
@@ -73,15 +66,7 @@ void flush_locked(expert_stats & s) {
     s.last_flush = std::chrono::steady_clock::now();
 }
 
-void count(expert_stats & s, int il, const ggml_tensor * t) {
-    const int64_t n_used   = t->ne[0];
-    const int64_t n_tokens = t->ne[1];
-
-    // the top-k is usually a strided view of the argsort, so fetch the whole span once and stride on the host
-    const size_t span = (size_t) (n_tokens - 1) * t->nb[1] + (size_t) n_used * t->nb[0];
-    s.buf.resize(span);
-    ggml_backend_tensor_get(t, s.buf.data(), 0, span);
-
+void count(expert_stats & s, int il, const int32_t * ids, int64_t n_used, int64_t n_tokens) {
     phase_counts & p = s.phases[n_tokens == 1 ? 1 : 0];
     if ((int) p.tokens.size() <= il) {
         p.tokens.resize(il + 1, 0);
@@ -90,38 +75,28 @@ void count(expert_stats & s, int il, const ggml_tensor * t) {
     p.tokens[il] += n_tokens;
 
     std::vector<uint64_t> & hits = p.hits[il];
-    for (int64_t j = 0; j < n_tokens; j++) {
-        for (int64_t k = 0; k < n_used; k++) {
-            int32_t e;
-            memcpy(&e, s.buf.data() + j * t->nb[1] + k * t->nb[0], sizeof(e));
-            if (e < 0) {
-                continue;
-            }
-            if ((size_t) e >= hits.size()) {
-                hits.resize(e + 1, 0);
-            }
-            hits[e]++;
+    for (int64_t i = 0; i < n_tokens * n_used; i++) {
+        const int32_t e = ids[i];
+        if (e < 0) {
+            continue;
         }
+        if ((size_t) e >= hits.size()) {
+            hits.resize(e + 1, 0);
+        }
+        hits[e]++;
     }
 }
 
-bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
-    if (strncmp(t->name, k_topk_prefix, strlen(k_topk_prefix)) != 0 || t->type != GGML_TYPE_I32) {
-        return !ask;
-    }
-    if (ask) {
-        return true;
-    }
-
+// the selections of a ubatch arrive at the synchronize after it, the graph is not cut for them like an eval callback
+// on each layer's top-k would
+void on_moe_ids(int32_t il, const int32_t * ids, int32_t n_used, int32_t n_tokens, void * user_data) {
     auto & s = *static_cast<expert_stats *>(user_data);
-    const int il = atoi(t->name + strlen(k_topk_prefix));
 
     std::lock_guard<std::mutex> lock(s.mu);
-    count(s, il, t);
+    count(s, il, ids, n_used, n_tokens);
     if (std::chrono::steady_clock::now() - s.last_flush >= std::chrono::seconds(s.flush_sec)) {
         flush_locked(s);
     }
-    return true;
 }
 
 // a restart keeps adding to the counts already on disk instead of overwriting them
@@ -159,8 +134,8 @@ void abyss_expert_stats_install(common_params & params) {
     if (!path || !*path) {
         return;
     }
-    if (params.cb_eval) {
-        LOG_WRN("abyss: an eval callback is already set, expert stats disabled\n");
+    if (params.cb_moe_ids) {
+        LOG_WRN("abyss: a MoE selection callback is already set, expert stats disabled\n");
         return;
     }
 
@@ -171,8 +146,8 @@ void abyss_expert_stats_install(common_params & params) {
     }
     load_existing(*g_stats);
 
-    params.cb_eval           = eval_cb;
-    params.cb_eval_user_data = g_stats;
+    params.cb_moe_ids           = on_moe_ids;
+    params.cb_moe_ids_user_data = g_stats;
     std::atexit(flush_at_exit);
 
     LOG_INF("abyss: counting routed experts into %s every %d s\n", g_stats->path.c_str(), g_stats->flush_sec);

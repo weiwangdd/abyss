@@ -1,0 +1,266 @@
+From ccab9c9078b27186e07603cc001523300e0fbfc8 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Tue, 3 Nov 2026 22:24:08 +0100
+Subject: [PATCH] abyss: ABYSS_HC_KSPLIT=1 runs an rms_norm followed by a
+ mul_mat of its single F32 column with a few long F32 rows (the
+ hyper-connection mixes of DeepSeek V4) as one split-K product with the norm
+ folded in: a block per (row, chunk of the columns) sums its part of the
+ product and of the squares, and a second kernel adds the parts in a fixed
+ order and scales them; test-backend-ops gains RMS_NORM_MUL_MAT
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  12 +++
+ ggml/src/ggml-cuda/mmvf.cu      | 142 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cuh     |   4 +
+ tests/test-backend-ops.cpp      |  43 ++++++++++
+ 4 files changed, 201 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 13f6498..998945b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5648,6 +5648,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // abyss: the norm folded into a split-K product of its single column with a few long rows (ABYSS_HC_KSPLIT=1);
++    // ggml_cuda_can_fuse wants the two of the same shape
++    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
++            ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(node, cgraph->nodes[i + 1]) &&
++            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT }, { i + 1 })) {
++        const int out_nodes[] = { i + 1 };
++        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
++            ggml_cuda_op_rms_norm_mul_mat_vec_f(*cuda_ctx, node, cgraph->nodes[i + 1]);
++            return 1;
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d0a572e..0116fea 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -888,3 +888,145 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+             return false;
+     }
+ }
++
++// abyss: rms_norm -> mul_mat of one F32 column with a few long F32 rows (the hyper-connection mixes of DeepSeek V4, 24
++// rows of 4*n_embd): dst[j] = rsqrt(mean(x^2) + eps) * sum_k W[j][k]*x[k], the norm folded into the product. A block
++// per row would leave most SMs idle, so a block per (row, chunk of the columns) sums its part of the row and of the
++// squares, and a second kernel adds the parts in a fixed order, so that the result does not depend on the scheduling.
++// The rows are read before waiting for the kernel that writes x (PDL)
++#define MMVF_NORM_BLOCK  128
++#define MMVF_NORM_UNROLL 4
++
++static __global__ void rms_norm_mul_mat_vec_f_part(
++        const float * W, const float * x, float * part, float * part_ss, const int nrows, const int64_t stride_row,
++        const int ncols4) {
++    const int row   = blockIdx.x;
++    const int chunk = blockIdx.y;
++    const int tid   = threadIdx.x;
++
++    const int      i0 = chunk*MMVF_NORM_BLOCK*MMVF_NORM_UNROLL + tid;
++    const float4 * W4 = (const float4 *) (W + row*stride_row);
++    const float4 * x4 = (const float4 *) x;
++
++    float4 w[MMVF_NORM_UNROLL];
++#pragma unroll
++    for (int u = 0; u < MMVF_NORM_UNROLL; ++u) {
++        const int i = i0 + u*MMVF_NORM_BLOCK;
++        w[u] = i < ncols4 ? W4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    }
++
++    ggml_cuda_pdl_sync();
++
++    float sum = 0.0f;
++    float ss  = 0.0f;
++#pragma unroll
++    for (int u = 0; u < MMVF_NORM_UNROLL; ++u) {
++        const int    i = i0 + u*MMVF_NORM_BLOCK;
++        const float4 v = i < ncols4 ? x4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        sum += w[u].x*v.x + w[u].y*v.y + w[u].z*v.z + w[u].w*v.w;
++        ss  += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
++    }
++
++    ggml_cuda_pdl_lc();
++
++    sum = warp_reduce_sum<WARP_SIZE>(sum);
++    ss  = warp_reduce_sum<WARP_SIZE>(ss);
++
++    __shared__ float s_sum[MMVF_NORM_BLOCK/WARP_SIZE];
++    __shared__ float s_ss[MMVF_NORM_BLOCK/WARP_SIZE];
++    if (tid % WARP_SIZE == 0) {
++        s_sum[tid/WARP_SIZE] = sum;
++        s_ss[tid/WARP_SIZE]  = ss;
++    }
++    __syncthreads();
++    if (tid == 0) {
++        float a = 0.0f;
++        float b = 0.0f;
++#pragma unroll
++        for (int k = 0; k < MMVF_NORM_BLOCK/WARP_SIZE; ++k) {
++            a += s_sum[k];
++            b += s_ss[k];
++        }
++        part[chunk*nrows + row] = a;
++        if (row == 0) {
++            part_ss[chunk] = b;
++        }
++    }
++}
++
++static __global__ void rms_norm_mul_mat_vec_f_reduce(
++        const float * part, const float * part_ss, float * dst, const int nrows, const int nchunks, const int ncols,
++        const float eps) {
++    const int row = threadIdx.x;
++
++    ggml_cuda_pdl_sync();
++
++    float ss = 0.0f;
++    for (int c = 0; c < nchunks; ++c) {
++        ss += part_ss[c];
++    }
++    const float scale = rsqrtf(ss/ncols + eps);
++
++    ggml_cuda_pdl_lc();
++
++    if (row < nrows) {
++        float sum = 0.0f;
++        for (int c = 0; c < nchunks; ++c) {
++            sum += part[c*nrows + row];
++        }
++        dst[row] = scale*sum;
++    }
++}
++
++bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat) {
++    static const bool enabled = [] {
++        const char * e = getenv("ABYSS_HC_KSPLIT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (!enabled) {
++        return false;
++    }
++
++    const ggml_tensor * x = rms_norm->src[0];
++    const ggml_tensor * W = mul_mat->src[0];
++    if (mul_mat->src[1] != rms_norm || x->type != GGML_TYPE_F32 || W->type != GGML_TYPE_F32 ||
++            rms_norm->type != GGML_TYPE_F32 || mul_mat->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(W) || !ggml_is_contiguous(mul_mat) || ggml_nrows(x) != 1 ||
++            ggml_nrows(W) != W->ne[1] || W->ne[0] != x->ne[0]) {
++        return false;
++    }
++    // a few long rows, where a block per row leaves most SMs idle
++    if (W->ne[1] > 64 || x->ne[0] < 4096 || x->ne[0] % 4 != 0) {
++        return false;
++    }
++    // float4 loads
++    return (uintptr_t) x->data % 16 == 0 && (uintptr_t) W->data % 16 == 0 && W->nb[1] % 16 == 0;
++}
++
++void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
++    const ggml_tensor * x = rms_norm->src[0];
++    const ggml_tensor * W = mul_mat->src[0];
++
++    float eps;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++
++    const int ncols   = x->ne[0];
++    const int nrows   = W->ne[1];
++    const int ncols4  = ncols/4;
++    const int nchunks = (ncols4 + MMVF_NORM_BLOCK*MMVF_NORM_UNROLL - 1)/(MMVF_NORM_BLOCK*MMVF_NORM_UNROLL);
++
++    ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nchunks*nrows + nchunks);
++    float * part_ss = part.get() + (size_t) nchunks*nrows;
++    cudaStream_t stream = ctx.stream();
++
++    const ggml_cuda_kernel_launch_params params_part = {dim3(nrows, nchunks, 1), dim3(MMVF_NORM_BLOCK, 1, 1), 0, stream};
++    ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_part, params_part,
++        (const float *) W->data, (const float *) x->data, part.get(), part_ss, nrows, (int64_t) (W->nb[1]/sizeof(float)),
++        ncols4);
++
++    const ggml_cuda_kernel_launch_params params_reduce = {dim3(1, 1, 1), dim3(64, 1, 1), 0, stream};
++    ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_reduce, params_reduce,
++        (const float *) part.get(), (const float *) part_ss, (float *) mul_mat->data, nrows, nchunks, ncols, eps);
++}
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index 350b5cc..ccf4a80 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -12,3 +12,7 @@ void ggml_cuda_op_mul_mat_vec_f(
+     const int64_t src1_padded_row_size, cudaStream_t stream);
+ 
+ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
++
++// abyss: rms_norm -> mul_mat of one column with a few long F32 rows as one split-K product (ABYSS_HC_KSPLIT=1)
++bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat);
++void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 9665cb0..dc0d310 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3789,6 +3789,44 @@ struct test_rms_norm_back : public test_case {
+ };
+ 
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
++// abyss: rms_norm -> mul_mat of a single column with a few long rows (the hyper-connection mixes of DeepSeek V4), which
++// the CUDA backend fuses into a split-K product with ABYSS_HC_KSPLIT=1
++struct test_rms_norm_mul_mat : public test_case {
++    const int64_t k;
++    const int64_t m;
++    const int64_t n;
++    const float eps;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "RMS_NORM_MUL_MAT";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(k, m, n, eps);
++    }
++
++    test_rms_norm_mul_mat(int64_t k = 20480, int64_t m = 24, int64_t n = 1, float eps = 1e-6f)
++        : k(k), m(m), n(n), eps(eps) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_set_param(x);
++        ggml_set_name(x, "x");
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
++        ggml_set_name(w, "w");
++
++        // computed first, so that no OP_NONE comes between rms_norm and mul_mat
++        x = ggml_scale(ctx, x, 1.0f);
++        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, eps));
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -10432,6 +10470,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
+     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
++    for (int64_t m : {24, 64}) {
++        test_cases.emplace_back(new test_rms_norm_mul_mat(20480, m, 1));
++    }
++    test_cases.emplace_back(new test_rms_norm_mul_mat(20480, 24, 2)); // two columns, not fused
++    test_cases.emplace_back(new test_rms_norm_mul_mat(4100, 24, 1));  // a partial last chunk
+ 
+     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+-- 
+2.43.0
+

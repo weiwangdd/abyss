@@ -1,0 +1,272 @@
+From 0982951c0ea78cd99269273c572a24f7f33976c9 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Tue, 3 Nov 2026 22:24:08 +0100
+Subject: [PATCH] abyss: cb_moe_ids in llama_context_params (and common_params)
+ hands each MoE layer's selected experts to a callback at the synchronize
+ after the ubatch: build_moe_ffn keeps a copy of the selection as a graph
+ output after the fused routing nodes, and decode copies the copies to a
+ pinned buffer along with the logits. The expert stats use it instead of an
+ eval callback, which cut the graph at every layer's top-k (no fused routing,
+ a sync and a graph launch per layer) and also counted the reshaped and cont
+ views of the selection that the MoE cache's plans make
+
+---
+ common/common.cpp     |  2 ++
+ common/common.h       |  3 ++
+ include/llama.h       |  8 +++++
+ src/llama-context.cpp | 72 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.h   | 14 +++++++++
+ src/llama-cparams.h   |  3 ++
+ src/llama-graph.cpp   | 13 ++++++++
+ src/llama-graph.h     |  2 ++
+ 8 files changed, 117 insertions(+)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 80f48fe..b41353c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1774,6 +1774,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.flash_attn_type   = params.flash_attn_type;
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
++    cparams.cb_moe_ids           = params.cb_moe_ids;
++    cparams.cb_moe_ids_user_data = params.cb_moe_ids_user_data;
+     cparams.offload_kqv       = !params.no_kv_offload;
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
+diff --git a/common/common.h b/common/common.h
+index 5ebf260..feb6fba 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -503,6 +503,9 @@ struct common_params {
+     ggml_backend_sched_eval_callback cb_eval = nullptr;
+     void * cb_eval_user_data                 = nullptr;
+ 
++    llama_moe_ids_callback cb_moe_ids = nullptr; // abyss: see llama_context_params
++    void * cb_moe_ids_user_data       = nullptr;
++
+     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+ 
+     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+diff --git a/include/llama.h b/include/llama.h
+index d0188a8..83f01e1 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -245,6 +245,9 @@ extern "C" {
+ 
+     typedef bool (*llama_progress_callback)(float progress, void * user_data);
+ 
++    // abyss: the experts a MoE layer selected for the tokens of a ubatch, ids[n_tokens][n_expert_used]
++    typedef void (*llama_moe_ids_callback)(int32_t il, const int32_t * ids, int32_t n_expert_used, int32_t n_tokens, void * user_data);
++
+     // Input data for llama_encode/llama_decode
+     // A llama_batch object can contain input about one or many sequences
+     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
+@@ -396,6 +399,11 @@ extern "C" {
+         ggml_backend_sched_eval_callback cb_eval;
+         void * cb_eval_user_data;
+ 
++        // abyss: called with each MoE layer's selected experts at the synchronize after the ubatch; an eval callback
++        // on them would cut the graph at every layer
++        llama_moe_ids_callback cb_moe_ids;
++        void * cb_moe_ids_user_data;
++
+         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a982d2d..9036483 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -157,6 +157,9 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++    cparams.cb_moe_ids           = params.cb_moe_ids;
++    cparams.cb_moe_ids_user_data = params.cb_moe_ids_user_data;
++
+     cparams.ctx_other = nullptr;
+ 
+     // TODO: more generic
+@@ -930,6 +933,8 @@ void llama_context::synchronize() {
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    moe_ids_flush();
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -957,6 +962,66 @@ void llama_context::synchronize() {
+     t_compute_start_us = 0;
+ }
+ 
++// abyss: each MoE layer's selected experts (an output of the graph) are copied to a pinned buffer with the logits and
++// handed to cparams.cb_moe_ids at the next synchronize, so a decode waits for nothing more than its logits; the
++// selections of an earlier ubatch still in the buffer are handed over first
++void llama_context::moe_ids_read(const llm_graph_result * res) {
++    size_t nbytes = 0;
++    for (const ggml_tensor * t : res->t_moe_ids) {
++        if (t && ggml_nelements(t) > 0) {
++            nbytes += ggml_nbytes(t);
++        }
++    }
++    if (nbytes == 0) {
++        return;
++    }
++
++    if (!moe_ids_pending.empty()) {
++        ggml_backend_sched_synchronize(sched.get());
++        moe_ids_flush();
++    }
++
++    if (!buf_moe_ids || ggml_backend_buffer_get_size(buf_moe_ids.get()) < nbytes) {
++        // room for a full ubatch, so that the buffer is allocated once
++        const size_t size = std::max(nbytes,
++            (size_t) model.hparams.n_layer() * model.hparams.n_expert_used_max() * cparams.n_ubatch * sizeof(int32_t));
++
++        auto * buft = ggml_backend_cpu_buffer_type();
++        auto * output_dev = model.dev_output();
++        auto * host_buft  = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
++        if (host_buft) {
++            buft = host_buft;
++        }
++        buf_moe_ids.reset(ggml_backend_buft_alloc_buffer(buft, size));
++        GGML_ASSERT(buf_moe_ids != nullptr);
++    }
++
++    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_moe_ids.get());
++    size_t offs = 0;
++    for (size_t il = 0; il < res->t_moe_ids.size(); il++) {
++        ggml_tensor * t = res->t_moe_ids[il];
++        if (!t || ggml_nelements(t) == 0) {
++            continue;
++        }
++        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++        GGML_ASSERT(backend != nullptr);
++        ggml_backend_tensor_get_async(backend, t, base + offs, 0, ggml_nbytes(t));
++        moe_ids_pending.push_back({ (int32_t) il, (int32_t) t->ne[0], (int32_t) t->ne[1], offs });
++        offs += ggml_nbytes(t);
++    }
++}
++
++void llama_context::moe_ids_flush() {
++    if (moe_ids_pending.empty()) {
++        return;
++    }
++    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf_moe_ids.get());
++    for (const auto & e : moe_ids_pending) {
++        cparams.cb_moe_ids(e.il, (const int32_t *) (base + e.offs), e.n_used, e.n_tokens, cparams.cb_moe_ids_user_data);
++    }
++    moe_ids_pending.clear();
++}
++
+ const llama_model & llama_context::get_model() const {
+     return model;
+ }
+@@ -2453,6 +2518,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             }
+         }
+ 
++        // abyss: the MoE selections, for cparams.cb_moe_ids
++        if (cparams.cb_moe_ids) {
++            moe_ids_read(res);
++        }
++
+         // extract embeddings
+         if (embd.data && t_embd && n_outputs > 0) {
+             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+@@ -4701,6 +4771,8 @@ llama_context_params llama_context_default_params() {
+         /*.defrag_thold                =*/ -1.0f,
+         /*.cb_eval                     =*/ nullptr,
+         /*.cb_eval_user_data           =*/ nullptr,
++        /*.cb_moe_ids                  =*/ nullptr,
++        /*.cb_moe_ids_user_data        =*/ nullptr,
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
+         /*.moe_cache_size              =*/ 0,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index fcf23f1..f75f77e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -479,6 +479,20 @@ private:
+ 
+     copy_experts_info copy_experts;
+ 
++    // abyss: the MoE selections read back for cparams.cb_moe_ids, handed to it at the next synchronize
++    struct moe_ids_entry {
++        int32_t il;
++        int32_t n_used;
++        int32_t n_tokens;
++        size_t  offs; // in buf_moe_ids
++    };
++
++    std::vector<moe_ids_entry> moe_ids_pending;
++    ggml_backend_buffer_ptr    buf_moe_ids; // pinned
++
++    void moe_ids_read(const llm_graph_result * res);
++    void moe_ids_flush();
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 38a259c..bbee201 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -67,5 +67,8 @@ struct llama_cparams {
+     ggml_backend_sched_eval_callback cb_eval;
+     void * cb_eval_user_data;
+ 
++    llama_moe_ids_callback cb_moe_ids;
++    void * cb_moe_ids_user_data;
++
+     llama_context * ctx_other;
+ };
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 602cc43..aadc190 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1565,6 +1565,8 @@ void llm_graph_result::reset() {
+     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+ 
++    t_moe_ids.assign(LLAMA_MAX_LAYERS, nullptr);
++
+     t_sampled.clear();
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+@@ -2451,6 +2453,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // abyss: a copy of the selection kept as an output and read after the graph (cparams.cb_moe_ids). The expert stats
++    // read it through an eval callback before, which cut the graph there: no fused routing, and a sync and a graph
++    // launch per layer. The copy comes after the fused nodes, which must stay together
++    if (cparams.cb_moe_ids && il >= 0 && il < (int) res->t_moe_ids.size() && n_tokens > 0) {
++        ggml_tensor * ids_out = ggml_cont(ctx0, selected_experts);
++        cb(ids_out, "ffn_moe_ids_out", il);
++        ggml_set_output(ids_out);
++        ggml_build_forward_expand(gf, ids_out);
++        res->t_moe_ids[il] = ids_out;
++    }
++
+     // the experts of host-resident layers may be read from the MoE cache
+     // abyss: the CPU may compute some of the misses, for the plain SwiGLU experts of DeepSeek V4
+     const bool cpu_split_ok = (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) && il >= 0 &&
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4a4e8a1..a805b19 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1007,6 +1007,8 @@ public:
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
++    std::vector<ggml_tensor *> t_moe_ids; // [LLAMA_MAX_LAYERS] abyss: each MoE layer's selected experts, for cparams.cb_moe_ids
++
+     std::vector<ggml_tensor *> t_sampled;
+     std::vector<ggml_tensor *> t_sampled_probs;
+     std::vector<ggml_tensor *> t_sampled_logits;
+-- 
+2.43.0
+

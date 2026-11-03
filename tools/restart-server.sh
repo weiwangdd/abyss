@@ -5,7 +5,10 @@
 # template or the weights changed. Like the official encoding, reasoning of earlier turns is dropped when there are no
 # tools, and the default sampling is what the DeepSeek-V4.1-Flash-1017 model card recommends, temperature 1.0 and
 # top-p 1.0; requests can override it. The experts the CPU computes for a token are deferred to the next layer
-# (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025); restart-nodefer.sh is the fallback without.
+# (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025); restart-nodefer.sh is the fallback without. The hyper-connection mixes of a
+# token run as one split-K product with their norm folded in (ABYSS_HC_KSPLIT=1, 0027); restart-noksplit.sh is the
+# fallback without. The expert stats read each layer's selection after the graph (0026); NEW_STATS=1 starts them
+# from zero, the old file kept aside.
 set -e
 cd ~/abyss-stats
 mkdir -p slots
@@ -36,12 +39,18 @@ if [ -n "$pids" ]; then
     sleep 1
   done
 fi
-cp expert-stats.json "expert-stats-$(date +%H%M).json"
+if [ -f expert-stats.json ]; then
+  if [ -n "$NEW_STATS" ]; then
+    mv expert-stats.json "expert-stats-$(date +%m%d-%H%M)-before-new.json"
+  else
+    cp expert-stats.json "expert-stats-$(date +%H%M).json"
+  fi
+fi
 [ -f server.log ] && mv server.log "server-$(date +%H%M).log"
 cd ~/src/mx-llama.cpp
 ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
   ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_DECODE_STATS=100 GOMP_SPINCOUNT=100000000 \
-  ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 \
+  ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
   nohup ./build-m2/bin/llama-server \
   -m ~/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \

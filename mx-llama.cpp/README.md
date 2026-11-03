@@ -4,7 +4,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `abyss-expert-stats.{h,cpp}` + `0001-hook-expert-stats.patch` | `llama-server` 的专家命中统计 |
+| `abyss-expert-stats.{h,cpp}` + `0001-hook-expert-stats.patch` | `llama-server` 的专家命中统计（经 `0026` 的 `cb_moe_ids` 读选择结果，要和它一起用） |
 | `0002-deepseek-v41-dsml-tags.patch` | 解析 V4.1 的工具调用标签（`<｜DSML｜ calls>` 等，标签名带前导空格） |
 | `deepseek-v4.1.jinja` | V4.1 对话模板，按官方 `encoding/encoding.py` 逐字对齐：GGUF 内嵌的是 V4 的模板，工具调用标签是 V4 写法，也没有 `<｜System｜>` 和思考强度行 |
 | `0003-ced-prefill.patch` | CED 感知预填充：解码器层只对后面的 token 还能通过滑动窗口看到的那些 token 算 FFN（`ABYSS_CED_PREFILL=1`） |
@@ -30,6 +30,8 @@
 | `0023-big-batch-cache.patch` | 大批次用缓存（`ABYSS_MOE_BIG_CACHE=1`）：专家缓存覆盖的层规划大批次时，缓存里有的专家记下槽位，在缓存所在的卡上直接算（gate、up、激活、down，加权求和），其余的照 `0014` 分给 CPU 和上传；三路同时进行，最后相加。原来缓存只能复制给它所在的卡，大批次在第一张卡上算，用不上缓存。规划结果末尾多一列槽位号，统计行多报从缓存算的专家数 |
 | `0024-moe-prefetch.patch` | 专家预取（`ABYSS_MOE_PREFETCH=K`，只用于测试，没有上线）：单 token 解码时，专家缓存覆盖的层用下一层的路由门作用在本层的路由器输入上选 top K（和路由同样建图，CUDA 照样融合），缓存里没有的挤掉最久没用、这一步也没用到的槽位，用缓存所在卡上第二个 CUDA backend 的流提前上传，每层最多 `ABYSS_MOE_PREFETCH_MAX` 个；下一层的规划让主流等它的事件。主机到显卡的拷贝按提交顺序排队、不分流，所以调度器加了启动回调（`ggml_backend_sched_set_launch_callback`），预取等这一层的计算提交以后才发，不挡住它的输入拷贝。解码统计行多报每 token 预取数和被读到的比例。实测命中率 78% → 82–85%，解码速度不变（见 CLAUDE.md「专家预取」）；不设开关时和原来一样 |
 | `0025-moe-defer.patch` | 专家延后（`ABYSS_MOE_DEFER=1`，生产已开）：单 token 解码时，专家缓存覆盖的层交给 CPU 算的专家不并进本层的 FFN 输出，它们的加权和在下一层注意力的输出处、按本层 FFN 的 post 系数加进残差（下一层的注意力没看到这部分，残差本身是精确的）；图的顺序让 GPU 先算本层缓存命中的专家和下一层的注意力，CPU 同时算未命中，规划算子顺带把 FFN 输入拷到 CPU。调度器加了开关 `ggml_backend_sched_set_async_host_inputs`：GPU 段从 CPU 段来的小输入（≤ 1 MiB）走锁页暂存区在 GPU 的流上异步拷，紧跟 GPU 段、没有输入的 CPU 段不再同步，有逐节点回调（专家统计）时回调不读的段也不同步。会话解码 +11%，解码路径 PPL +0.06% ± 0.14%（见 CLAUDE.md「专家延后」）；不设开关时和原来一样 |
+| `0026-moe-ids-stats.patch` | 专家统计不再切图：`llama_context_params`（和 `common_params`）加了 `cb_moe_ids`。设了它，`build_moe_ffn` 在融合的路由节点之后给每层的选择结果加一个 `cont` 输出，每个 ubatch 算完和 logits 一起异步拷进锁页内存，在下一次 `synchronize()`（读 logits 时）交给回调。`abyss-expert-stats` 改用它，不再装逐节点回调：原来的回调在每层的 top-k 处切开计算图，路由的融合内核用不上，每层还多一次同步和一次 CUDA graph 启动；而且按名字前缀匹配，把专家缓存的规划对选择结果做的 reshape、cont 视图也算了进去，第 22–39 层的计数是错的。生产设置下会话解码 +7.8%（见 CLAUDE.md「专家统计不再切图」） |
+| `0027-hc-ksplit.patch` | 超连接混合系数的 K 切分（`ABYSS_HC_KSPLIT=1`，生产已开）：CUDA 后端把「`rms_norm` 后接以它为输入的 `mul_mat`」（单列、F32、≤ 64 行、≥ 4,096 列，也就是 DSV4 每个子层的超连接混合系数，24 行 × 20,480 列）换成两个内核：每块算（行, 2,048 列一段）的点积和这段的平方和，第二个内核按固定顺序相加再乘 `rsqrt(mean(x²)+eps)`，结果和调度无关。每次约 12.3 → 3.3 µs，每 token 80 次，会话解码 +4.5%；`test-backend-ops` 加了 `RMS_NORM_MUL_MAT` 用例。不设开关时和原来一样 |
 
 ## 安装
 
@@ -49,7 +51,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0019-graph-memory.patch <abyss>/mx-llama.cpp/0020-indexer-chunks.patch \
   <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch \
   <abyss>/mx-llama.cpp/0023-big-batch-cache.patch <abyss>/mx-llama.cpp/0024-moe-prefetch.patch \
-  <abyss>/mx-llama.cpp/0025-moe-defer.patch
+  <abyss>/mx-llama.cpp/0025-moe-defer.patch <abyss>/mx-llama.cpp/0026-moe-ids-stats.patch \
+  <abyss>/mx-llama.cpp/0027-hc-ksplit.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
@@ -74,7 +77,7 @@ python3 tools/expert_hotness.py ~/expert-stats.json
 - 统计文件已存在时，启动后接着累加，不会覆盖。
 - 统计按 ubatch 的 token 数区分阶段：1 个 token 算解码，多个算预填充。要用 `-np 1`，否则多路并发的解码会被算成预填充。
 - `ABYSS_EXPERT_STATS_FLUSH_SEC` 控制写文件间隔，默认 30 秒；只在有请求时写，进程正常退出时也会写一次。
-- 回调会让调度器在每层的路由结果处同步一次，速度会略降。测速时不要开。
+- 统计在每个 ubatch 之后读选择结果（`0026`），不切计算图，每 token 只多 40 次 24 字节的拷回（约 0.1 ms）；`0026` 之前的逐节点回调每层同步一次，测速时要关。
 - `ABYSS_CED_PREFILL=1` 打开 CED 感知预填充，只对 DeepSeek V4.1 生效。每次 `llama_decode` 调用按自己的末尾规划，所以 server 要设大 `-b`（比如 65536），让整段提示词进一次调用才省得多。`ABYSS_CED_MARGIN`（默认 256）是末尾额外保持有效的位置数。`0003` 跳过 FFN，`0005` 再跳过注意力的查询，KV 的写入始终不变。
 - `ABYSS_DSV41_INDEXER=1` 打开 V4.1 的稀疏注意力索引器：KV 源层写索引键（第 2、8、14 层用已有的索引键 cache，第 20 层用新增的 `kv_lidp`），索引源层打分选 top-512，第 20 层为后面的压缩比 1 索引源挑 2,048 个候选块，其余层沿用最近索引源的 top-k。DSV4 状态格式版本因此升到 2
 - `llama-abyss-dump` 由 `ABYSS_DUMP_RE`（张量名正则，名字带 `-<层号>` 后缀）和 `ABYSS_DUMP_DIR` 控制，整段提示词作为一批送入，每个 ubatch 存一个 `<名字>.<序号>.bin`。设 `ABYSS_DUMP_GEN=N` 时不存提示词，而是之后贪心解码 N 个 token，只存这些单 token 的计算。`0007` 给索引键的输入起名 `idx_latent`，`0008` 给压缩注意力的查询起名 `hca_q`，都不影响计算
