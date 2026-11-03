@@ -4,7 +4,8 @@
 # conversation instead of prefilling it again; NO_RESTORE=1 skips the restore, e.g. when the cache layout or the
 # template or the weights changed. Like the official encoding, reasoning of earlier turns is dropped when there are no
 # tools, and the default sampling is what the DeepSeek-V4.1-Flash-1017 model card recommends, temperature 1.0 and
-# top-p 1.0; requests can override it.
+# top-p 1.0; requests can override it. The experts the CPU computes for a token are deferred to the next layer
+# (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025); restart-nodefer.sh is the fallback without.
 set -e
 cd ~/abyss-stats
 mkdir -p slots
@@ -40,7 +41,7 @@ cp expert-stats.json "expert-stats-$(date +%H%M).json"
 cd ~/src/mx-llama.cpp
 ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
   ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_DECODE_STATS=100 GOMP_SPINCOUNT=100000000 \
-  ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 \
+  ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 \
   nohup ./build-m2/bin/llama-server \
   -m ~/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \

@@ -1,0 +1,423 @@
+From d7b375b8272f6599ce2c7c1e29075032bcb54f55 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Tue, 3 Nov 2026 14:49:33 +0100
+Subject: [PATCH] abyss: ABYSS_MOE_DEFER=1 defers, for a single token, the
+ experts the CPU computes for a cached layer to the next layer: their weighted
+ sum joins the residual at the next layer's attention output through the post
+ mix of the layer that selected them, so the device computes the cached
+ experts and the next layer's attention while the host computes the misses;
+ the plan carries the FFN input to the host, and a new scheduler switch,
+ ggml_backend_sched_set_async_host_inputs, copies small host inputs of GPU
+ splits through pinned staging on the GPU's stream and lets a CPU split
+ without inputs go on after a GPU split, so the host does not wait for the
+ device
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml-backend.h |  6 +++++
+ ggml/src/ggml-backend.cpp   | 44 +++++++++++++++++++++++++++++++-
+ src/llama-context.cpp       |  7 +++++
+ src/llama-graph.cpp         | 51 +++++++++++++++++++++++++++++--------
+ src/llama-graph.h           | 12 ++++++---
+ src/llama-moe-cache.cpp     | 10 ++++----
+ src/llama-moe-cache.h       |  4 ++-
+ src/models/deepseek4.cpp    | 33 ++++++++++++++++++++++--
+ 8 files changed, 144 insertions(+), 23 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b964d61..37686e1 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -391,6 +391,12 @@ extern "C" {
+     // abyss: Set a callback to be called after the computation of each split was started
+     GGML_API void                 ggml_backend_sched_set_launch_callback(ggml_backend_sched_t sched, ggml_backend_sched_launch_callback callback, void * user_data);
+ 
++    // abyss: with enabled, a small input in host memory that a GPU split reads from a CPU split is copied through a
++    // pinned staging buffer on the GPU's stream, after the work queued on it, instead of the host first waiting for the
++    // GPU to finish; and a CPU split without inputs after a GPU split does not wait for that split. The host can then
++    // compute while the GPU does (the MoE expert deferral, ABYSS_MOE_DEFER)
++    GGML_API void                 ggml_backend_sched_set_async_host_inputs(ggml_backend_sched_t sched, bool enabled);
++
+     //
+     // Meta backend
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8845708..560e053 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1040,6 +1040,8 @@ struct ggml_backend_sched {
+     ggml_backend_sched_launch_callback callback_launch;
+     void * callback_launch_user_data;
+ 
++    bool async_host_inputs; // abyss: see ggml_backend_sched_set_async_host_inputs
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -2379,7 +2381,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        // abyss: with async_host_inputs a CPU split goes on while the GPU computes: the GPU splits read no host compute
++        // buffer asynchronously then, their host inputs go through staging buffers
++        const bool host_goes_on = sched->async_host_inputs && prev_backend_id >= 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) == GGML_BACKEND_DEVICE_TYPE_GPU;
++        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !host_goes_on) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -2477,6 +2484,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+             } else {
+                 sched->timing.n_non_graph_inputs += sched->timing.enabled ? 1 : 0;
++
++                // abyss: async_host_inputs: a small host input of a GPU split from a CPU split is copied on the split
++                // backend's stream, after the work queued on it, so the host does not wait for the GPU here. The pinned
++                // staging buffer keeps the data until the copy has run
++                const size_t async_size = ggml_nbytes(input);
++                if (sched->async_host_inputs && !ggml_backend_sched_is_host_weight(input) && input != input_cpy &&
++                        input->buffer != nullptr && ggml_backend_buffer_is_host(input->buffer) &&
++                        ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++                        ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
++                        async_size > 0 && async_size <= 1024*1024 && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
++                        split_backend->iface.set_tensor_async != nullptr && input_staging_event != nullptr) {
++                    if (!input_staging_event_waited) {
++                        if (sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
++                            ggml_backend_event_synchronize(input_staging_event);
++                        }
++                        sched->input_staging_events_recorded[split_backend_id][sched->cur_copy] = false;
++                        input_staging_event_waited = true;
++                    }
++                    ggml_backend_sched_input_staging * staging = ggml_backend_sched_get_input_staging(
++                        sched, hash_id(input), split_backend_id, sched->cur_copy, async_size);
++                    void * input_staging = ggml_backend_buffer_get_base(staging->buffer);
++                    GGML_ASSERT(input_staging != nullptr);
++                    memcpy(input_staging, input->data, async_size);
++                    ggml_backend_tensor_set_async(split_backend, input_cpy, input_staging, 0, async_size);
++                    input_staging_event_needs_record = true;
++                    sched->timing.n_non_graph_inputs_staged += sched->timing.enabled ? 1 : 0;
++                    ggml_backend_sched_timing_trace_input(sched, "non_graph_async_host", input, input_cpy, input_backend, split_backend);
++                    continue;
++                }
++
+                 // wait for the split backend to finish using the input before overwriting it
+                 int64_t t0 = ggml_backend_sched_timing_now(sched);
+                 // ROCm: with deep pipelining the enqueued event wait below does not
+@@ -2967,6 +3004,11 @@ void ggml_backend_sched_set_launch_callback(ggml_backend_sched_t sched, ggml_bac
+     sched->callback_launch_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_async_host_inputs(ggml_backend_sched_t sched, bool enabled) {
++    GGML_ASSERT(sched);
++    sched->async_host_inputs = enabled;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     return sched->n_splits;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dd47f45..a982d2d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -737,6 +737,13 @@ void llama_context::sched_reserve() {
+         ggml_backend_sched_set_sync_non_graph_inputs(result, sync_non_graph_inputs);
+         ggml_backend_sched_set_copy_callback(result, sched_copy_experts, this);
+         ggml_backend_sched_set_launch_callback(result, sched_launched, this);
++        // abyss: ABYSS_MOE_DEFER=1 defers the experts the CPU computes for a single token to the next layer, so the
++        // host computes them while the GPU goes on; the scheduler must then not make the host wait for the GPU
++        static const bool moe_defer = [] {
++            const char * e = getenv("ABYSS_MOE_DEFER");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        ggml_backend_sched_set_async_host_inputs(result, moe_defer);
+         return result;
+     };
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 171ca4c..602cc43 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2257,7 +2257,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
+-         ggml_tensor * moe_pred) const {
++         ggml_tensor * moe_pred,
++         ggml_tensor ** moe_deferred) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -2279,7 +2280,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         gate_exps_s,
+         down_exps_s,
+         selected_experts_in,
+-        moe_pred
++        moe_pred,
++        moe_deferred
+     );
+ }
+ 
+@@ -2308,7 +2310,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
+-         ggml_tensor * moe_pred) const {
++         ggml_tensor * moe_pred,
++         ggml_tensor ** moe_deferred) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -2454,7 +2457,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         gate_exps && up_exps && down_exps && !gate_up_exps && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s;
+     ggml_tensor * cpu_ids = nullptr;
+-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, cpu_split_ok ? &cpu_ids : nullptr, moe_pred);
++    // abyss: to defer the CPU's experts, the plan carries their input, so the host has it before the device goes on
++    const bool want_defer = moe_deferred != nullptr && cpu_split_ok && n_tokens == 1;
++    ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il,
++        cpu_split_ok ? &cpu_ids : nullptr, moe_pred, want_defer ? cur3 : nullptr);
++    const bool defer = want_defer && cpu_ids != nullptr;
++    if (moe_deferred) {
++        *moe_deferred = nullptr;
++    }
+ 
+     // abyss: a batch too large for the cache splits its experts between the uploads and the CPU (ABYSS_MOE_BIG_SPLIT).
+     // The device path below gets the ids of the experts it uploads, -1 for the CPU's; the CPU gets a compact batch of
+@@ -2483,11 +2494,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     }
+ 
+-    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++    cur = cur3;
+     ggml_tensor * cur_in = cur;
+ 
+     // abyss: the experts the CPU computes, from the host weights, for the rows of x and the experts of ids
+-    auto build_cpu_experts = [&](ggml_tensor * x, ggml_tensor * ids) {
++    // deferred ones are not expanded here: the consumer of their sum expands them after the device's next work
++    auto build_cpu_experts = [&](ggml_tensor * x, ggml_tensor * ids, bool expand = true) {
+         ggml_tensor * up_c   = ggml_mul_mat_id(ctx0, up_exps,   x, ids);
+         ggml_tensor * gate_c = ggml_mul_mat_id(ctx0, gate_exps, x, ids);
+         const float limit = hparams.swiglu_clamp_exp[il];
+@@ -2498,13 +2510,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+         }
+         cb(down_c, "ffn_moe_down_cpu", il);
+-        ggml_build_forward_expand(gf, down_c);
++        if (expand) {
++            ggml_build_forward_expand(gf, down_c);
++        }
+         return down_c;
+     };
+ 
+     // with the small-batch plan the CPU's experts are expanded before the device's, so their split runs after the plan
+     // started the uploads
+-    ggml_tensor * experts_cpu = cpu_ids ? build_cpu_experts(cur_in, cpu_ids) : nullptr; // [n_embd, n_expert_used, n_tokens]
++    ggml_tensor * experts_cpu = cpu_ids ? build_cpu_experts(cur_in, cpu_ids, !defer) : nullptr; // [n_embd, n_expert_used, n_tokens]
+ 
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+@@ -2691,7 +2705,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             }
+         }
+     }
+-    if (experts_cpu) {
++    if (experts_cpu && !defer) {
+         // each expert is computed on one side, the other side's rows are zero
+         experts = ggml_add(ctx0, experts, experts_cpu);
+     }
+@@ -2752,6 +2766,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->backend(il));
+     }
+ 
++    if (defer) {
++        // abyss: the CPU's experts, weighted and summed on the cache device, which copies their rows when it needs the sum
++        ggml_backend_t dev = moe_cache->backend(il);
++        ggml_tensor * rows = ggml_mul(ctx0, experts_cpu, weights);
++        ggml_backend_sched_set_tensor_backend(sched, rows, dev);
++        ggml_tensor * sum = ggml_view_2d(ctx0, rows, n_embd, n_tokens, rows->nb[2], 0);
++        for (uint32_t i = 1; i < hparams.n_expert_used(il); ++i) {
++            sum = ggml_add(ctx0, sum, ggml_view_2d(ctx0, rows, n_embd, n_tokens, rows->nb[2], i*rows->nb[1]));
++            ggml_backend_sched_set_tensor_backend(sched, sum, dev);
++        }
++        cb(sum, "ffn_moe_deferred", il);
++        *moe_deferred = sum;
++    }
++
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     return moe_out;
+@@ -2765,7 +2793,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * gate_up_exps,
+                  int   il,
+          ggml_tensor ** cpu_ids,
+-         ggml_tensor * moe_pred) const {
++         ggml_tensor * moe_pred,
++         ggml_tensor * plan_keep) const {
+     if (moe_cache == nullptr) {
+         return nullptr;
+     }
+@@ -2792,7 +2821,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+         if (moe_pred && !ggml_is_contiguous(moe_pred)) {
+             moe_pred = ggml_cont(ctx0, moe_pred);
+         }
+-        ggml_tensor * plan = moe_cache->build_plan(ctx0, il, ids, moe_pred);
++        ggml_tensor * plan = moe_cache->build_plan(ctx0, il, ids, moe_pred, plan_keep);
+         ggml_format_name(plan, "ffn_moe_plan-%d", il);
+         const int64_t n = ggml_nelements(ids);
+         *cpu_ids = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, plan, n, n*ggml_element_size(plan)), selected_experts->ne[0], selected_experts->ne[1]);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index dc27f0c..4a4e8a1 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1225,10 +1225,14 @@ struct llm_graph_context {
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
+-             ggml_tensor * moe_pred = nullptr) const;
++             ggml_tensor * moe_pred = nullptr,
++             ggml_tensor ** moe_deferred = nullptr) const;
+ 
+     // abyss: moe_pred (I32 [k, n_tokens]) are the experts the next layer is predicted to select, which the plan of this
+     // layer prefetches into the MoE cache (see llama_moe_cache::prefetch_k)
++    // abyss: with moe_deferred, a single token whose misses the CPU computes leaves them out of the result: *moe_deferred
++    // gets their weighted sum [n_embd, n_tokens], which the caller adds later, so the host computes them while the device
++    // goes on (ABYSS_MOE_DEFER); nullptr if nothing is deferred
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+              ggml_tensor * gate_inp,
+@@ -1254,7 +1258,8 @@ struct llm_graph_context {
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
+-             ggml_tensor * moe_pred = nullptr) const;
++             ggml_tensor * moe_pred = nullptr,
++             ggml_tensor ** moe_deferred = nullptr) const;
+ 
+     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+     // abyss: with cpu_ids and the cache's cpu_misses(), *cpu_ids gets the experts the CPU computes (-1 for the others),
+@@ -1267,7 +1272,8 @@ struct llm_graph_context {
+              ggml_tensor * gate_up_exps,
+                      int   il,
+              ggml_tensor ** cpu_ids = nullptr,
+-             ggml_tensor * moe_pred = nullptr) const;
++             ggml_tensor * moe_pred = nullptr,
++             ggml_tensor * plan_keep = nullptr) const;
+ 
+     //
+     // inputs
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 9288f14..07f14ae 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -987,10 +987,10 @@ struct llama_moe_cache::impl {
+         pf_next_il = -1;
+     }
+ 
+-    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred) {
+-        ggml_tensor * args[2] = { ids, pred };
++    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred, ggml_tensor * keep) {
++        ggml_tensor * args[3] = { ids, pred, keep };
+         // one task: the plan runs on the thread that drives the graph, the one the backends' streams were used from
+-        return ggml_custom_4d(ctx, GGML_TYPE_I32, 2*ggml_nelements(ids), 1, 1, 1, args, pred ? 2 : 1, plan_op, 1, &plan_ctxs[il]);
++        return ggml_custom_4d(ctx, GGML_TYPE_I32, 2*ggml_nelements(ids), 1, 1, 1, args, keep ? 3 : pred ? 2 : 1, plan_op, 1, &plan_ctxs[il]);
+     }
+ 
+     ggml_backend_t backend(int32_t il) const {
+@@ -1219,8 +1219,8 @@ bool llama_moe_cache::big_used(const ggml_tensor * w, std::vector<bool> & used)
+     return pimpl->big_used(w, used);
+ }
+ 
+-ggml_tensor * llama_moe_cache::build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred) const {
+-    return pimpl->build_plan(ctx, il, ids, pred);
++ggml_tensor * llama_moe_cache::build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred, ggml_tensor * keep) const {
++    return pimpl->build_plan(ctx, il, ids, pred, keep);
+ }
+ 
+ void llama_moe_cache::launched(ggml_backend_t backend) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 11acdb2..e846c62 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -39,7 +39,9 @@ public:
+     // abyss: pred (I32, contiguous, see prefetch_k) are the experts predicted for layer il + 1; those the cache does not
+     // hold are uploaded on a stream of their own once the device has started computing layer il (see launched), and the
+     // plan of layer il + 1 makes the device wait for them
+-    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred = nullptr) const;
++    // abyss: keep (any tensor, may be nullptr) is not read; as a source of the plan it is copied to the host with the
++    // ids, for a CPU op that reads it later without waiting for the device (ABYSS_MOE_DEFER)
++    ggml_tensor * build_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids, ggml_tensor * pred = nullptr, ggml_tensor * keep = nullptr) const;
+ 
+     // abyss: ggml_backend_sched launch callback: the scheduler started a computation on backend
+     void launched(ggml_backend_t backend);
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 92b7897..f3b6ea3 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1815,6 +1815,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         return off;
+     }();
+ 
++    // abyss: ABYSS_MOE_DEFER=1, for a single token the experts the CPU computes for a cached layer are added to the
++    // residual only at the next layer's attention output, through the post mix of the layer that selected them: the
++    // host computes them while the device runs the next layer's attention. Exact for the residual, approximate in that
++    // the next layer's attention does not see them
++    static const bool moe_defer = [] {
++        const char * e = getenv("ABYSS_MOE_DEFER");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    ggml_tensor * defer_sum  = nullptr; // [n_embd, n_tokens], the last layer's deferred experts
++    ggml_tensor * defer_post = nullptr; // [hc, n_tokens], that layer's FFN post mix
++
+     // one row index per hash column per table, hashed host side from the token history
+     ggml_tensor * inp_engram = nullptr;
+     if (hparams.engram_n_layers > 0 && !engram_off) {
+@@ -1861,7 +1872,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+         cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+ 
+-        inpL = build_hc_post(cur, residual, post, comb, il);
++        // abyss: the last layer's deferred experts join the residual before this layer's attention output does
++        ggml_tensor * res_attn = residual;
++        if (defer_sum) {
++            ggml_tensor * d3 = ggml_reshape_3d(ctx0, defer_sum, n_embd, 1, n_tokens);
++            ggml_tensor * p3 = ggml_reshape_3d(ctx0, defer_post, 1, hc, n_tokens);
++            res_attn = ggml_add(ctx0, residual, ggml_mul(ctx0, ggml_repeat(ctx0, d3, residual), p3));
++            cb(res_attn, "moe_deferred_res", il);
++            defer_sum  = nullptr;
++            defer_post = nullptr;
++        }
++
++        inpL = build_hc_post(cur, res_attn, post, comb, il);
+         cb(inpL, "hc_attn_post", il);
+ 
+         residual = inpL;
+@@ -1931,6 +1953,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                 exp_probs_b = nullptr;
+             }
+ 
++            ggml_tensor * moe_deferred = nullptr;
++            const bool defer_here = moe_defer && moe_cache && n_tokens == 1 && !inp_ced && il + 1 < n_layer;
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                     layer.ffn_gate_inp,
+                     layer.ffn_up_exps,
+@@ -1948,8 +1972,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                     nullptr,
+                     nullptr,
+                     selected_experts,
+-                    moe_pred);
++                    moe_pred,
++                    defer_here ? &moe_deferred : nullptr);
+             cb(moe_out, "ffn_moe_out", il);
++            if (moe_deferred) {
++                defer_sum  = moe_deferred;
++                defer_post = post;
++            }
+ 
+             ggml_tensor * ffn_shexp = build_ffn(cur,
+                     layer.ffn_up_shexp, nullptr, nullptr,
+-- 
+2.43.0
+

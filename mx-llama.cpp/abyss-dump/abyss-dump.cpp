@@ -11,6 +11,11 @@
 // above 0: then each token is sampled from the softmax at that temperature (ABYSS_DUMP_SEED, default 1), as a server
 // does with temperature T, top-p 1 and no top-k. It stops at an end-of-generation token, and the generated text goes
 // to <dir>/generated.txt.
+//
+// With ABYSS_DUMP_FORCE=<text file> the decoded tokens are not chosen but forced: the file's tokens follow the prompt
+// one at a time (all of them, or the first ABYSS_DUMP_GEN), and the negative log-likelihood of each under the logits
+// before it goes to <dir>/nll.txt, one per line, with the mean and the perplexity printed at the end: the perplexity of
+// the decode path, which batched evaluation does not reach. An empty ABYSS_DUMP_RE dumps nothing.
 
 #include "arg.h"
 #include "common.h"
@@ -92,14 +97,17 @@ int main(int argc, char ** argv) {
     state.dir = dir;
 
     const char * gen = getenv("ABYSS_DUMP_GEN");
-    const int n_gen = gen ? atoi(gen) : 0;
-    state.active = n_gen == 0;
+    const char * force_path = getenv("ABYSS_DUMP_FORCE");
+    int n_gen = gen ? atoi(gen) : 0;
+    state.active = n_gen == 0 && force_path == nullptr;
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    params.cb_eval           = dump_cb;
-    params.cb_eval_user_data = &state;
+    if (re[0] != '\0') {
+        params.cb_eval           = dump_cb;
+        params.cb_eval_user_data = &state;
+    }
     params.warmup            = false;
 
     auto llama_init = common_init_from_params(params);
@@ -120,7 +128,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // decoding, one token per evaluation: greedy, or sampled at ABYSS_DUMP_TEMP
+    // the tokens to force, which follow the prompt
+    std::vector<llama_token> forced;
+    if (force_path) {
+        FILE * f = fopen(force_path, "rb");
+        if (!f) {
+            LOG_ERR("abyss-dump: cannot read %s\n", force_path);
+            return 1;
+        }
+        std::string text;
+        char buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) {
+            text.append(buf, n);
+        }
+        fclose(f);
+        forced = common_tokenize(ctx, text, false, false);
+        if (n_gen <= 0 || n_gen > (int) forced.size()) {
+            n_gen = (int) forced.size();
+        }
+        LOG_INF("abyss-dump: forcing %d of %zu tokens\n", n_gen, forced.size());
+    }
+    std::vector<double> nll;
+
+    // decoding, one token per evaluation: greedy, or sampled at ABYSS_DUMP_TEMP, or forced
     state.active = true;
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const char * temp_env = getenv("ABYSS_DUMP_TEMP");
@@ -137,7 +167,16 @@ int main(int argc, char ** argv) {
                 tok = v;
             }
         }
-        if (temp > 0) {
+        if (!forced.empty()) {
+            // the negative log-likelihood of the forced token, then that token goes in
+            const double top = logits[tok];
+            double total = 0;
+            for (llama_token v = 0; v < n_vocab; ++v) {
+                total += std::exp((double) logits[v] - top);
+            }
+            tok = forced[i];
+            nll.push_back(top + std::log(total) - logits[tok]);
+        } else if (temp > 0) {
             const double top = logits[tok];
             double total = 0;
             for (llama_token v = 0; v < n_vocab; ++v) {
@@ -154,7 +193,7 @@ int main(int argc, char ** argv) {
             }
         }
         LOG_INF("abyss-dump: generated token %d: %d\n", i, tok);
-        if (llama_vocab_is_eog(vocab, tok)) {
+        if (forced.empty() && llama_vocab_is_eog(vocab, tok)) {
             LOG_INF("abyss-dump: end of generation after %d tokens\n", i);
             break;
         }
@@ -164,6 +203,21 @@ int main(int argc, char ** argv) {
             LOG_ERR("failed to decode\n");
             return 1;
         }
+    }
+    if (!nll.empty()) {
+        const std::string path = state.dir + "/nll.txt";
+        FILE * f = fopen(path.c_str(), "wb");
+        double sum = 0;
+        for (double x : nll) {
+            sum += x;
+            if (f) {
+                fprintf(f, "%.6f\n", x);
+            }
+        }
+        if (f) {
+            fclose(f);
+        }
+        LOG_INF("abyss-dump: %zu forced tokens, mean NLL %.6f, perplexity %.4f\n", nll.size(), sum/nll.size(), std::exp(sum/nll.size()));
     }
     if (n_gen > 0) {
         const std::string path = state.dir + "/generated.txt";

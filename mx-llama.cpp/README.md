@@ -11,7 +11,7 @@
 | `0004-engram-prefetch.patch` | Engram 预取：`llama_decode` 拿到整批后，后台线程按哈希算出的行号对表做 `MADV_WILLNEED`（`ABYSS_ENGRAM_PREFETCH=<线程数>`） |
 | `0005-ced-attention.patch` | CED 感知预填充第二步：解码器层的注意力也只对同一子集的 token 计算查询，KV 照常全部写入 |
 | `0006-dsv41-indexer.patch` | V4.1 稀疏注意力索引器：每个查询只看索引源选出的 512 个压缩位置（`ABYSS_DSV41_INDEXER=1`） |
-| `abyss-dump/` + `0007-abyss-dump.patch` | `llama-abyss-dump`：跑一段提示词，把名字匹配正则的计算图张量存成文件，给 `tools/eval/indexer_oracle.py` 对拍用；`ABYSS_DUMP_GEN=N` 时只导出之后逐个解码的 N 个 token，默认贪心，`ABYSS_DUMP_TEMP` 按温度采样（`tools/eval/expert-trace.sh` 用它导出路由） |
+| `abyss-dump/` + `0007-abyss-dump.patch` | `llama-abyss-dump`：跑一段提示词，把名字匹配正则的计算图张量存成文件，给 `tools/eval/indexer_oracle.py` 对拍用；`ABYSS_DUMP_GEN=N` 时只导出之后逐个解码的 N 个 token，默认贪心，`ABYSS_DUMP_TEMP` 按温度采样（`tools/eval/expert-trace.sh` 用它导出路由）；`ABYSS_DUMP_FORCE` 逐个强制喂一段文字，记下每个 token 的负对数似然（`tools/eval/defer-ppl.sh` 用它测解码路径的 PPL） |
 | `0008-dsv41-decode-gather.patch` | 单 token 解码时，压缩注意力层先取出索引器选中的 top-k 行，再和滑动窗口拼接，不再每层拼接整个压缩 KV（`ABYSS_DSV41_DECODE_GATHER=1`，要和 `ABYSS_DSV41_INDEXER=1` 一起开） |
 | `0009-moe-cpu-miss.patch` | 专家缓存的未命中，一部分按热度挑出来上传进缓存，其余交给 CPU 算，两边同时进行（`ABYSS_MOE_CPU_MISS=1`） |
 | `0010-fix-ced-inputs-m2-small-batches.patch` | 修两处崩溃：`0006` 的 CED 行映射在计算图用不到时没有分配，提示词约 2,500–16,000 token 时断言失败；`0009` 在 9–32 个 token 的批次里，同一 token 的多个 CPU 未命中指向同一个全零槽位，CUDA MMQ 越界读 |
@@ -29,6 +29,7 @@
 | `0022-big-batch-stats.patch` | 大批次统计（`ABYSS_MOE_BIG_STATS=1`）：专家缓存覆盖的层每次规划大批次（超过 32 个 token）时，在 stderr 打印一行 `abyss: big batch`：层号、token 数、用到的专家数、其中在缓存里的专家数和挑选数、交给 CPU 的专家数和其中在缓存里的。只读，不改计算；`tools/eval/big_coverage.py` 按请求汇总 |
 | `0023-big-batch-cache.patch` | 大批次用缓存（`ABYSS_MOE_BIG_CACHE=1`）：专家缓存覆盖的层规划大批次时，缓存里有的专家记下槽位，在缓存所在的卡上直接算（gate、up、激活、down，加权求和），其余的照 `0014` 分给 CPU 和上传；三路同时进行，最后相加。原来缓存只能复制给它所在的卡，大批次在第一张卡上算，用不上缓存。规划结果末尾多一列槽位号，统计行多报从缓存算的专家数 |
 | `0024-moe-prefetch.patch` | 专家预取（`ABYSS_MOE_PREFETCH=K`，只用于测试，没有上线）：单 token 解码时，专家缓存覆盖的层用下一层的路由门作用在本层的路由器输入上选 top K（和路由同样建图，CUDA 照样融合），缓存里没有的挤掉最久没用、这一步也没用到的槽位，用缓存所在卡上第二个 CUDA backend 的流提前上传，每层最多 `ABYSS_MOE_PREFETCH_MAX` 个；下一层的规划让主流等它的事件。主机到显卡的拷贝按提交顺序排队、不分流，所以调度器加了启动回调（`ggml_backend_sched_set_launch_callback`），预取等这一层的计算提交以后才发，不挡住它的输入拷贝。解码统计行多报每 token 预取数和被读到的比例。实测命中率 78% → 82–85%，解码速度不变（见 CLAUDE.md「专家预取」）；不设开关时和原来一样 |
+| `0025-moe-defer.patch` | 专家延后（`ABYSS_MOE_DEFER=1`，生产已开）：单 token 解码时，专家缓存覆盖的层交给 CPU 算的专家不并进本层的 FFN 输出，它们的加权和在下一层注意力的输出处、按本层 FFN 的 post 系数加进残差（下一层的注意力没看到这部分，残差本身是精确的）；图的顺序让 GPU 先算本层缓存命中的专家和下一层的注意力，CPU 同时算未命中，规划算子顺带把 FFN 输入拷到 CPU。调度器加了开关 `ggml_backend_sched_set_async_host_inputs`：GPU 段从 CPU 段来的小输入（≤ 1 MiB）走锁页暂存区在 GPU 的流上异步拷，紧跟 GPU 段、没有输入的 CPU 段不再同步。会话解码 +11%，解码路径 PPL +0.06% ± 0.14%（见 CLAUDE.md「专家延后」）；不设开关时和原来一样 |
 
 ## 安装
 
@@ -47,7 +48,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0017-slot-save-thin-checkpoints.patch <abyss>/mx-llama.cpp/0018-plain-request-text.patch \
   <abyss>/mx-llama.cpp/0019-graph-memory.patch <abyss>/mx-llama.cpp/0020-indexer-chunks.patch \
   <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch \
-  <abyss>/mx-llama.cpp/0023-big-batch-cache.patch <abyss>/mx-llama.cpp/0024-moe-prefetch.patch
+  <abyss>/mx-llama.cpp/0023-big-batch-cache.patch <abyss>/mx-llama.cpp/0024-moe-prefetch.patch \
+  <abyss>/mx-llama.cpp/0025-moe-defer.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
