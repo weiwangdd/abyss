@@ -979,3 +979,145 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             return false;
     }
 }
+
+// abyss: rms_norm -> mul_mat of one F32 column with a few long F32 rows (the hyper-connection mixes of DeepSeek V4, 24
+// rows of 4*n_embd): dst[j] = rsqrt(mean(x^2) + eps) * sum_k W[j][k]*x[k], the norm folded into the product. A block
+// per row would leave most SMs idle, so a block per (row, chunk of the columns) sums its part of the row and of the
+// squares, and a second kernel adds the parts in a fixed order, so that the result does not depend on the scheduling.
+// The rows are read before waiting for the kernel that writes x (PDL)
+#define MMVF_NORM_BLOCK  128
+#define MMVF_NORM_UNROLL 4
+
+static __global__ void rms_norm_mul_mat_vec_f_part(
+        const float * W, const float * x, float * part, float * part_ss, const int nrows, const int64_t stride_row,
+        const int ncols4) {
+    const int row   = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int tid   = threadIdx.x;
+
+    const int      i0 = chunk*MMVF_NORM_BLOCK*MMVF_NORM_UNROLL + tid;
+    const float4 * W4 = (const float4 *) (W + row*stride_row);
+    const float4 * x4 = (const float4 *) x;
+
+    float4 w[MMVF_NORM_UNROLL];
+#pragma unroll
+    for (int u = 0; u < MMVF_NORM_UNROLL; ++u) {
+        const int i = i0 + u*MMVF_NORM_BLOCK;
+        w[u] = i < ncols4 ? W4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float sum = 0.0f;
+    float ss  = 0.0f;
+#pragma unroll
+    for (int u = 0; u < MMVF_NORM_UNROLL; ++u) {
+        const int    i = i0 + u*MMVF_NORM_BLOCK;
+        const float4 v = i < ncols4 ? x4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        sum += w[u].x*v.x + w[u].y*v.y + w[u].z*v.z + w[u].w*v.w;
+        ss  += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+
+    ggml_cuda_pdl_lc();
+
+    sum = warp_reduce_sum<WARP_SIZE>(sum);
+    ss  = warp_reduce_sum<WARP_SIZE>(ss);
+
+    __shared__ float s_sum[MMVF_NORM_BLOCK/WARP_SIZE];
+    __shared__ float s_ss[MMVF_NORM_BLOCK/WARP_SIZE];
+    if (tid % WARP_SIZE == 0) {
+        s_sum[tid/WARP_SIZE] = sum;
+        s_ss[tid/WARP_SIZE]  = ss;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float a = 0.0f;
+        float b = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MMVF_NORM_BLOCK/WARP_SIZE; ++k) {
+            a += s_sum[k];
+            b += s_ss[k];
+        }
+        part[chunk*nrows + row] = a;
+        if (row == 0) {
+            part_ss[chunk] = b;
+        }
+    }
+}
+
+static __global__ void rms_norm_mul_mat_vec_f_reduce(
+        const float * part, const float * part_ss, float * dst, const int nrows, const int nchunks, const int ncols,
+        const float eps) {
+    const int row = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    float ss = 0.0f;
+    for (int c = 0; c < nchunks; ++c) {
+        ss += part_ss[c];
+    }
+    const float scale = rsqrtf(ss/ncols + eps);
+
+    ggml_cuda_pdl_lc();
+
+    if (row < nrows) {
+        float sum = 0.0f;
+        for (int c = 0; c < nchunks; ++c) {
+            sum += part[c*nrows + row];
+        }
+        dst[row] = scale*sum;
+    }
+}
+
+bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat) {
+    static const bool enabled = [] {
+        const char * e = getenv("ABYSS_HC_KSPLIT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * W = mul_mat->src[0];
+    if (mul_mat->src[1] != rms_norm || x->type != GGML_TYPE_F32 || W->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32 || mul_mat->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(W) || !ggml_is_contiguous(mul_mat) || ggml_nrows(x) != 1 ||
+            ggml_nrows(W) != W->ne[1] || W->ne[0] != x->ne[0]) {
+        return false;
+    }
+    // a few long rows, where a block per row leaves most SMs idle
+    if (W->ne[1] > 64 || x->ne[0] < 4096 || x->ne[0] % 4 != 0) {
+        return false;
+    }
+    // float4 loads
+    return (uintptr_t) x->data % 16 == 0 && (uintptr_t) W->data % 16 == 0 && W->nb[1] % 16 == 0;
+}
+
+void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * W = mul_mat->src[0];
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int ncols   = x->ne[0];
+    const int nrows   = W->ne[1];
+    const int ncols4  = ncols/4;
+    const int nchunks = (ncols4 + MMVF_NORM_BLOCK*MMVF_NORM_UNROLL - 1)/(MMVF_NORM_BLOCK*MMVF_NORM_UNROLL);
+
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nchunks*nrows + nchunks);
+    float * part_ss = part.get() + (size_t) nchunks*nrows;
+    cudaStream_t stream = ctx.stream();
+
+    const ggml_cuda_kernel_launch_params params_part = {dim3(nrows, nchunks, 1), dim3(MMVF_NORM_BLOCK, 1, 1), 0, stream};
+    ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_part, params_part,
+        (const float *) W->data, (const float *) x->data, part.get(), part_ss, nrows, (int64_t) (W->nb[1]/sizeof(float)),
+        ncols4);
+
+    const ggml_cuda_kernel_launch_params params_reduce = {dim3(1, 1, 1), dim3(64, 1, 1), 0, stream};
+    ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_reduce, params_reduce,
+        (const float *) part.get(), (const float *) part_ss, (float *) mul_mat->data, nrows, nchunks, ncols, eps);
+}

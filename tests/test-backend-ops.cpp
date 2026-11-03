@@ -4081,6 +4081,44 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// abyss: rms_norm -> mul_mat of a single column with a few long rows (the hyper-connection mixes of DeepSeek V4), which
+// the CUDA backend fuses into a split-K product with ABYSS_HC_KSPLIT=1
+struct test_rms_norm_mul_mat : public test_case {
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(k, m, n, eps);
+    }
+
+    test_rms_norm_mul_mat(int64_t k = 20480, int64_t m = 24, int64_t n = 1, float eps = 1e-6f)
+        : k(k), m(m), n(n), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(w, "w");
+
+        // computed first, so that no OP_NONE comes between rms_norm and mul_mat
+        x = ggml_scale(ctx, x, 1.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, eps));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -11548,6 +11586,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
+    for (int64_t m : {24, 64}) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat(20480, m, 1));
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat(20480, 24, 2)); // two columns, not fused
+    test_cases.emplace_back(new test_rms_norm_mul_mat(4100, 24, 1));  // a partial last chunk
 
     for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}));

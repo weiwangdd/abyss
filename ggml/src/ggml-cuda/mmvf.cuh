@@ -12,3 +12,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+// abyss: rms_norm -> mul_mat of one column with a few long F32 rows as one split-K product (ABYSS_HC_KSPLIT=1)
+bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat);
+void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat);
