@@ -1,10 +1,11 @@
 #!/bin/bash
 # The MoE expert deferral (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025) against without, on a server with the production
-# settings, one server per entry of CONFIGS ("name:defer", defer 0 is off): greedy_kl.py on PROMPTS corpus slices of
-# 128 greedy tokens each and the 96k prompt of ctx_size.py with its 32 greedy tokens, both decoding, so their outputs
-# are compared with the first entry's (top-20 KL over the identical prefix); then the append-only session of
-# decode_modes.py (REPEAT corpus copies, ROUNDS turns per mode), whose decode speed per turn and expert cache counts
-# are summed up per entry. BUILD picks the binaries (default build-pf, which has the switch). Waits for the production
+# settings, one server per entry of CONFIGS ("name:defer[:admit]", defer 0 is off, admit the ABYSS_MOE_ADMIT, default
+# 0.3): unless KL=0, greedy_kl.py on PROMPTS corpus slices of 128 greedy tokens each and the 96k prompt of ctx_size.py
+# with its 32 greedy tokens, both decoding, so their outputs are compared with the first entry's (top-20 KL over the
+# identical prefix); then the append-only session of decode_modes.py (REPEAT corpus copies, ROUNDS turns per mode),
+# whose decode speed per turn and expert cache counts are summed up per entry. BUILD picks the binaries (default
+# build-pf); ABYSS_EXPERT_STATS set by the caller turns the expert stats of production on. Waits for the production
 # server to go idle, saves its slot and stops it, and restarts it at the end (~/abyss-stats/restart.sh restores the
 # slot).
 set -u
@@ -49,13 +50,14 @@ gpus_free
 
 first=""
 for c in $CONFIGS; do
-  IFS=: read -r name defer <<< "$c"
+  IFS=: read -r name defer admit <<< "$c"
+  admit=${admit:-0.3}
   log=$O/server-$name.log
-  echo "### $name: ABYSS_MOE_DEFER=$defer $(date +%T)"
+  echo "### $name: ABYSS_MOE_DEFER=$defer ABYSS_MOE_ADMIT=$admit $(date +%T)"
   env GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 \
     ABYSS_DSV41_INDEXER=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 \
     ABYSS_MOE_BIG_CACHE=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 \
-    ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_DEFER="$defer" \
+    ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT="$admit" ABYSS_MOE_DEFER="$defer" \
     "$B/llama-server" -m "$M" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
     -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 --checkpoint-min-step 32768 \
@@ -68,9 +70,11 @@ for c in $CONFIGS; do
     sleep 3
   done
   if [ $up = 1 ]; then
-    GREEDY_URL=http://127.0.0.1:$PORT python3 -I "$E/greedy_kl.py" run "$E/corpus.txt" "$O/greedy-$name.json" \
-      --prompts "${PROMPTS:-8}" | tail -2
-    CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" same "$O/same-$name.json"
+    if [ "${KL:-1}" = 1 ]; then
+      GREEDY_URL=http://127.0.0.1:$PORT python3 -I "$E/greedy_kl.py" run "$E/corpus.txt" "$O/greedy-$name.json" \
+        --prompts "${PROMPTS:-8}" | tail -2
+      CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" same "$O/same-$name.json"
+    fi
     DECODE_URL=http://127.0.0.1:$PORT python3 -I "$E/decode_modes.py" "$E/corpus.txt" --repeat "${REPEAT:-6}" \
       --rounds "${ROUNDS:-3}" --max-tokens 256 > "$O/session-$name.txt" 2>&1 || echo "  session failed, see $O/session-$name.txt"
     kill -TERM $spid 2>/dev/null
