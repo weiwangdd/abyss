@@ -29,7 +29,7 @@
 | `0022-big-batch-stats.patch` | 大批次统计（`ABYSS_MOE_BIG_STATS=1`）：专家缓存覆盖的层每次规划大批次（超过 32 个 token）时，在 stderr 打印一行 `abyss: big batch`：层号、token 数、用到的专家数、其中在缓存里的专家数和挑选数、交给 CPU 的专家数和其中在缓存里的。只读，不改计算；`tools/eval/big_coverage.py` 按请求汇总 |
 | `0023-big-batch-cache.patch` | 大批次用缓存（`ABYSS_MOE_BIG_CACHE=1`）：专家缓存覆盖的层规划大批次时，缓存里有的专家记下槽位，在缓存所在的卡上直接算（gate、up、激活、down，加权求和），其余的照 `0014` 分给 CPU 和上传；三路同时进行，最后相加。原来缓存只能复制给它所在的卡，大批次在第一张卡上算，用不上缓存。规划结果末尾多一列槽位号，统计行多报从缓存算的专家数 |
 | `0024-moe-prefetch.patch` | 专家预取（`ABYSS_MOE_PREFETCH=K`，只用于测试，没有上线）：单 token 解码时，专家缓存覆盖的层用下一层的路由门作用在本层的路由器输入上选 top K（和路由同样建图，CUDA 照样融合），缓存里没有的挤掉最久没用、这一步也没用到的槽位，用缓存所在卡上第二个 CUDA backend 的流提前上传，每层最多 `ABYSS_MOE_PREFETCH_MAX` 个；下一层的规划让主流等它的事件。主机到显卡的拷贝按提交顺序排队、不分流，所以调度器加了启动回调（`ggml_backend_sched_set_launch_callback`），预取等这一层的计算提交以后才发，不挡住它的输入拷贝。解码统计行多报每 token 预取数和被读到的比例。实测命中率 78% → 82–85%，解码速度不变（见 CLAUDE.md「专家预取」）；不设开关时和原来一样 |
-| `0025-moe-defer.patch` | 专家延后（`ABYSS_MOE_DEFER=1`，生产已开）：单 token 解码时，专家缓存覆盖的层交给 CPU 算的专家不并进本层的 FFN 输出，它们的加权和在下一层注意力的输出处、按本层 FFN 的 post 系数加进残差（下一层的注意力没看到这部分，残差本身是精确的）；图的顺序让 GPU 先算本层缓存命中的专家和下一层的注意力，CPU 同时算未命中，规划算子顺带把 FFN 输入拷到 CPU。调度器加了开关 `ggml_backend_sched_set_async_host_inputs`：GPU 段从 CPU 段来的小输入（≤ 1 MiB）走锁页暂存区在 GPU 的流上异步拷，紧跟 GPU 段、没有输入的 CPU 段不再同步。会话解码 +11%，解码路径 PPL +0.06% ± 0.14%（见 CLAUDE.md「专家延后」）；不设开关时和原来一样 |
+| `0025-moe-defer.patch` | 专家延后（`ABYSS_MOE_DEFER=1`，生产已开）：单 token 解码时，专家缓存覆盖的层交给 CPU 算的专家不并进本层的 FFN 输出，它们的加权和在下一层注意力的输出处、按本层 FFN 的 post 系数加进残差（下一层的注意力没看到这部分，残差本身是精确的）；图的顺序让 GPU 先算本层缓存命中的专家和下一层的注意力，CPU 同时算未命中，规划算子顺带把 FFN 输入拷到 CPU。调度器加了开关 `ggml_backend_sched_set_async_host_inputs`：GPU 段从 CPU 段来的小输入（≤ 1 MiB）走锁页暂存区在 GPU 的流上异步拷，紧跟 GPU 段、没有输入的 CPU 段不再同步，有逐节点回调（专家统计）时回调不读的段也不同步。会话解码 +11%，解码路径 PPL +0.06% ± 0.14%（见 CLAUDE.md「专家延后」）；不设开关时和原来一样 |
 
 ## 安装
 
