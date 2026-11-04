@@ -1,0 +1,991 @@
+From fda52b0112fd6bacb42fca5ccfe3008952313ffc Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 4 Nov 2026 20:02:20 +0100
+Subject: [PATCH] abyss: for a single token, ABYSS_HC_FUSE=1 computes the
+ hyper-connection gates and combs of DeepSeek V4 in the kernels next to them
+ (the split-K reduce of the mixes also writes the gate and the comb built
+ right after them, and a gate whose values the collapse of the residual copies
+ takes runs with the collapse and the rms_norm after it as one kernel), and
+ ABYSS_GATHER_FUSE=1 writes the keys and the mask of the attention with the
+ top-k compressed rows (0008) in one kernel instead of get_rows, cast and
+ concat for each, unless an output overlaps a tensor the kernel reads; both
+ give the same results; test-backend-ops gains DSV4_GATHER_KV
+
+---
+ ggml/src/ggml-cuda/dsv4-hc.cu   | 312 +++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/dsv4-hc.cuh  | 117 ++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 262 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cu      |  46 ++++-
+ ggml/src/ggml-cuda/mmvf.cuh     |   5 +-
+ ggml/src/ggml-cuda/softcap.cu   |   6 +-
+ tests/test-backend-ops.cpp      |  75 ++++++++
+ 7 files changed, 750 insertions(+), 73 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index ca1d2dc..fe1b2e3 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -1,37 +1,6 @@
+ #include "common.cuh"
+ #include "dsv4-hc.cuh"
+-
+-
+-static constexpr int DSV4_HC = 4;
+-
+-
+-static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
+-    for (int idst = 0; idst < DSV4_HC; ++idst) {
+-        float sum = eps;
+-        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+-            sum += comb[idst + DSV4_HC*isrc];
+-        }
+-
+-        const float inv_sum = 1.0f / sum;
+-        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+-            comb[idst + DSV4_HC*isrc] *= inv_sum;
+-        }
+-    }
+-}
+-
+-static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
+-    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+-        float sum = eps;
+-        for (int idst = 0; idst < DSV4_HC; ++idst) {
+-            sum += comb[idst + DSV4_HC*isrc];
+-        }
+-
+-        const float inv_sum = 1.0f / sum;
+-        for (int idst = 0; idst < DSV4_HC; ++idst) {
+-            comb[idst + DSV4_HC*isrc] *= inv_sum;
+-        }
+-    }
+-}
++#include "convert.cuh"
+ 
+ static __global__ void dsv4_hc_comb_f32(
+         const float * mixes,
+@@ -59,38 +28,8 @@ static __global__ void dsv4_hc_comb_f32(
+ 
+     ggml_cuda_pdl_sync();
+ 
+-    const float scale_comb = scale[2*ss0];
+     float comb[DSV4_HC*DSV4_HC];
+-
+-    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+-        float max = -INFINITY;
+-        for (int idst = 0; idst < DSV4_HC; ++idst) {
+-            const int idx = idst + DSV4_HC*isrc;
+-            const float v = mixes[(comb_offset + idx)*sm0 + it*sm1] * scale_comb + base[(comb_offset + idx)*sb0];
+-            comb[idx] = v;
+-            max = fmaxf(max, v);
+-        }
+-
+-        float sum = 0.0f;
+-        for (int idst = 0; idst < DSV4_HC; ++idst) {
+-            const int idx = idst + DSV4_HC*isrc;
+-            const float v = expf(comb[idx] - max);
+-            comb[idx] = v;
+-            sum += v;
+-        }
+-
+-        const float inv_sum = 1.0f / sum;
+-        for (int idst = 0; idst < DSV4_HC; ++idst) {
+-            const int idx = idst + DSV4_HC*isrc;
+-            comb[idx] = comb[idx] * inv_sum + eps;
+-        }
+-    }
+-
+-    dsv4_hc_comb_norm_cols(comb, eps);
+-    for (int32_t i = 1; i < n_iter; ++i) {
+-        dsv4_hc_comb_norm_rows(comb, eps);
+-        dsv4_hc_comb_norm_cols(comb, eps);
+-    }
++    dsv4_hc_comb_token(mixes + comb_offset*sm0 + it*sm1, sm0, scale[2*ss0], base + comb_offset*sb0, sb0, eps, n_iter, comb);
+ 
+     for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+         for (int idst = 0; idst < DSV4_HC; ++idst) {
+@@ -314,3 +253,250 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+ }
++
++// abyss: ABYSS_HC_FUSE, for one token: the gate values from their mixes, the collapse of the residual copies with them
++// (dsv4_hc_pre_f32, not gated) and the rms_norm of the collapse times its weight (rms_norm_f32 with the multiply), in one
++// block of the size and the column order the norm kernel uses, with the same block reduction, so that the gate, the
++// collapse and the norm come out as the separate kernels compute them. Writes all three
++template <int block_size>
++static __global__ void dsv4_hc_pre_norm_f32(
++        const float * gx, const int64_t sgx, const float * gs, const float * gb, const float g_scale, const float g_bias,
++        float * gate, const float * x, const int64_t sx0, const int64_t sx1, const float hc_scale, float * pre,
++        const float * w, float * dst, const int ncols, const float eps) {
++    constexpr int max_per_thread = 8;
++    ggml_cuda_pdl_lc();
++    extern __shared__ float s_sum[];
++    const int tid = threadIdx.x;
++
++    ggml_cuda_pdl_sync();
++
++    float wg[DSV4_HC];
++#pragma unroll
++    for (int ih = 0; ih < DSV4_HC; ++ih) {
++        wg[ih] = dsv4_hc_gate(gx[ih*sgx], gs[0], gb[ih], g_scale, g_bias);
++    }
++    if (tid < DSV4_HC) {
++        gate[tid] = wg[tid];
++    }
++
++    float v[max_per_thread];
++    float tmp = 0.0f;
++#pragma unroll
++    for (int k = 0; k < max_per_thread; ++k) {
++        const int col = tid + k*block_size;
++        if (col < ncols) {
++            float sum = 0.0f;
++#pragma unroll
++            for (int ih = 0; ih < DSV4_HC; ++ih) {
++                sum += x[col*sx0 + ih*sx1] * wg[ih];
++            }
++            v[k] = hc_scale * sum;
++            pre[col] = v[k];
++            tmp += v[k] * v[k];
++        }
++    }
++
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++#pragma unroll
++    for (int k = 0; k < max_per_thread; ++k) {
++        const int col = tid + k*block_size;
++        if (col < ncols) {
++            dst[col] = scale * v[k] * w[col];
++        }
++    }
++}
++
++bool ggml_cuda_should_fuse_dsv4_hc_pre_norm(const ggml_tensor * mul, const ggml_tensor * scale, const ggml_tensor * pre,
++        const ggml_tensor * norm, const ggml_tensor * mul_w) {
++    const ggml_tensor * gx = mul->src[0];
++    const ggml_tensor * x  = pre->src[0];
++    const ggml_tensor * w  = mul_w->src[1];
++    if (pre->src[1] != scale || norm->src[0] != pre || mul_w->src[0] != norm || ggml_get_op_params_i32(pre, 1) != 0) {
++        return false;
++    }
++    for (const ggml_tensor * t : { gx, x, w, scale, pre, norm, mul_w }) {
++        if (t->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++    // one token, DSV4_HC copies, a row of the size the norm kernel's block covers
++    const int64_t ncols = x->ne[0];
++    if (gx->ne[0] != DSV4_HC || ggml_nrows(gx) != 1 || x->ne[1] != DSV4_HC || x->ne[2] != 1 || x->ne[3] != 1 ||
++            x->nb[0] != sizeof(float) || !ggml_is_contiguous(scale) || ggml_nelements(scale) != DSV4_HC ||
++            !ggml_is_contiguous(pre) || ggml_nrows(pre) != 1 || pre->ne[0] != ncols ||
++            !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul_w) || !ggml_are_same_shape(pre, mul_w) ||
++            !ggml_is_contiguous(w) || w->ne[0] != ncols || ggml_nrows(w) != 1) {
++        return false;
++    }
++    const int block_size = ncols < 1024 ? 256 : 1024;
++    return ncols <= 8*block_size;
++}
++
++void ggml_cuda_op_dsv4_hc_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add,
++        const ggml_tensor * scale_node, const ggml_tensor * pre, const ggml_tensor * norm, ggml_tensor * mul_w) {
++    const ggml_tensor * gx = mul->src[0];
++    const ggml_tensor * gs = mul->src[1];
++    const ggml_tensor * gb = add->src[1];
++    const ggml_tensor * x  = pre->src[0];
++    const ggml_tensor * w  = mul_w->src[1];
++
++    float g_scale;
++    float g_bias;
++    memcpy(&g_scale, (const float *) scale_node->op_params + 0, sizeof(float));
++    memcpy(&g_bias,  (const float *) scale_node->op_params + 1, sizeof(float));
++    const float hc_scale = ggml_get_op_params_f32(pre, 0);
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(float));
++
++    const int     ncols = (int) x->ne[0];
++    const int64_t sgx   = gx->nb[0] / sizeof(float);
++    const int64_t sx0   = x->nb[0] / sizeof(float);
++    const int64_t sx1   = x->nb[1] / sizeof(float);
++
++    cudaStream_t stream = ctx.stream();
++    if (ncols < 1024) {
++        const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(256, 1, 1), 32*sizeof(float), stream);
++        ggml_cuda_kernel_launch(dsv4_hc_pre_norm_f32<256>, params,
++            (const float *) gx->data, sgx, (const float *) gs->data, (const float *) gb->data, g_scale, g_bias,
++            (float *) scale_node->data, (const float *) x->data, sx0, sx1, hc_scale, (float *) pre->data,
++            (const float *) w->data, (float *) mul_w->data, ncols, eps);
++    } else {
++        const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(1024, 1, 1), 32*sizeof(float), stream);
++        ggml_cuda_kernel_launch(dsv4_hc_pre_norm_f32<1024>, params,
++            (const float *) gx->data, sgx, (const float *) gs->data, (const float *) gb->data, g_scale, g_bias,
++            (float *) scale_node->data, (const float *) x->data, sx0, sx1, hc_scale, (float *) pre->data,
++            (const float *) w->data, (float *) mul_w->data, ncols, eps);
++    }
++}
++
++// abyss: ABYSS_GATHER_FUSE, see dsv4_gather_kv_nodes: the elements of the keys first, then those of the mask; each
++// converted as get_rows, the cast and the concat convert it
++template <typename c_t, typename m_t>
++static __global__ void dsv4_gather_kv_f16(
++        const half * raw_k, const int64_t n_raw_k, const c_t * comp, const int64_t comp_row, const int32_t * ids,
++        const int64_t n_top, half * k_all, const int64_t D, const int64_t n_k,
++        const half * raw_m, const int64_t n_raw_m, const m_t * m_col, const int64_t m_col_stride, half * kq_mask,
++        const int64_t n_m) {
++    ggml_cuda_pdl_sync();
++    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n_k + n_m; i += (int64_t) blockDim.x*gridDim.x) {
++        if (i < n_k) {
++            const int64_t row = i / D;
++            if (row < n_raw_k) {
++                k_all[i] = raw_k[i];
++            } else {
++                const int64_t i0 = i - row*D;
++                k_all[i] = ggml_cuda_cast<half>(ggml_cuda_cast<float>(comp[(int64_t) ids[row - n_raw_k]*comp_row + i0]));
++            }
++        } else {
++            const int64_t j    = i - n_k;
++            const int64_t ncol = n_raw_m + n_top;
++            const int64_t r    = j / ncol;
++            const int64_t c    = j - r*ncol;
++            if (c < n_raw_m) {
++                kq_mask[j] = raw_m[r*n_raw_m + c];
++            } else {
++                kq_mask[j] = ggml_cuda_cast<half>(ggml_cuda_cast<float>(m_col[(int64_t) ids[c - n_raw_m]*m_col_stride]));
++            }
++        }
++    }
++}
++
++static bool dsv4_gather_debug() {
++    static const bool on = getenv("ABYSS_GATHER_DEBUG") != nullptr;
++    return on;
++}
++
++static bool dsv4_gather_kv_check(const dsv4_gather_kv_nodes & g) {
++    const ggml_tensor * comp  = g.k_rows->src[0];
++    const ggml_tensor * ids   = g.k_rows->src[1];
++    const ggml_tensor * raw_k = g.k_all->src[0];
++    const ggml_tensor * m_col = g.m_rows->src[0];
++    const ggml_tensor * raw_m = g.kq_mask->src[0];
++    if ((comp->type != GGML_TYPE_F32 && comp->type != GGML_TYPE_F16) || ids->type != GGML_TYPE_I32 || g.k_rows->type != GGML_TYPE_F32 ||
++            raw_k->type != GGML_TYPE_F16 || g.k_all->type != GGML_TYPE_F16 || raw_m->type != GGML_TYPE_F16 ||
++            g.kq_mask->type != GGML_TYPE_F16 || (m_col->type != GGML_TYPE_F32 && m_col->type != GGML_TYPE_F16)) {
++        return false;
++    }
++    // the same top k for the rows and the mask, one row of ids
++    const ggml_tensor * m_ids = g.m_rows->src[1];
++    if (m_ids->data != ids->data || m_ids->type != GGML_TYPE_I32 || ggml_nelements(m_ids) != ggml_nelements(ids) ||
++            ggml_nrows(ids) != 1 || !ggml_is_contiguous(ids)) {
++        return false;
++    }
++    const int64_t n_top = ids->ne[0];
++    // the compressed rows: a 2-D view of F32 rows; the keys: the window's then the rows, D elements each, contiguous
++    if (comp->ne[2] != 1 || comp->ne[3] != 1 || comp->nb[0] != ggml_type_size(comp->type) || comp->nb[1] % ggml_type_size(comp->type) != 0 ||
++            g.k_rows->ne[0] != comp->ne[0] || g.k_rows->ne[1] != n_top || g.k_all->ne[3] != 1 ||
++            !ggml_is_contiguous(g.k_all) || !ggml_is_contiguous(raw_k) || raw_k->ne[0] != g.k_all->ne[0] ||
++            raw_k->ne[1] != g.k_all->ne[1] || g.k_all->ne[0]*g.k_all->ne[1] != comp->ne[0] ||
++            g.k_all->ne[2] != raw_k->ne[2] + n_top) {
++        return false;
++    }
++    // the mask column: one entry per compressed row; the mask: the window's entries then the rows', every row alike
++    if (m_col->ne[0] != 1 || m_col->ne[2] != 1 || m_col->ne[3] != 1 || m_col->nb[1] % ggml_type_size(m_col->type) != 0 ||
++            g.m_rows->ne[0] != 1 || g.m_rows->ne[1] != n_top || !ggml_is_contiguous(raw_m) ||
++            !ggml_is_contiguous(g.kq_mask) || g.kq_mask->ne[0] != raw_m->ne[0] + n_top ||
++            g.kq_mask->ne[1] != raw_m->ne[1] || g.kq_mask->ne[2] != raw_m->ne[2] || g.kq_mask->ne[3] != raw_m->ne[3]) {
++        return false;
++    }
++    return true;
++}
++
++bool ggml_cuda_should_fuse_dsv4_gather_kv(const dsv4_gather_kv_nodes & g) {
++    const bool ok = dsv4_gather_kv_check(g);
++    static int n_said = 0;
++    if (!ok && dsv4_gather_debug() && n_said < 6) {
++        n_said++;
++        const ggml_tensor * ts[] = { g.k_rows->src[0], g.k_rows->src[1], g.k_rows, g.k_all->src[0], g.k_all, g.m_rows->src[0],
++                                     g.m_rows->src[1], g.m_rows, g.kq_mask->src[0], g.kq_mask };
++        for (const ggml_tensor * t : ts) {
++            fprintf(stderr, "gatherdbg check: %-28.28s %s ne %lld %lld %lld %lld nb %zu %zu %zu %zu contiguous %d\n", t->name,
++                ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                t->nb[0], t->nb[1], t->nb[2], t->nb[3], (int) ggml_is_contiguous(t));
++        }
++    }
++    return ok;
++}
++
++void ggml_cuda_op_dsv4_gather_kv(ggml_backend_cuda_context & ctx, const dsv4_gather_kv_nodes & g) {
++    const ggml_tensor * comp  = g.k_rows->src[0];
++    const ggml_tensor * ids   = g.k_rows->src[1];
++    const ggml_tensor * raw_k = g.k_all->src[0];
++    const ggml_tensor * m_col = g.m_rows->src[0];
++    const ggml_tensor * raw_m = g.kq_mask->src[0];
++
++    const int64_t n_top = ids->ne[0];
++    const int64_t D     = g.k_all->ne[0]*g.k_all->ne[1];
++    const int64_t n_k   = ggml_nelements(g.k_all);
++    const int64_t n_m   = ggml_nelements(g.kq_mask);
++
++    const int block_size = 256;
++    const int64_t n_blocks = std::min<int64_t>((n_k + n_m + block_size - 1)/block_size, 65535);
++    const ggml_cuda_kernel_launch_params params = ggml_cuda_kernel_launch_params(dim3((unsigned) n_blocks, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
++    auto launch = [&](auto c_tag, auto m_tag) {
++        using c_t = decltype(c_tag);
++        using m_t = decltype(m_tag);
++        ggml_cuda_kernel_launch(dsv4_gather_kv_f16<c_t, m_t>, params,
++            (const half *) raw_k->data, raw_k->ne[2], (const c_t *) comp->data, (int64_t) (comp->nb[1]/sizeof(c_t)),
++            (const int32_t *) ids->data, n_top, (half *) g.k_all->data, D, n_k,
++            (const half *) raw_m->data, raw_m->ne[0], (const m_t *) m_col->data, (int64_t) (m_col->nb[1]/sizeof(m_t)),
++            (half *) g.kq_mask->data, n_m);
++    };
++    if (comp->type == GGML_TYPE_F32) {
++        if (m_col->type == GGML_TYPE_F32) {
++            launch(float(), float());
++        } else {
++            launch(float(), half());
++        }
++    } else {
++        if (m_col->type == GGML_TYPE_F32) {
++            launch(half(), float());
++        } else {
++            launch(half(), half());
++        }
++    }
++}
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cuh b/ggml/src/ggml-cuda/dsv4-hc.cuh
+index 2379aae..69c8ce5 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+@@ -1,6 +1,123 @@
++#pragma once
++
+ #include "common.cuh"
+ #include "ggml.h"
+ 
++static constexpr int DSV4_HC = 4;
++
++// abyss: one hyper-connection gate value, sigmoid(x * s + b) * scale + bias, each step rounded as in the four
++// elementwise kernels it stands for; mul_add_sigmoid_scale_f32 and the fusions of ABYSS_HC_FUSE share it
++static __device__ __forceinline__ float dsv4_hc_gate(const float x, const float s, const float b, const float scale, const float bias) {
++    float v = __fmul_rn(x, s);
++    v = __fadd_rn(v, b);
++    v = 1.0f / (1.0f + expf(-v));
++    return scale * v + bias;
++}
++
++static __device__ __forceinline__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
++    for (int idst = 0; idst < DSV4_HC; ++idst) {
++        float sum = eps;
++        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
++            sum += comb[idst + DSV4_HC*isrc];
++        }
++
++        const float inv_sum = 1.0f / sum;
++        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
++            comb[idst + DSV4_HC*isrc] *= inv_sum;
++        }
++    }
++}
++
++static __device__ __forceinline__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
++    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
++        float sum = eps;
++        for (int idst = 0; idst < DSV4_HC; ++idst) {
++            sum += comb[idst + DSV4_HC*isrc];
++        }
++
++        const float inv_sum = 1.0f / sum;
++        for (int idst = 0; idst < DSV4_HC; ++idst) {
++            comb[idst + DSV4_HC*isrc] *= inv_sum;
++        }
++    }
++}
++
++// abyss: the comb of one token, comb[idst + DSV4_HC*isrc], from its comb mixes mix[idx*sm] and bases base[idx*sb]: the
++// affine map, a softmax over dst for each src plus eps, then Sinkhorn normalization; dsv4_hc_comb_f32 and the fused
++// split-K reduce of ABYSS_HC_FUSE share it
++static __device__ __forceinline__ void dsv4_hc_comb_token(
++        const float * mix, const int64_t sm, const float scale_comb, const float * base, const int64_t sb,
++        const float eps, const int32_t n_iter, float * comb) {
++    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
++        float max = -INFINITY;
++        for (int idst = 0; idst < DSV4_HC; ++idst) {
++            const int idx = idst + DSV4_HC*isrc;
++            const float v = mix[idx*sm] * scale_comb + base[idx*sb];
++            comb[idx] = v;
++            max = fmaxf(max, v);
++        }
++
++        float sum = 0.0f;
++        for (int idst = 0; idst < DSV4_HC; ++idst) {
++            const int idx = idst + DSV4_HC*isrc;
++            const float v = expf(comb[idx] - max);
++            comb[idx] = v;
++            sum += v;
++        }
++
++        const float inv_sum = 1.0f / sum;
++        for (int idst = 0; idst < DSV4_HC; ++idst) {
++            const int idx = idst + DSV4_HC*isrc;
++            comb[idx] = comb[idx] * inv_sum + eps;
++        }
++    }
++
++    dsv4_hc_comb_norm_cols(comb, eps);
++    for (int32_t i = 1; i < n_iter; ++i) {
++        dsv4_hc_comb_norm_rows(comb, eps);
++        dsv4_hc_comb_norm_cols(comb, eps);
++    }
++}
++
++// abyss: ABYSS_HC_FUSE, the gate and the comb that the split-K reduce of one token's mixes (mmvf.cu) also computes:
++// the gate reads DSV4_HC mixes from gate_off, the comb the 16 after the 2*DSV4_HC gate mixes
++struct dsv4_hc_mix_tail {
++    float       * gate;       // DSV4_HC values
++    int           gate_off;
++    const float * gate_s;     // the gate's scale, one value
++    const float * gate_b;     // its bases, DSV4_HC values
++    float         gate_scale;
++    float         gate_bias;
++    float       * comb;       // comb[idst*comb_sd0 + isrc*comb_sd1]
++    int64_t       comb_sd0;
++    int64_t       comb_sd1;
++    const float * comb_scale; // the comb mixes' scale, one value
++    const float * comb_base;  // the base of the first comb mix, then every comb_sb
++    int64_t       comb_sb;
++    float         comb_eps;
++    int32_t       comb_iters;
++};
++
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// abyss: ABYSS_GATHER_FUSE, the keys and the mask of the single-token attention with the top-k compressed rows
++// (mx-llama.cpp/0008): get_rows of the compressed rows, its cast to F16 and the concat after the window's keys, then
++// get_rows of the mask column, its repeat, cast and concat after the window's mask, as one kernel
++struct dsv4_gather_kv_nodes {
++    const ggml_tensor * k_rows;   // GET_ROWS of the compressed rows (F32)
++    const ggml_tensor * k_all;    // CONCAT of the window's keys and the F16 rows, dim 2
++    const ggml_tensor * m_rows;   // GET_ROWS of the mask column
++    const ggml_tensor * kq_mask;  // CONCAT of the window's mask and the F16 entries, dim 0
++};
++bool ggml_cuda_should_fuse_dsv4_gather_kv(const dsv4_gather_kv_nodes & g);
++void ggml_cuda_op_dsv4_gather_kv(ggml_backend_cuda_context & ctx, const dsv4_gather_kv_nodes & g);
++
++// abyss: ABYSS_HC_FUSE, a gate (mul, add, sigmoid, scale) whose values the collapse of one token's residual copies takes
++// (dsv4_hc_pre, not gated), and the rms_norm of the collapse times its weight, as one kernel that writes the gate, the
++// collapse and the norm, each computed as the kernels it replaces compute it
++bool ggml_cuda_should_fuse_dsv4_hc_pre_norm(const ggml_tensor * mul, const ggml_tensor * scale, const ggml_tensor * pre,
++        const ggml_tensor * norm, const ggml_tensor * mul_w);
++void ggml_cuda_op_dsv4_hc_pre_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add,
++        const ggml_tensor * scale, const ggml_tensor * pre, const ggml_tensor * norm, ggml_tensor * mul_w);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 998945b..cbaf38f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4851,6 +4851,245 @@ static bool ggml_cuda_moe_weighted_reduction_enabled() {
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++// abyss: ABYSS_HC_FUSE=1 computes the hyper-connection gates and combs of DeepSeek V4 in the kernels next to them: the
++// split-K reduce of the mixes also writes the gate and the comb built right after them, and a gate whose values the
++// collapse of the residual copies takes runs with the collapse and the rms_norm after it as one kernel (dsv4-hc.cu)
++static bool ggml_cuda_hc_fuse_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("ABYSS_HC_FUSE");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++// abyss: after the split-K mixes of one token (nodes i, i + 1): a view of the mixes, a view of the scale, mul, a view of
++// the base, add, sigmoid, scale (a gate), then the comb of the mixes
++static bool ggml_cuda_match_dsv4_hc_mix_tail(const ggml_cgraph * cgraph, const int i, dsv4_hc_mix_tail & tail) {
++    if (!ggml_cuda_hc_fuse_enabled() || i + 9 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * mixes = cgraph->nodes[i + 1];
++    const ggml_tensor * gx    = cgraph->nodes[i + 2];
++    const ggml_tensor * mul   = cgraph->nodes[i + 4];
++    const ggml_tensor * add   = cgraph->nodes[i + 6];
++    const ggml_tensor * sig   = cgraph->nodes[i + 7];
++    const ggml_tensor * scale = cgraph->nodes[i + 8];
++    const ggml_tensor * comb  = cgraph->nodes[i + 9];
++    if (gx->op != GGML_OP_VIEW || gx->view_src != mixes || cgraph->nodes[i + 3]->op != GGML_OP_VIEW ||
++            cgraph->nodes[i + 5]->op != GGML_OP_VIEW || mul->op != GGML_OP_MUL || mul->src[0] != gx ||
++            mul->src[1] != cgraph->nodes[i + 3] || add->op != GGML_OP_ADD || add->src[1] != cgraph->nodes[i + 5] ||
++            sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
++            scale->op != GGML_OP_SCALE || comb->op != GGML_OP_DSV4_HC_COMB || comb->src[0] != mixes) {
++        return false;
++    }
++    if (!ggml_cuda_should_fuse_mul_add_sigmoid_scale(mul, add, sig, scale)) {
++        return false;
++    }
++    const ggml_tensor * cs = comb->src[1];
++    const ggml_tensor * cb = comb->src[2];
++    if (mixes->ne[0] != (2 + DSV4_HC)*DSV4_HC || ggml_nrows(mixes) != 1 || !ggml_is_contiguous(mixes) ||
++            gx->ne[0] != DSV4_HC || ggml_nrows(gx) != 1 || gx->view_offs % sizeof(float) != 0 ||
++            gx->view_offs/sizeof(float) + DSV4_HC > (size_t) mixes->ne[0] || comb->ne[2] != 1 ||
++            cs->type != GGML_TYPE_F32 || cb->type != GGML_TYPE_F32 || comb->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int     idxs[] = { i, i + 1, i + 4, i + 6, i + 7, i + 8, i + 9 };
++    const ggml_op ops[]  = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
++                             GGML_OP_DSV4_HC_COMB };
++    const int     outs[] = { i + 1, i + 8, i + 9 };
++    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 3) ||
++            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 10, outs, 3)) {
++        return false;
++    }
++    tail.gate     = (float *) scale->data;
++    tail.gate_off = (int) (gx->view_offs/sizeof(float));
++    tail.gate_s   = (const float *) mul->src[1]->data;
++    tail.gate_b   = (const float *) add->src[1]->data;
++    memcpy(&tail.gate_scale, (const float *) scale->op_params + 0, sizeof(float));
++    memcpy(&tail.gate_bias,  (const float *) scale->op_params + 1, sizeof(float));
++    tail.comb       = (float *) comb->data;
++    tail.comb_sd0   = comb->nb[0]/sizeof(float);
++    tail.comb_sd1   = comb->nb[1]/sizeof(float);
++    tail.comb_scale = (const float *) cs->data + 2*(cs->nb[0]/sizeof(float));
++    tail.comb_base  = (const float *) cb->data + 2*DSV4_HC*(cb->nb[0]/sizeof(float));
++    tail.comb_sb    = cb->nb[0]/sizeof(float);
++    tail.comb_eps   = ggml_get_op_params_f32(comb, 0);
++    tail.comb_iters = ggml_get_op_params_i32(comb, 1);
++    return true;
++}
++
++// abyss: a gate (mul, a view of the base, add, sigmoid, scale, from node i) whose values the collapse of one token's
++// residual copies takes, then the rms_norm of the collapse times its weight
++static bool ggml_cuda_match_dsv4_hc_pre_norm(const ggml_cgraph * cgraph, const int i) {
++    if (!ggml_cuda_hc_fuse_enabled() || i + 7 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * mul   = cgraph->nodes[i];
++    const ggml_tensor * add   = cgraph->nodes[i + 2];
++    const ggml_tensor * sig   = cgraph->nodes[i + 3];
++    const ggml_tensor * scale = cgraph->nodes[i + 4];
++    const ggml_tensor * pre   = cgraph->nodes[i + 5];
++    const ggml_tensor * norm  = cgraph->nodes[i + 6];
++    const ggml_tensor * mul_w = cgraph->nodes[i + 7];
++    if (mul->op != GGML_OP_MUL || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || add->op != GGML_OP_ADD ||
++            add->src[1] != cgraph->nodes[i + 1] || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || scale->op != GGML_OP_SCALE ||
++            pre->op != GGML_OP_DSV4_HC_PRE || norm->op != GGML_OP_RMS_NORM || mul_w->op != GGML_OP_MUL) {
++        return false;
++    }
++    if (!ggml_cuda_should_fuse_mul_add_sigmoid_scale(mul, add, sig, scale) ||
++            !ggml_cuda_should_fuse_dsv4_hc_pre_norm(mul, scale, pre, norm, mul_w)) {
++        return false;
++    }
++    const int     idxs[] = { i, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7 };
++    const ggml_op ops[]  = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM,
++                             GGML_OP_MUL };
++    const int     outs[] = { i + 4, i + 5, i + 7 };
++    return ggml_can_fuse_subgraph_ext(cgraph, idxs, 7, ops, outs, 3) &&
++        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 8, outs, 3);
++}
++
++// abyss: ABYSS_GATHER_FUSE=1, the keys and mask of the single-token attention with the top-k compressed rows as one
++// kernel (dsv4-hc.cu): from the GET_ROWS of the rows at node i, skipping only nodes that compute nothing, a reshape of
++// it, its cast to F16, the concat after the window's keys; then the GET_ROWS of the mask column, a reshape, the repeat,
++// the cast and the concat after the window's mask. Returns the index of the last node, -1 if the graph differs
++static bool ggml_cuda_gather_fuse_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("ABYSS_GATHER_FUSE");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++static int ggml_cuda_match_dsv4_gather_kv_impl(const ggml_cgraph * cgraph, const int i, dsv4_gather_kv_nodes & g, int & stage);
++
++// abyss: ABYSS_GATHER_DEBUG=1 prints, for the first GET_ROWS of compressed rows (hca_comp_k) that do not fuse, the step
++// that failed and the nodes after it
++static int ggml_cuda_match_dsv4_gather_kv(const ggml_cgraph * cgraph, const int i, dsv4_gather_kv_nodes & g) {
++    if (!ggml_cuda_gather_fuse_enabled()) {
++        return -1;
++    }
++    int stage = 0;
++    const int last = ggml_cuda_match_dsv4_gather_kv_impl(cgraph, i, g, stage);
++    static const bool dbg = getenv("ABYSS_GATHER_DEBUG") != nullptr;
++    static int n_said = 0;
++    const ggml_tensor * t = cgraph->nodes[i];
++    if (last < 0 && dbg && n_said < 6 && t->src[1] && t->src[1]->type == GGML_TYPE_I32 && strstr(t->src[0]->name, "hca_comp_k")) {
++        n_said++;
++        fprintf(stderr, "gatherdbg: %s does not fuse at step %d\n", t->name, stage);
++        for (int k = i; k < std::min(cgraph->n_nodes, i + 16); ++k) {
++            const ggml_tensor * x = cgraph->nodes[k];
++            fprintf(stderr, "gatherdbg   +%d %s %s %s | %s | %s\n", k - i, ggml_op_desc(x), ggml_type_name(x->type), x->name,
++                x->src[0] ? x->src[0]->name : "-", x->src[1] ? x->src[1]->name : "-");
++        }
++    }
++    return last;
++}
++
++static int ggml_cuda_match_dsv4_gather_kv_impl(const ggml_cgraph * cgraph, const int i, dsv4_gather_kv_nodes & g, int & stage) {
++    const int n = cgraph->n_nodes;
++    auto noop = [](const ggml_tensor * t) {
++        return t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
++            t->op == GGML_OP_NONE;
++    };
++    auto next = [&](int k) {
++        while (k < n && noop(cgraph->nodes[k])) {
++            ++k;
++        }
++        return k;
++    };
++    // a reshape of t, or t
++    auto from = [](const ggml_tensor * x, const ggml_tensor * t) {
++        return x == t || (x->op == GGML_OP_RESHAPE && x->src[0] == t);
++    };
++
++    const ggml_tensor * k_rows = cgraph->nodes[i];
++    stage = 1;
++    const int ic = next(i + 1);
++    if (ic >= n || cgraph->nodes[ic]->op != GGML_OP_CPY || !from(cgraph->nodes[ic]->src[0], k_rows)) {
++        return -1;
++    }
++    stage = 2;
++    const int ik = next(ic + 1);
++    if (ik >= n || cgraph->nodes[ik]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cgraph->nodes[ik], 0) != 2 ||
++            cgraph->nodes[ik]->src[1] != cgraph->nodes[ic]) {
++        return -1;
++    }
++    stage = 3;
++    const int im = next(ik + 1);
++    if (im >= n || cgraph->nodes[im]->op != GGML_OP_GET_ROWS) {
++        return -1;
++    }
++    stage = 4;
++    const ggml_tensor * m_rows = cgraph->nodes[im];
++    const int ir = next(im + 1);
++    if (ir >= n || cgraph->nodes[ir]->op != GGML_OP_REPEAT || !from(cgraph->nodes[ir]->src[0], m_rows)) {
++        return -1;
++    }
++    const int ic2 = next(ir + 1);
++    if (ic2 >= n || cgraph->nodes[ic2]->op != GGML_OP_CPY || cgraph->nodes[ic2]->src[0] != cgraph->nodes[ir]) {
++        return -1;
++    }
++    const int ik2 = next(ic2 + 1);
++    if (ik2 >= n || cgraph->nodes[ik2]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cgraph->nodes[ik2], 0) != 0 ||
++            cgraph->nodes[ik2]->src[1] != cgraph->nodes[ic2]) {
++        return -1;
++    }
++    stage = 5;
++    g = { k_rows, cgraph->nodes[ik], m_rows, cgraph->nodes[ik2] };
++    if (!ggml_cuda_should_fuse_dsv4_gather_kv(g)) {
++        return -1;
++    }
++    stage = 6;
++
++    // the nodes of the two chains but the concats are read only inside the range; a cast reads itself (ggml_cast's
++    // src[1]), which its use count includes, so the count starts at the node itself. The other nodes of the range
++    // compute nothing, and the loop skips them anyway
++    const ggml_tensor * chain[] = { k_rows, cgraph->nodes[ic]->src[0], cgraph->nodes[ic], m_rows, cgraph->nodes[ir]->src[0],
++                                    cgraph->nodes[ir], cgraph->nodes[ic2] };
++    for (int kn = i; kn < ik2; ++kn) {
++        const ggml_tensor * t = cgraph->nodes[kn];
++        if (std::find(std::begin(chain), std::end(chain), t) == std::end(chain)) {
++            continue;
++        }
++        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            return -1;
++        }
++        int uses = 0;
++        for (int k = kn; k <= ik2; ++k) {
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                uses += cgraph->nodes[k]->src[s] == t;
++            }
++        }
++        if (uses != ggml_node_get_use_count(cgraph, kn)) {
++            return -1;
++        }
++    }
++    stage = 7;
++    const int outs[] = { ik, ik2 };
++    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, ik2 - i + 1, outs, 2)) {
++        return -1;
++    }
++    // the kernel reads all its inputs while it writes both outputs, where the separate kernels read the mask column
++    // before the mask is written: the allocator may give the mask the memory of the mask input once its last reader
++    // (this layer's get_rows) is done, and the check above takes the column's view in the range for an intermediate
++    stage = 8;
++    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data;
++        const char * b0 = (const char *) b->data;
++        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++    };
++    const ggml_tensor * ins[]  = { g.k_rows->src[0], g.k_rows->src[1], g.k_all->src[0], g.m_rows->src[0], g.m_rows->src[1],
++                                   g.kq_mask->src[0] };
++    for (const ggml_tensor * out : { g.k_all, g.kq_mask }) {
++        for (const ggml_tensor * in : ins) {
++            if (overlap(out, in)) {
++                return -1;
++            }
++        }
++    }
++    return ik2;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4860,6 +5099,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // abyss: ABYSS_GATHER_FUSE, the keys and mask of the single-token attention with the top-k compressed rows
++    if (node->op == GGML_OP_GET_ROWS) {
++        dsv4_gather_kv_nodes g;
++        const int last = ggml_cuda_match_dsv4_gather_kv(cgraph, i, g);
++        if (last > i) {
++            ggml_cuda_op_dsv4_gather_kv(*cuda_ctx, g);
++            return last - i;
++        }
++    }
++
++    // abyss: ABYSS_HC_FUSE, a hyper-connection gate with the collapse and the norm it feeds
++    if (node->op == GGML_OP_MUL && ggml_cuda_match_dsv4_hc_pre_norm(cgraph, i)) {
++        ggml_cuda_op_dsv4_hc_pre_norm(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4], cgraph->nodes[i + 5],
++            cgraph->nodes[i + 6], cgraph->nodes[i + 7]);
++        return 7;
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+@@ -5653,6 +5909,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+             ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(node, cgraph->nodes[i + 1]) &&
+             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT }, { i + 1 })) {
++        // abyss: with the gate and the comb that follow the mixes (ABYSS_HC_FUSE)
++        dsv4_hc_mix_tail tail;
++        if (ggml_cuda_match_dsv4_hc_mix_tail(cgraph, i, tail)) {
++            ggml_cuda_op_rms_norm_mul_mat_vec_f(*cuda_ctx, node, cgraph->nodes[i + 1], &tail);
++            return 9;
++        }
+         const int out_nodes[] = { i + 1 };
+         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+             ggml_cuda_op_rms_norm_mul_mat_vec_f(*cuda_ctx, node, cgraph->nodes[i + 1]);
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 0116fea..00b33c1 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -954,9 +954,13 @@ static __global__ void rms_norm_mul_mat_vec_f_part(
+     }
+ }
+ 
++// abyss: with_tail (ABYSS_HC_FUSE) also computes, from the mixes, the gate and the comb that follow them in the graph
++// of a DeepSeek V4 hyper-connection, as mul_add_sigmoid_scale_f32 and dsv4_hc_comb_f32 compute them: four threads the
++// gate, a thread of the second warp the comb
++template <bool with_tail>
+ static __global__ void rms_norm_mul_mat_vec_f_reduce(
+         const float * part, const float * part_ss, float * dst, const int nrows, const int nchunks, const int ncols,
+-        const float eps) {
++        const float eps, const dsv4_hc_mix_tail tail) {
+     const int row = threadIdx.x;
+ 
+     ggml_cuda_pdl_sync();
+@@ -969,12 +973,36 @@ static __global__ void rms_norm_mul_mat_vec_f_reduce(
+ 
+     ggml_cuda_pdl_lc();
+ 
++    float mix = 0.0f;
+     if (row < nrows) {
+         float sum = 0.0f;
+         for (int c = 0; c < nchunks; ++c) {
+             sum += part[c*nrows + row];
+         }
+-        dst[row] = scale*sum;
++        mix = scale*sum;
++        dst[row] = mix;
++    }
++
++    if constexpr (with_tail) {
++        __shared__ float s_mix[64];
++        if (row < nrows) {
++            s_mix[row] = mix;
++        }
++        __syncthreads();
++        if (row >= tail.gate_off && row < tail.gate_off + DSV4_HC) {
++            const int i0 = row - tail.gate_off;
++            tail.gate[i0] = dsv4_hc_gate(s_mix[row], tail.gate_s[0], tail.gate_b[i0], tail.gate_scale, tail.gate_bias);
++        }
++        if (row == WARP_SIZE) {
++            float comb[DSV4_HC*DSV4_HC];
++            dsv4_hc_comb_token(s_mix + 2*DSV4_HC, 1, tail.comb_scale[0], tail.comb_base, tail.comb_sb, tail.comb_eps,
++                tail.comb_iters, comb);
++            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
++                for (int idst = 0; idst < DSV4_HC; ++idst) {
++                    tail.comb[idst*tail.comb_sd0 + isrc*tail.comb_sd1] = comb[idst + DSV4_HC*isrc];
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -1005,7 +1033,8 @@ bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm,
+     return (uintptr_t) x->data % 16 == 0 && (uintptr_t) W->data % 16 == 0 && W->nb[1] % 16 == 0;
+ }
+ 
+-void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
++void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat,
++        const dsv4_hc_mix_tail * tail) {
+     const ggml_tensor * x = rms_norm->src[0];
+     const ggml_tensor * W = mul_mat->src[0];
+ 
+@@ -1027,6 +1056,13 @@ void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const
+         ncols4);
+ 
+     const ggml_cuda_kernel_launch_params params_reduce = {dim3(1, 1, 1), dim3(64, 1, 1), 0, stream};
+-    ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_reduce, params_reduce,
+-        (const float *) part.get(), (const float *) part_ss, (float *) mul_mat->data, nrows, nchunks, ncols, eps);
++    if (tail) {
++        GGML_ASSERT(nrows <= 64);
++        ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_reduce<true>, params_reduce,
++            (const float *) part.get(), (const float *) part_ss, (float *) mul_mat->data, nrows, nchunks, ncols, eps, *tail);
++    } else {
++        ggml_cuda_kernel_launch(rms_norm_mul_mat_vec_f_reduce<false>, params_reduce,
++            (const float *) part.get(), (const float *) part_ss, (float *) mul_mat->data, nrows, nchunks, ncols, eps,
++            dsv4_hc_mix_tail{});
++    }
+ }
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index ccf4a80..03a159b 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
++#include "dsv4-hc.cuh"
+ 
+ #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
+ 
+@@ -15,4 +16,6 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+ 
+ // abyss: rms_norm -> mul_mat of one column with a few long F32 rows as one split-K product (ABYSS_HC_KSPLIT=1)
+ bool ggml_cuda_should_fuse_rms_norm_mul_mat_vec_f(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat);
+-void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat);
++// abyss: with tail (ABYSS_HC_FUSE) the reduce also computes the gate and the comb that follow the mixes
++void ggml_cuda_op_rms_norm_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_mat,
++        const dsv4_hc_mix_tail * tail = nullptr);
+diff --git a/ggml/src/ggml-cuda/softcap.cu b/ggml/src/ggml-cuda/softcap.cu
+index 345c140..8d493e4 100644
+--- a/ggml/src/ggml-cuda/softcap.cu
++++ b/ggml/src/ggml-cuda/softcap.cu
+@@ -1,4 +1,5 @@
+ #include "softcap.cuh"
++#include "dsv4-hc.cuh"
+ 
+ static __global__ void softcap_f32(const float * x, float * dst, const float scale, const float softcap, const int k) {
+     ggml_cuda_pdl_lc();
+@@ -54,10 +55,7 @@ static __global__ void mul_add_sigmoid_scale_f32(
+     const int64_t i0 = i - i1*ne0;
+ 
+     ggml_cuda_pdl_sync();
+-    float v = __fmul_rn(x[i1*s1 + i0*s0], s[0]);
+-    v = __fadd_rn(v, b[i0]);
+-    v = 1.0f / (1.0f + expf(-v));
+-    dst[i] = scale * v + bias;
++    dst[i] = dsv4_hc_gate(x[i1*s1 + i0*s0], s[0], b[i0], scale, bias);
+ }
+ 
+ static int gate_dbg() {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dc0d310..b746ca6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3827,6 +3827,77 @@ struct test_rms_norm_mul_mat : public test_case {
+     }
+ };
+ 
++// abyss: the keys and the mask of a DeepSeek V4.1 single-token attention with its top-k compressed rows (the graph of
++// mx-llama.cpp/0008, which ABYSS_GATHER_FUSE fuses): get_rows of the compressed rows, cast to F16, concat after the
++// window's keys; get_rows of the mask column, repeat, cast, concat after the window's mask. The two come out side by side
++struct test_dsv4_gather_kv : public test_case {
++    const ggml_type type_comp;
++    const ggml_type type_mask;
++    const int64_t d;      // elements of a key row
++    const int64_t n_comp; // compressed rows
++    const int64_t n_top;
++    const int64_t n_raw;  // window rows
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "DSV4_GATHER_KV";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR6(type_comp, type_mask, d, n_comp, n_top, n_raw);
++    }
++
++    test_dsv4_gather_kv(ggml_type type_comp = GGML_TYPE_F16, ggml_type type_mask = GGML_TYPE_F16, int64_t d = 512,
++            int64_t n_comp = 1024, int64_t n_top = 512, int64_t n_raw = 2048)
++        : type_comp(type_comp), type_mask(type_mask), d(d), n_comp(n_comp), n_top(n_top), n_raw(n_raw) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * comp   = ggml_new_tensor_2d(ctx, type_comp, d, n_comp);
++        ggml_tensor * ids    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_top);
++        ggml_tensor * raw_k  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, 1, n_raw);
++        ggml_tensor * m_full = ggml_new_tensor_2d(ctx, type_mask, n_comp, 1);
++        ggml_tensor * raw_m  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_raw, 1);
++        ggml_set_name(comp, "comp");
++        ggml_set_name(ids, "ids");
++
++        ggml_tensor * k_top = ggml_get_rows(ctx, comp, ids);
++        k_top = ggml_cast(ctx, ggml_reshape_4d(ctx, k_top, d, 1, n_top, 1), GGML_TYPE_F16);
++        ggml_tensor * k_all = ggml_concat(ctx, raw_k, k_top, 2);
++
++        ggml_tensor * m_col = ggml_view_2d(ctx, m_full, 1, n_comp, ggml_element_size(m_full), 0);
++        ggml_tensor * m_top = ggml_reshape_2d(ctx, ggml_get_rows(ctx, m_col, ids), n_top, 1);
++        m_top = ggml_repeat_4d(ctx, m_top, n_top, 1, 1, 1);
++        m_top = ggml_cast(ctx, m_top, GGML_TYPE_F16);
++        ggml_tensor * kq_mask = ggml_concat(ctx, raw_m, m_top, 0);
++
++        // side by side: the keys as rows of d, the mask as rows of d too
++        GGML_ASSERT((n_raw + n_top) % d == 0);
++        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, k_all, d, n_raw + n_top),
++                ggml_reshape_2d(ctx, kq_mask, d, (n_raw + n_top)/d), 1);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (ggml_is_view_op(t->op)) {
++                continue;
++            }
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int> data(ggml_nelements(t));
++                for (size_t i = 0; i < data.size(); i++) {
++                    data[i] = rand() % n_comp;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -10475,6 +10546,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_rms_norm_mul_mat(20480, 24, 2)); // two columns, not fused
+     test_cases.emplace_back(new test_rms_norm_mul_mat(4100, 24, 1));  // a partial last chunk
++    test_cases.emplace_back(new test_dsv4_gather_kv(GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_dsv4_gather_kv(GGML_TYPE_F32, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_dsv4_gather_kv(GGML_TYPE_F16, GGML_TYPE_F32));
++    test_cases.emplace_back(new test_dsv4_gather_kv(GGML_TYPE_F16, GGML_TYPE_F16, 512, 1024, 512, 512));
+ 
+     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
+-- 
+2.43.0
+

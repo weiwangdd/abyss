@@ -1,6 +1,6 @@
 #!/bin/bash
 # Perplexity of the decode path with the MoE expert deferral (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025) and without, or
-# with any switches: llama-abyss-dump with the production settings (those of mx-llama.cpp/0030) forces, one token at a
+# with any switches: llama-abyss-dump with the production settings (those of mx-llama.cpp/0032) forces, one token at a
 # time after a corpus prompt, the corpus text that follows it and a C++ source of the fork (GEN tokens in all, default
 # 4000), saving each token's NLL, once per entry of CONFIGS ("name:VAR=VALUE,VAR=VALUE", the settings on top of
 # production; default without and with the deferral); then nll_compare.py pairs each run with the first one token by
@@ -61,7 +61,7 @@ for c in $CONFIGS; do
     ABYSS_DSV41_INDEXER=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_ADMIT=0.3 \
     ABYSS_MOE_BIG_SPLIT=1 ABYSS_MOE_BIG_CACHE=1 ABYSS_PLAIN_INPUT=1 ABYSS_DECODE_STATS=100 ABYSS_MOE_DEFER=1 \
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
-    "${extra_env[@]}" \
+    ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 "${extra_env[@]}" \
     ABYSS_DUMP_RE= ABYSS_DUMP_DIR="$O/$name" ABYSS_DUMP_FORCE="$O/force.txt" ABYSS_DUMP_GEN="${GEN:-4000}" \
     "$B/llama-abyss-dump" -m "$M" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \

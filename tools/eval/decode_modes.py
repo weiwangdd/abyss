@@ -5,7 +5,9 @@ Turn 1 sends a system prompt, the agent tools and REPEAT copies of the corpus (a
 one token, which fills the prompt cache. Every later turn appends the previous answer and a new question, so the
 prompt cache keeps the conversation and the expert cache sees new text each time, and generates MAX_TOKENS tokens in
 one of the modes, round robin: greedy or the server's default sampling, streamed or not. The server log's eval time
-of each request is the decode speed (decode_modes.sh reads it).
+of each request is the decode speed (decode_modes.sh reads it). The turns ignore the end of generation, so a sampled
+answer that makes a tool call can leave the tool-call grammar nothing to accept (the server answers 500); such a turn
+is left out of the conversation and the next one goes on.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import os
 import json
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 URL = os.environ.get("DECODE_URL", "http://127.0.0.1:8080")
@@ -85,7 +88,14 @@ def main():
             subprocess.run(["nsys", "start", "--session=abyss", f"--output={args.capture}", "--force-overwrite=true"],
                            check=True)
         t0 = time.time()
-        content, reasoning = request(body)
+        try:
+            content, reasoning = request(body)
+        except urllib.error.HTTPError as e:
+            print(f"turn {turn + 2}: {mode:15s} failed, HTTP {e.code} after {time.time() - t0:.1f} s; left out", flush=True)
+            if capture:
+                subprocess.run(["nsys", "stop", "--session=abyss"], check=True)
+            messages.pop()
+            continue
         print(f"turn {turn + 2}: {mode:15s} {time.time() - t0:5.1f} s", flush=True)
         if capture:
             subprocess.run(["nsys", "stop", "--session=abyss"], check=True)
