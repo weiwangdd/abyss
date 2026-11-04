@@ -1,8 +1,10 @@
 #!/bin/bash
 # The MoE cache's admission and eviction (mx-llama.cpp/0030: ABYSS_MOE_EVICT=cold evicts the coldest expert by decayed
 # heat, ABYSS_MOE_ADMIT_GATE=1 admits a miss only if hotter than it, ABYSS_MOE_SKIP_ZERO=1 lets the CPU's experts of a
-# token read no zero slot) against the production plan, on servers with the production settings, one per entry of
-# CONFIGS ("name:VAR=VALUE,VAR=VALUE", the settings on top of production; an entry without them is production):
+# token read no zero slot) against the production plan, and later switches of the cache the same way (0031:
+# ABYSS_MOE_DEFER_UPLOAD=1 defers a token's uploaded experts with the CPU's), on servers with the production settings
+# of 0029, one per entry of CONFIGS ("name:VAR=VALUE,VAR=VALUE", the settings on top of those; an entry without them is
+# that production):
 # greedy_kl.py on PROMPTS corpus slices of 128 greedy tokens each and the 96k prompt of ctx_size.py with its 32 greedy
 # tokens, compared with the first entry's (a cache that admits other experts gives the CPU other experts, whose sums
 # round differently; the zero slots alone change nothing), and the append-only session of decode_modes.py (REPEAT
@@ -94,7 +96,7 @@ for c in $CONFIGS; do
       match($0, /[0-9.]+ major page faults/); f += substr($0, RSTART, RLENGTH) + 0 }
     END { if (n) printf "  decode stats: %d windows, %.1f ms/token, hit rate %.1f%%, per token %.1f uploaded, %.1f by the CPU, %.1f disk faults\n",
       n, t / n, h / n, u / n, c / n, f / n }' "$log"
-  grep -a -E "abyss: moe cache ubatch <= 8|evicting the" "$log" | sed 's/^.*abyss: /  /; s/^.*ABYSS_MOE_CPU_MISS/  ABYSS_MOE_CPU_MISS/'
+  grep -a -E "abyss: moe cache ubatch <= 8|evicting the|deferred uploads" "$log" | sed 's/^.*abyss: /  /; s/^.*ABYSS_MOE_CPU_MISS/  ABYSS_MOE_CPU_MISS/'
   if [ -n "$first" ] && [ -s "$O/greedy-$first.json" ] && [ -s "$O/greedy-$name.json" ]; then
     echo "  corpus slices, $first vs $name:"
     python3 -I "$E/greedy_kl.py" compare "$O/greedy-$first.json" "$O/greedy-$name.json" | sed 's/^/    /'

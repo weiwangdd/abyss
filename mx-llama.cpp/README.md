@@ -35,6 +35,7 @@
 | `0028-engram-decode-prefetch.patch` | 解码的 Engram 预读（`ABYSS_ENGRAM_DECODE_PREFETCH=1`，生产已开）：少于 64 个 token 的批次（解码），Engram 输入一算出行号就对这些行发 `MADV_WILLNEED`，在计算图启动之前，计算图的 CPU `get_rows` 不再逐行等缺页（每个冷行约 86 µs）；64 个以上的照旧由 `0004` 预取。剖析里 Engram 前的 GPU 空等每 token 1.24 → 0.49 ms，输出不变；剩下的主要是 NVMe 的 APST（见 CLAUDE.md「解码的 Engram 预读」） |
 | `0029-dist-vec.patch` | CPU 采样向量化（`ABYSS_DIST_VEC=1`，生产已开）：`dist` 采样把 logit 减最大值后拷进连续缓冲区，用能自动向量化的多项式 exp（`target_clones` 出 AVX-512、AVX2 和通用三份）算分子，每 1,024 个一块求和，按块找到目标再在块内找，归一化改乘倒数；随机数和选法不变。129,280 个 token 的采样 0.411 → 0.117 ms，固定种子 2,000 次选中的 token 全同 |
 | `0030-moe-cache-gate.patch` | 专家缓存的准入门和淘汰（生产已开）：小批次的规划可以淘汰衰减热度最低的槽位，不再按最久没用（`ABYSS_MOE_EVICT=cold`，这次规划读到或刚放进的不挤）；未命中比要挤掉的那个热才上传进缓存，否则交给 CPU（`ABYSS_MOE_ADMIT_GATE=1`）；单 token 时 CPU 算的专家槽位号填 −1，`mul_mat_vec_q` 对负 id 整块写 0、不读零槽位（`ABYSS_MOE_SKIP_ZERO=1`）。生产设置下每 token 上传 6.9 → 5.2，会话解码 +3.2%，KL 6e-4（交给 CPU、被延后的专家变了）；零槽位跳过本身输出不变（见 CLAUDE.md「缓存的准入门和淘汰」） |
+| `0031-moe-defer-upload.patch` | 上传的专家也延后（`ABYSS_MOE_DEFER_UPLOAD=1`，只用于测试，没有上线）：单 token 的 CPU 专家延后到下一层时（`ABYSS_MOE_DEFER`），规划准入的第一个未命中不在规划里上传，命中那段计算里它的槽位号填 −1，CPU 也不算它；启动回调等命中那段计算提交后（它的小拷贝已经排进队列），把它放到缓存所在卡上第二个 CUDA backend 的流上传，再让主流等它的事件；延后求和那一段从槽位算它（单专家宽，按它在选中专家里的位置取权重），和 CPU 的专家一起在下一层注意力输出前加回残差；同一层其余准入的照旧同步上传。要和 `ABYSS_MOE_CPU_MISS`、`ABYSS_MOE_SKIP_ZERO` 一起用，开了 `ABYSS_MOE_PREFETCH` 时不起作用。会话解码 +1%（约 0.3–0.5 ms/token），PPL +0.12% ± 0.10%（见 CLAUDE.md「上传的专家也延后」）；不设开关时和原来一样 |
 
 ## 安装
 
@@ -56,7 +57,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0023-big-batch-cache.patch <abyss>/mx-llama.cpp/0024-moe-prefetch.patch \
   <abyss>/mx-llama.cpp/0025-moe-defer.patch <abyss>/mx-llama.cpp/0026-moe-ids-stats.patch \
   <abyss>/mx-llama.cpp/0027-hc-ksplit.patch <abyss>/mx-llama.cpp/0028-engram-decode-prefetch.patch \
-  <abyss>/mx-llama.cpp/0029-dist-vec.patch <abyss>/mx-llama.cpp/0030-moe-cache-gate.patch
+  <abyss>/mx-llama.cpp/0029-dist-vec.patch <abyss>/mx-llama.cpp/0030-moe-cache-gate.patch \
+  <abyss>/mx-llama.cpp/0031-moe-defer-upload.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
