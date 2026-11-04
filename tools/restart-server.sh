@@ -10,7 +10,9 @@
 # fallback without. The expert stats read each layer's selection after the graph (0026); NEW_STATS=1 starts them
 # from zero, the old file kept aside. A decode step's Engram rows are read ahead (ABYSS_ENGRAM_DECODE_PREFETCH=1, 0028)
 # and the dist sampler is vectorized (ABYSS_DIST_VEC=1, 0029); neither changes the outputs, and leaving them out is the
-# fallback.
+# fallback. The MoE cache evicts its coldest expert by decayed heat and admits a miss only if hotter than that one, and
+# the experts the CPU computes for a token read no zero slot (ABYSS_MOE_EVICT=cold, ABYSS_MOE_ADMIT_GATE=1,
+# ABYSS_MOE_SKIP_ZERO=1, 0030); leaving them out is the fallback.
 set -e
 cd ~/abyss-stats
 mkdir -p slots
@@ -53,7 +55,7 @@ cd ~/src/mx-llama.cpp
 ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
   ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_DECODE_STATS=100 GOMP_SPINCOUNT=100000000 \
   ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
-  ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 \
+  ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
   nohup ./build-m2/bin/llama-server \
   -m ~/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \

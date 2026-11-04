@@ -1,0 +1,208 @@
+From 5735e36c949c6909254f9119f788f3cf95cdd878 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 4 Nov 2026 11:46:40 +0100
+Subject: [PATCH] abyss: the MoE cache plan of a small batch can evict the slot
+ whose expert has the lowest decayed heat instead of the least recently used
+ one (ABYSS_MOE_EVICT=cold, never a slot the plan reads or has filled), admit
+ a miss only if it is hotter than the expert it would evict
+ (ABYSS_MOE_ADMIT_GATE=1), and name no zero slot for the experts the CPU
+ computes for a single token (ABYSS_MOE_SKIP_ZERO=1): mul_mat_vec_q writes
+ zeros for an id < 0 without reading an expert
+
+---
+ ggml/src/ggml-cuda/mmvq.cu | 12 +++++++
+ src/llama-moe-cache.cpp    | 71 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 79 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 44e820e..63e5cdf 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -648,6 +648,18 @@ static __global__ void mul_mat_vec_q(
+     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+     sample_dst = blockIdx.z;
+ 
++    // abyss: an id < 0 selects no expert and its rows are zero, without reading any (the experts the CPU computes for
++    // a token of the MoE cache, ABYSS_MOE_SKIP_ZERO)
++    if constexpr (ncols_dst == 1) {
++        if (ids && !shared_expert && (int32_t) channel_x < 0) {
++            if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block &&
++                    (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
++                dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = 0.0f;
++            }
++            return;
++        }
++    }
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 07f14ae..2805cc9 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -9,6 +9,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+@@ -187,6 +188,10 @@ struct llama_moe_cache::impl {
+         std::vector<uint32_t> use_eval;
+         std::vector<uint32_t> pf_eval;
+         std::vector<uint8_t>  pf_unread;
++
++        // abyss: ABYSS_MOE_EVICT=cold, per slot the plan that last read or filled it, which may not evict it
++        std::vector<uint32_t> plan_use;
++        uint32_t plan_gen = 0;
+     };
+ 
+     struct layer {
+@@ -214,6 +219,14 @@ struct llama_moe_cache::impl {
+     float heat_decay  = 0.99f;            // per plan, ABYSS_MOE_HEAT_DECAY
+     std::vector<std::vector<float>> heat; // [n_layer][n_expert] decayed use counts
+ 
++    // abyss: ABYSS_MOE_EVICT=cold evicts the slot whose expert has the lowest decayed heat instead of the least
++    // recently used one, ABYSS_MOE_ADMIT_GATE=1 admits a miss only if it is hotter than the expert it would evict, and
++    // with ABYSS_MOE_SKIP_ZERO=1 the experts the CPU computes for a single token name no zero slot (-1), so the device
++    // reads none
++    bool evict_cold = false;
++    bool admit_gate = false;
++    bool skip_zero  = false;
++
+     struct plan_ctx {
+         impl  * self;
+         int32_t il;
+@@ -296,6 +309,15 @@ struct llama_moe_cache::impl {
+         if (const char * e = getenv("ABYSS_MOE_HEAT_DECAY")) {
+             heat_decay = std::clamp((float) atof(e), 0.0f, 1.0f);
+         }
++        if (const char * e = getenv("ABYSS_MOE_EVICT")) {
++            evict_cold = strcmp(e, "cold") == 0;
++        }
++        if (const char * e = getenv("ABYSS_MOE_ADMIT_GATE")) {
++            admit_gate = atoi(e) != 0;
++        }
++        if (const char * e = getenv("ABYSS_MOE_SKIP_ZERO")) {
++            skip_zero = atoi(e) != 0;
++        }
+         if (const char * e = getenv("ABYSS_MOE_BIG_SPLIT")) {
+             big = atoi(e) != 0;
+         }
+@@ -438,6 +460,7 @@ struct llama_moe_cache::impl {
+                 continue;
+             }
+             g.lru.init(model.layers.size(), n_expert, g.n_slots);
++            g.plan_use.assign(g.n_slots, 0);
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             for (int32_t il : g.layers) {
+                 heat.resize(model.layers.size());
+@@ -569,7 +592,9 @@ struct llama_moe_cache::impl {
+             }
+         }
+         if (split) {
+-            LLAMA_LOG_INFO("%s: ABYSS_MOE_CPU_MISS=1, admitting %.2f of the misses, heat decay %.3f\n", __func__, admit, heat_decay);
++            LLAMA_LOG_INFO("%s: ABYSS_MOE_CPU_MISS=1, admitting %.2f of the misses, heat decay %.3f, evicting the %s%s%s\n", __func__,
++                admit, heat_decay, evict_cold ? "coldest" : "least recently used", admit_gate ? ", only misses hotter than it" : "",
++                skip_zero ? ", no zero slots for a single token" : "");
+         }
+ 
+         // abyss: the plans issue the prefetches, which ABYSS_MOE_CPU_MISS enables
+@@ -716,6 +741,11 @@ struct llama_moe_cache::impl {
+         for (float & x : h) {
+             x *= heat_decay;
+         }
++        if (++g.plan_gen == 0) {
++            std::fill(g.plan_use.begin(), g.plan_use.end(), 0);
++            g.plan_gen = 1;
++        }
++        const uint32_t gen = g.plan_gen;
+         if (++lru.seen_gen == 0) {
+             std::fill(lru.seen.begin(), lru.seen.end(), 0);
+             lru.seen_gen = 1;
+@@ -738,6 +768,7 @@ struct llama_moe_cache::impl {
+             h[e] += 1.0f;
+             if (slots[e] >= 0) {
+                 lru.touch(slots[e]);
++                g.plan_use[slots[e]] = gen;
+                 n_hit++;
+                 if (prefetch > 0) {
+                     g.use_eval[slots[e]] = eval;
+@@ -761,18 +792,25 @@ struct llama_moe_cache::impl {
+         fills.clear();
+         for (size_t i = 0; i < n_admit; ++i) {
+             const int32_t e = misses[i];
+-            const int32_t s = lru.head;
++            const int32_t s = evict_cold ? coldest(g, gen) : lru.head;
+             // abyss: never a slot the prefetch stream may still be writing, the CPU computes the rest
+             if (prefetch > 0 && g.pf_eval[s] == eval) {
+                 n_admit = i;
+                 break;
+             }
++            // abyss: ABYSS_MOE_ADMIT_GATE, a miss no hotter than the expert it would evict goes to the CPU, and so do the
++            // colder misses after it
++            if (admit_gate && lru.key_of[s] >= 0 && heat[lru.key_of[s] / lru.n_expert][lru.key_of[s] % lru.n_expert] >= h[e]) {
++                n_admit = i;
++                break;
++            }
+             if (lru.key_of[s] >= 0) {
+                 lru.slot_map[lru.key_of[s] / lru.n_expert][lru.key_of[s] % lru.n_expert] = -1;
+             }
+             lru.key_of[s] = il*lru.n_expert + e;
+             slots[e] = s;
+             lru.touch(s);
++            g.plan_use[s] = gen;
+             if (prefetch > 0) {
+                 g.use_eval[s]  = eval;
+                 g.pf_unread[s] = 0;
+@@ -798,11 +836,13 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
+-        // the k-th expert of a token reads zero slot k, so a token never names a slot twice
++        // the k-th expert of a token reads zero slot k, so a token never names a slot twice; with ABYSS_MOE_SKIP_ZERO a
++        // single token names none (-1) and the device writes zeros for it
+         GGML_ASSERT(n_ids % n_expert_used == 0);
++        const bool no_zero = skip_zero && n_ids == n_expert_used;
+         for (int64_t i = 0; i < n_ids; ++i) {
+             const int32_t e = ids[i];
+-            dev_slots[i] = slots[e] >= 0 ? slots[e] : g.n_slots + (int32_t) (i % n_expert_used);
++            dev_slots[i] = slots[e] >= 0 ? slots[e] : no_zero ? -1 : g.n_slots + (int32_t) (i % n_expert_used);
+             cpu_ids[i]   = slots[e] >= 0 ? -1 : e;
+         }
+ 
+@@ -823,6 +863,29 @@ struct llama_moe_cache::impl {
+ 
+     std::vector<int32_t> ids_misses;
+ 
++    // abyss: ABYSS_MOE_EVICT=cold, the slot of the group whose expert has the lowest decayed heat, an empty one first;
++    // never one this plan reads or has filled
++    int32_t coldest(const group & g, uint32_t gen) const {
++        const moe_cache_lru & lru = g.lru;
++        int32_t best   = -1;
++        float   best_h = 0.0f;
++        for (int32_t s = 0; s < g.n_slots; ++s) {
++            if (g.plan_use[s] == gen) {
++                continue;
++            }
++            const int32_t key = lru.key_of[s];
++            if (key < 0) {
++                return s;
++            }
++            const float hs = heat[key / lru.n_expert][key % lru.n_expert];
++            if (best < 0 || hs < best_h) {
++                best   = s;
++                best_h = hs;
++            }
++        }
++        return best >= 0 ? best : lru.head;
++    }
++
+     bool big_split(int32_t il, int64_t n_tokens) const {
+         return big && il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 && n_tokens > max_batch;
+     }
+-- 
+2.43.0
+
