@@ -14,8 +14,14 @@
 # the experts the CPU computes for a token read no zero slot (ABYSS_MOE_EVICT=cold, ABYSS_MOE_ADMIT_GATE=1,
 # ABYSS_MOE_SKIP_ZERO=1, 0030); leaving them out is the fallback. A token's hyper-connection gates and combs, and the
 # keys and mask of its attention with the top-k compressed rows, run in fewer kernels (ABYSS_HC_FUSE=1,
-# ABYSS_GATHER_FUSE=1, 0032), with the same results; leaving them out is the fallback.
+# ABYSS_GATHER_FUSE=1, 0032), with the same results; leaving them out is the fallback. HEAD_Q8=1 runs the copy of the
+# model whose output head is Q8_0 instead of BF16 (tools/convert/retype_tensor.py: about 2% faster per request, top-20
+# KL about 5e-4, the decode-path PPL the same); off by default.
 set -e
+model=$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF
+if [ -n "${HEAD_Q8:-}" ]; then
+  model=$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF-headq8
+fi
 cd ~/abyss-stats
 mkdir -p slots
 pids=$(pgrep -x llama-server || true)
@@ -60,7 +66,7 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
   ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 \
   nohup ./build-m2/bin/llama-server \
-  -m ~/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
+  -m $model/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" -ot "blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
   -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 \

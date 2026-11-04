@@ -5,7 +5,7 @@
 # defers a token's uploaded experts with the CPU's; 0032: ABYSS_HC_FUSE=1, ABYSS_GATHER_FUSE=1 fuse kernels), on servers
 # with the production settings (now those of 0032, so VAR=0 turns a switch of them off), one per entry of CONFIGS
 # ("name:VAR=VALUE,VAR=VALUE", the settings on top of those; an entry without them is production; BIN=<dir> among them
-# runs that entry's server from another build):
+# runs that entry's server from another build, MODEL=<gguf> on another model):
 # greedy_kl.py on PROMPTS corpus slices of 128 greedy tokens each and the 96k prompt of ctx_size.py with its 32 greedy
 # tokens, compared with the first entry's (a cache that admits other experts gives the CPU other experts, whose sums
 # round differently; the zero slots alone change nothing), and the append-only session of decode_modes.py (REPEAT
@@ -58,9 +58,13 @@ for c in $CONFIGS; do
   extra_env=()
   [ -n "$settings" ] && IFS=, read -r -a extra_env <<< "$settings"
   bin=$B
+  model=$M
   for k in "${!extra_env[@]}"; do
     if [[ ${extra_env[$k]} == BIN=* ]]; then
       bin=${extra_env[$k]#BIN=}
+      unset 'extra_env[k]'
+    elif [[ ${extra_env[$k]} == MODEL=* ]]; then
+      model=${extra_env[$k]#MODEL=}
       unset 'extra_env[k]'
     fi
   done
@@ -72,7 +76,7 @@ for c in $CONFIGS; do
     ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_DEFER=1 ABYSS_EXPERT_STATS="$O/stats-$name.json" \
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 \
     ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 "${extra_env[@]}" \
-    "$bin/llama-server" -m "$M" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
+    "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
     -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 --checkpoint-min-step 32768 \
     --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" --no-reasoning-preserve \

@@ -3,9 +3,10 @@
 # with any switches: llama-abyss-dump with the production settings (those of mx-llama.cpp/0032) forces, one token at a
 # time after a corpus prompt, the corpus text that follows it and a C++ source of the fork (GEN tokens in all, default
 # 4000), saving each token's NLL, once per entry of CONFIGS ("name:VAR=VALUE,VAR=VALUE", the settings on top of
-# production; default without and with the deferral); then nll_compare.py pairs each run with the first one token by
-# token. BUILD picks the binaries (default build-pf, which has the switches). Waits for the production server to go
-# idle, saves its slot and stops it, and restarts it at the end (~/abyss-stats/restart.sh restores the slot).
+# production, BIN=<dir> among them for another build and MODEL=<gguf> for another model; default without and with the
+# deferral); then nll_compare.py pairs each run with the first one token by token. BUILD picks the binaries (default
+# build-pf, which has the switches). Waits for the production server to go idle, saves its slot and stops it, and
+# restarts it at the end (~/abyss-stats/restart.sh restores the slot).
 set -u
 E=$(cd "$(dirname "$0")" && pwd)
 O=${OUT:-$HOME/abyss-eval}/defer-ppl-$(date +%m%d-%H%M)
@@ -55,6 +56,17 @@ for c in $CONFIGS; do
   IFS=: read -r name settings <<< "$c"
   extra_env=()
   [ -n "$settings" ] && IFS=, read -r -a extra_env <<< "$settings"
+  bin=$B
+  model=$M
+  for k in "${!extra_env[@]}"; do
+    if [[ ${extra_env[$k]} == BIN=* ]]; then
+      bin=${extra_env[$k]#BIN=}
+      unset 'extra_env[k]'
+    elif [[ ${extra_env[$k]} == MODEL=* ]]; then
+      model=${extra_env[$k]#MODEL=}
+      unset 'extra_env[k]'
+    fi
+  done
   mkdir -p "$O/$name"
   echo "### $name: ${settings:-production} $(date +%T)"
   env GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 \
@@ -63,7 +75,7 @@ for c in $CONFIGS; do
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
     ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 "${extra_env[@]}" \
     ABYSS_DUMP_RE= ABYSS_DUMP_DIR="$O/$name" ABYSS_DUMP_FORCE="$O/force.txt" ABYSS_DUMP_GEN="${GEN:-4000}" \
-    "$B/llama-abyss-dump" -m "$M" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
+    "$bin/llama-abyss-dump" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
     -c 16384 -b 8192 -ub 2048 --moe-cache-mib 20500 -f "$O/prompt.txt" > "$O/$name/dump.log" 2>&1
   echo "  exit $? $(date +%T)"
