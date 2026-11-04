@@ -32,6 +32,8 @@
 | `0025-moe-defer.patch` | 专家延后（`ABYSS_MOE_DEFER=1`，生产已开）：单 token 解码时，专家缓存覆盖的层交给 CPU 算的专家不并进本层的 FFN 输出，它们的加权和在下一层注意力的输出处、按本层 FFN 的 post 系数加进残差（下一层的注意力没看到这部分，残差本身是精确的）；图的顺序让 GPU 先算本层缓存命中的专家和下一层的注意力，CPU 同时算未命中，规划算子顺带把 FFN 输入拷到 CPU。调度器加了开关 `ggml_backend_sched_set_async_host_inputs`：GPU 段从 CPU 段来的小输入（≤ 1 MiB）走锁页暂存区在 GPU 的流上异步拷，紧跟 GPU 段、没有输入的 CPU 段不再同步，有逐节点回调（专家统计）时回调不读的段也不同步。会话解码 +11%，解码路径 PPL +0.06% ± 0.14%（见 CLAUDE.md「专家延后」）；不设开关时和原来一样 |
 | `0026-moe-ids-stats.patch` | 专家统计不再切图：`llama_context_params`（和 `common_params`）加了 `cb_moe_ids`。设了它，`build_moe_ffn` 在融合的路由节点之后给每层的选择结果加一个 `cont` 输出，每个 ubatch 算完和 logits 一起异步拷进锁页内存，在下一次 `synchronize()`（读 logits 时）交给回调。`abyss-expert-stats` 改用它，不再装逐节点回调：原来的回调在每层的 top-k 处切开计算图，路由的融合内核用不上，每层还多一次同步和一次 CUDA graph 启动；而且按名字前缀匹配，把专家缓存的规划对选择结果做的 reshape、cont 视图也算了进去，第 22–39 层的计数是错的。生产设置下会话解码 +7.8%（见 CLAUDE.md「专家统计不再切图」） |
 | `0027-hc-ksplit.patch` | 超连接混合系数的 K 切分（`ABYSS_HC_KSPLIT=1`，生产已开）：CUDA 后端把「`rms_norm` 后接以它为输入的 `mul_mat`」（单列、F32、≤ 64 行、≥ 4,096 列，也就是 DSV4 每个子层的超连接混合系数，24 行 × 20,480 列）换成两个内核：每块算（行, 2,048 列一段）的点积和这段的平方和，第二个内核按固定顺序相加再乘 `rsqrt(mean(x²)+eps)`，结果和调度无关。每次约 12.3 → 3.3 µs，每 token 80 次，会话解码 +4.5%；`test-backend-ops` 加了 `RMS_NORM_MUL_MAT` 用例。不设开关时和原来一样 |
+| `0028-engram-decode-prefetch.patch` | 解码的 Engram 预读（`ABYSS_ENGRAM_DECODE_PREFETCH=1`，生产已开）：少于 64 个 token 的批次（解码），Engram 输入一算出行号就对这些行发 `MADV_WILLNEED`，在计算图启动之前，计算图的 CPU `get_rows` 不再逐行等缺页（每个冷行约 86 µs）；64 个以上的照旧由 `0004` 预取。剖析里 Engram 前的 GPU 空等每 token 1.24 → 0.49 ms，输出不变；剩下的主要是 NVMe 的 APST（见 CLAUDE.md「解码的 Engram 预读」） |
+| `0029-dist-vec.patch` | CPU 采样向量化（`ABYSS_DIST_VEC=1`，生产已开）：`dist` 采样把 logit 减最大值后拷进连续缓冲区，用能自动向量化的多项式 exp（`target_clones` 出 AVX-512、AVX2 和通用三份）算分子，每 1,024 个一块求和，按块找到目标再在块内找，归一化改乘倒数；随机数和选法不变。129,280 个 token 的采样 0.411 → 0.117 ms，固定种子 2,000 次选中的 token 全同 |
 
 ## 安装
 
@@ -52,7 +54,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0021-bench-moe-cache.patch <abyss>/mx-llama.cpp/0022-big-batch-stats.patch \
   <abyss>/mx-llama.cpp/0023-big-batch-cache.patch <abyss>/mx-llama.cpp/0024-moe-prefetch.patch \
   <abyss>/mx-llama.cpp/0025-moe-defer.patch <abyss>/mx-llama.cpp/0026-moe-ids-stats.patch \
-  <abyss>/mx-llama.cpp/0027-hc-ksplit.patch
+  <abyss>/mx-llama.cpp/0027-hc-ksplit.patch <abyss>/mx-llama.cpp/0028-engram-decode-prefetch.patch \
+  <abyss>/mx-llama.cpp/0029-dist-vec.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

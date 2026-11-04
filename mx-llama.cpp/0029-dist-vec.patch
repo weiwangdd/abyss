@@ -1,0 +1,146 @@
+From 9dde0c513d178c8158dcb1c1fb4141a2a3d6a078 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 4 Nov 2026 10:52:01 +0100
+Subject: [PATCH] abyss: ABYSS_DIST_VEC=1 vectorizes the dist sampler: the
+ softmax numerators over the vocabulary with a polynomial exp the compiler
+ vectorizes (target_clones for AVX-512 and AVX2), sums per block, the target
+ searched through the sums of the blocks and the normalization by a
+ multiplication; the same draw from the RNG and the same rule for the token
+
+---
+ src/llama-sampler.cpp | 98 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 98 insertions(+)
+
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 521c571..211178f 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1138,6 +1138,10 @@ struct llama_sampler_dist : public llama_sampler_backend {
+     // inputs for the current sampling graph
+     std::vector<ggml_tensor *> inp_uniforms;
+ 
++    // abyss: scratch of ABYSS_DIST_VEC
++    std::vector<float>  vec_p;
++    std::vector<double> vec_bsum;
++
+     void copy_state(const llama_sampler_dist & src) {
+         // note: inp_uniforms and backend_transactional belong to the current sampling graph
+         seed_cur                  = src.seed_cur;
+@@ -1153,6 +1157,47 @@ static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
+     return sctx->get_name();
+ }
+ 
++// abyss: the softmax numerators exp(x[i]) of x <= 0 in place, in blocks whose sums go to bsum, written so that the loops
++// vectorize (Cephes' polynomial, within a few ulp of expf; exp of x below -87.33 is 0, the rounding to the nearest
++// integer adds and takes away 1.5 * 2^23); the dist sampler takes them over the whole vocabulary for every token, and
++// expf one at a time was most of its 0.6 ms on the 129,280 tokens of DeepSeek V4
++static constexpr size_t abyss_dist_block = 1024;
++
++__attribute__((target_clones("avx512f", "avx2", "default")))
++static void abyss_dist_exp(float * x, size_t n, double * bsum) {
++    for (size_t b0 = 0; b0 < n; b0 += abyss_dist_block) {
++        const size_t b1 = std::min(n, b0 + abyss_dist_block);
++        for (size_t i = b0; i < b1; ++i) {
++            const float v = x[i] < -87.33654f ? -87.33654f : x[i];
++            const float k = (v*1.44269504088896341f + 12582912.0f) - 12582912.0f;
++            const float r = (v - k*0.693359375f) - k*-2.12194440e-4f;
++            float q = 1.9875691500e-4f;
++            q = q*r + 1.3981999507e-3f;
++            q = q*r + 8.3334519073e-3f;
++            q = q*r + 4.1665795894e-2f;
++            q = q*r + 1.6666665459e-1f;
++            q = q*r + 5.0000001201e-1f;
++            q = q*r*r + r + 1.0f;
++            const uint32_t bits = (uint32_t) ((int32_t) k + 127) << 23;
++            float scale;
++            memcpy(&scale, &bits, sizeof(scale));
++            x[i] = x[i] < -87.33654f ? 0.0f : q*scale;
++        }
++        // eight independent sums, so that the loop vectorizes, added in a fixed order
++        double s[8] = { 0.0 };
++        size_t i = b0;
++        for (; i + 8 <= b1; i += 8) {
++            for (int j = 0; j < 8; ++j) {
++                s[j] += x[i + j];
++            }
++        }
++        for (; i < b1; ++i) {
++            s[0] += x[i];
++        }
++        bsum[b0/abyss_dist_block] = ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
++    }
++}
++
+ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (llama_sampler_dist *) smpl->ctx;
+ 
+@@ -1181,6 +1226,57 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
+         }
+     }
+ 
++    // abyss: the numerators and their sums vectorized, the search through the sums of blocks, the normalization by a
++    // multiplication (ABYSS_DIST_VEC=1); the same draw from the RNG and the same rule, the first token whose running sum
++    // reaches rnd times the total
++    static const bool dist_vec = [] {
++        const char * e = getenv("ABYSS_DIST_VEC");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (dist_vec) {
++        const size_t n  = cur_p->size;
++        const size_t nb = (n + abyss_dist_block - 1)/abyss_dist_block;
++        ctx->vec_p.resize(n);
++        ctx->vec_bsum.resize(nb);
++        float  * p    = ctx->vec_p.data();
++        double * bsum = ctx->vec_bsum.data();
++        for (size_t i = 0; i < n; ++i) {
++            p[i] = cur_p->data[i].logit - max_l;
++        }
++        abyss_dist_exp(p, n, bsum);
++
++        double sum_cum = 0.0;
++        for (size_t b = 0; b < nb; ++b) {
++            sum_cum += bsum[b];
++        }
++
++        const double rnd     = dist(ctx->rng);
++        const double sum_tgt = sum_cum*rnd;
++
++        // the block the target falls in, then the token in it (or after it, should the sums of the block and of its
++        // tokens round apart)
++        double sum_run = 0.0;
++        size_t b = 0;
++        while (b + 1 < nb && sum_run + bsum[b] < sum_tgt) {
++            sum_run += bsum[b];
++            ++b;
++        }
++        cur_p->selected = n - 1;
++        for (size_t i = b*abyss_dist_block; i < n; ++i) {
++            sum_run += p[i];
++            if (sum_run >= sum_tgt) {
++                cur_p->selected = i;
++                break;
++            }
++        }
++
++        const float inv = (float) (1.0/sum_cum);
++        for (size_t i = 0; i < n; ++i) {
++            cur_p->data[i].p = p[i]*inv;
++        }
++        return;
++    }
++
+     // apply softmax to obtain the probabilities
+     double sum_cum = 0.0f;
+     for (size_t i = 0; i < cur_p->size; ++i) {
+@@ -1416,6 +1512,8 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+             /* .n_backend_draws_generated = */ 0,
+             /* .n_backend_draws_committed = */ 0,
+             /* .inp_uniforms              = */ {},
++            /* .vec_p                     = */ {},
++            /* .vec_bsum                  = */ {},
+         }
+     );
+ }
+-- 
+2.43.0
+

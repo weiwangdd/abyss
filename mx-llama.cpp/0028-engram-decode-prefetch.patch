@@ -1,0 +1,48 @@
+From 85920cee025cd5bbd3350277f692f3157907fad3 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 4 Nov 2026 10:52:01 +0100
+Subject: [PATCH] abyss: ABYSS_ENGRAM_DECODE_PREFETCH=1 starts the reads of the
+ Engram rows of a batch under 64 tokens (a decode step) with MADV_WILLNEED as
+ soon as the input hashes them, before the graph is launched, so that the
+ graph's CPU get_rows does not fault them in one after another; batches of 64
+ tokens or more keep the prefetch of llama_decode
+
+---
+ src/models/deepseek41.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 57a4291..4888d8b 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-hparams.h"
++#include "llama-impl.h"
+ #include "llama-kv-cache-dsv4.h"
+ #include "llama-mmap.h"
+ #include "models.h"
+@@ -291,6 +292,21 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+         engram_hash_token(hp, tok.data(), &idx[i*n_cols], n_cols*n_tokens);
+     }
+ 
++    // abyss: a decode step gathers its rows in the graph's CPU get_rows, which faults them in one after another (about
++    // 90 us each when the page cache misses them, 1-1.5 ms a token with the GPUs waiting); MADV_WILLNEED starts all
++    // their reads here, before the graph is launched, so they arrive together (ABYSS_ENGRAM_DECODE_PREFETCH=1; a
++    // prompt of 64 tokens or more is prefetched by engram_prefetch() as llama_decode gets it)
++    static const bool decode_prefetch = [] {
++        const char * e = getenv("ABYSS_ENGRAM_DECODE_PREFETCH");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (decode_prefetch && n_tokens < 64) {
++        for (int64_t e = 0; e < n_eng; ++e) {
++            llama_prefetch_rows(pmodel.layers[hp.engram_layer_ids[e]].engram_embed, &idx[e*n_cols*n_tokens],
++                (size_t) (n_cols*n_tokens));
++        }
++    }
++
+     for (size_t e = 0; e < emb.size(); ++e) {
+         const ggml_tensor * table = pmodel.layers[hp.engram_layer_ids[e]].engram_embed;
+         const int64_t per_table = n_cols*n_tokens;
+-- 
+2.43.0
+
