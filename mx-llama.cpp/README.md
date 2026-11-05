@@ -37,6 +37,8 @@
 | `0030-moe-cache-gate.patch` | 专家缓存的准入门和淘汰（生产已开）：小批次的规划可以淘汰衰减热度最低的槽位，不再按最久没用（`ABYSS_MOE_EVICT=cold`，这次规划读到或刚放进的不挤）；未命中比要挤掉的那个热才上传进缓存，否则交给 CPU（`ABYSS_MOE_ADMIT_GATE=1`）；单 token 时 CPU 算的专家槽位号填 −1，`mul_mat_vec_q` 对负 id 整块写 0、不读零槽位（`ABYSS_MOE_SKIP_ZERO=1`）。生产设置下每 token 上传 6.9 → 5.2，会话解码 +3.2%，KL 6e-4（交给 CPU、被延后的专家变了）；零槽位跳过本身输出不变（见 CLAUDE.md「缓存的准入门和淘汰」） |
 | `0031-moe-defer-upload.patch` | 上传的专家也延后（`ABYSS_MOE_DEFER_UPLOAD=1`，只用于测试，没有上线）：单 token 的 CPU 专家延后到下一层时（`ABYSS_MOE_DEFER`），规划准入的第一个未命中不在规划里上传，命中那段计算里它的槽位号填 −1，CPU 也不算它；启动回调等命中那段计算提交后（它的小拷贝已经排进队列），把它放到缓存所在卡上第二个 CUDA backend 的流上传，再让主流等它的事件；延后求和那一段从槽位算它（单专家宽，按它在选中专家里的位置取权重），和 CPU 的专家一起在下一层注意力输出前加回残差；同一层其余准入的照旧同步上传。要和 `ABYSS_MOE_CPU_MISS`、`ABYSS_MOE_SKIP_ZERO` 一起用，开了 `ABYSS_MOE_PREFETCH` 时不起作用。会话解码 +1%（约 0.3–0.5 ms/token），PPL +0.12% ± 0.10%（见 CLAUDE.md「上传的专家也延后」）；不设开关时和原来一样 |
 | `0032-hc-gather-fuse.patch` | 单 token 解码的小内核融合（生产已开），结果和不融合逐位相同。`ABYSS_HC_FUSE=1`：超连接的 K 切分归约（0027）顺带算出紧跟在混合系数后面的 gate 和 comb（Sinkhorn）；pre gate、残差各份的合并（`dsv4_hc_pre`）和其后的 rms_norm 乘权重并成一个内核，块大小和累加顺序与原来的 norm 内核相同。`ABYSS_GATHER_FUSE=1`：带 top-k 压缩行的单 token 注意力（0008）把取行、转 F16、拼在窗口的 K 后面，以及掩码的取行、repeat、转换、拼接，从 7 个内核并成 1 个；融合内核要边读输入边写输出，所以输出和它读的任何张量地址重叠就不融合（段里最后一个 CSA 层的掩码输入，分配器会复用给拼接后的掩码）。每 token GPU 内核 13.87 → 13.30 ms，生产解码 20.15 → 19.68 ms/token。test-backend-ops 加了 `DSV4_GATHER_KV`（见 CLAUDE.md「小内核融合」） |
+| `0033-server-stats.patch` | server 每一步的计时（`ABYSS_SERVER_STATS=N`，默认关）：每 N 个单 token 生成步、以及每个请求结束时打印一行，把一步的墙钟时间拆成主循环和队列、组 batch、解码的准备、`llama_process`、其后 `llama_synchronize` 里等 GPU 的时间（最后一段留下的输出层和 logits 拷回）、yield 收尾、采样、accept、token 的文字和 `process_token`，以及其余部分。server 自己每 token 的处理合计约 0.04 ms（见 CLAUDE.md「token 之间的开销」） |
+| `0034-head-split.patch` | 输出层分两卡（`ABYSS_HEAD_SPLIT=F`，生产 0.5）：加载时把输出层前 F 的行复制到另一张 GPU，另建一个绑在输出层缓冲区上的视图表示其余的行；单个输出时两张卡同时算，结果在副本那张卡上拼起来（上下文的建图回调把 concat 放过去），logits 逐位相同。调度器加了 `ggml_backend_sched_set_overlap_gpus`，开了分两卡时打开：没有输入的 GPU 分段接在另一张 GPU 的分段后面时，主机不等那一段；从另一张 GPU 来的输入，先让那张卡的流在 GPU 上等本分段那张卡的事件再拷，主机不等。每 token 约快 0.4 ms，GPU0 多占 631 MiB（见 CLAUDE.md「输出层分两卡」）；不设开关时和原来一样 |
 
 ## 安装
 
@@ -59,7 +61,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0025-moe-defer.patch <abyss>/mx-llama.cpp/0026-moe-ids-stats.patch \
   <abyss>/mx-llama.cpp/0027-hc-ksplit.patch <abyss>/mx-llama.cpp/0028-engram-decode-prefetch.patch \
   <abyss>/mx-llama.cpp/0029-dist-vec.patch <abyss>/mx-llama.cpp/0030-moe-cache-gate.patch \
-  <abyss>/mx-llama.cpp/0031-moe-defer-upload.patch <abyss>/mx-llama.cpp/0032-hc-gather-fuse.patch
+  <abyss>/mx-llama.cpp/0031-moe-defer-upload.patch <abyss>/mx-llama.cpp/0032-hc-gather-fuse.patch \
+  <abyss>/mx-llama.cpp/0033-server-stats.patch <abyss>/mx-llama.cpp/0034-head-split.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

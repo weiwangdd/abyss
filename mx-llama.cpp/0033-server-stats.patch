@@ -1,0 +1,168 @@
+From bbfa752c5678e6127f37f62b6a9499843799d5e6 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Thu, 5 Nov 2026 18:25:09 +0100
+Subject: [PATCH] abyss: ABYSS_SERVER_STATS=N prints, every N steps of the
+ server that decode a single generated token and at the end of each request,
+ where a step's wall time goes: the main loop and its queue, the batch, the
+ setup of the decode, llama_process(), the wait in the llama_synchronize()
+ after it, the end of the yield, the rest before sampling, sampling, accepting
+ the token, its text and process_token(), and the rest of post_decode()
+
+---
+ tools/server/server-context.cpp | 86 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index da7a27a..1c3f327 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3223,6 +3223,71 @@ private:
+     };
+ #endif
+ 
++    // abyss: ABYSS_SERVER_STATS=N prints, every N steps that decode a single generated token, where a step's wall time
++    // goes, from the end of one update_slots() to the end of the next: the main loop and its queue in between, the batch
++    // (pre_decode), the setup of the decode (render, graph reservation, the start of the yield), llama_process() itself,
++    // the wait in the llama_synchronize() after it (the GPU work the last split left running: the output head and the
++    // logits copy), the end of the yield (its handshake with the queue worker), the rest before sampling, sampling,
++    // accepting the token, the token's text and process_token() (stop strings, the streamed result), and the rest; the
++    // steps of a request that ends before N more are printed when it ends
++    struct abyss_step_stats {
++        static constexpr int N_PART = 11;
++        int32_t every = 0;
++        bool    on    = false; // this update_slots() decodes one generated token
++        bool    finished = false; // and its request ended with it
++        int64_t t_end_prev = 0; // the end of the previous update_slots() if it was such a step
++        int64_t t_start = 0, t_pre = 0, t_proc0 = 0, t_proc1 = 0, t_sync = 0, t_yield = 0;
++        int64_t t_smpl0 = 0, t_smpl1 = 0, t_accept = 0, t_token = 0;
++        double  sum[N_PART] = {};
++        int64_t n = 0;
++
++        abyss_step_stats() {
++            const char * e = getenv("ABYSS_SERVER_STATS");
++            every = e != nullptr ? std::max(0, atoi(e)) : 0;
++        }
++
++        void mark(int64_t & t) const {
++            if (every > 0) {
++                t = ggml_time_us();
++            }
++        }
++
++        void end_step() {
++            if (every <= 0) {
++                return;
++            }
++            const int64_t t_end = ggml_time_us();
++            const bool counted = on && t_end_prev > 0 && t_token > 0;
++            if (counted) {
++                const int64_t t[N_PART + 1] = { t_end_prev, t_start, t_pre, t_proc0, t_proc1, t_sync, t_yield,
++                                                t_smpl0, t_smpl1, t_accept, t_token, t_end };
++                for (int i = 0; i < N_PART; i++) {
++                    sum[i] += 1e-3 * (t[i + 1] - t[i]);
++                }
++                n++;
++            }
++            // a request that ended, or one cut off without its end (the next step is not a counted one)
++            const bool request_end = finished || !counted;
++            if (n > 0 && (n == every || request_end)) {
++                double total = 0.0;
++                for (double v : sum) {
++                    total += v;
++                }
++                SRV_INF("abyss: server stats, %d tokens%s: %.2f ms/token = loop %.3f + batch %.3f + setup %.3f + "
++                        "llama_process %.3f + GPU wait %.3f + yield end %.3f + before sampling %.3f + sampling %.3f + "
++                        "accept %.3f + token %.3f + rest %.3f\n", (int) n, request_end ? " (request end)" : "",
++                        total / n, sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n, sum[4] / n, sum[5] / n,
++                        sum[6] / n, sum[7] / n, sum[8] / n, sum[9] / n, sum[10] / n);
++                std::fill(std::begin(sum), std::end(sum), 0.0);
++                n = 0;
++            }
++            t_end_prev = on && !finished ? t_end : 0;
++            on = false;
++            finished = false;
++            t_token = 0;
++        }
++    } abyss_stats;
++
+     void update_slots() {
+ #ifdef DEBUG_TIMINGS
+         static int64_t t_prev = 0;
+@@ -3264,6 +3329,7 @@ private:
+             }
+         }
+ 
++        abyss_stats.mark(abyss_stats.t_start);
+         try {
+             scoped_timer t(t_pre_decode, n_pre_decode);
+             pre_decode();
+@@ -3277,6 +3343,10 @@ private:
+ 
+         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+ 
++        abyss_stats.mark(abyss_stats.t_pre);
++        abyss_stats.on = batch.size() == 1 && batch.slot_batched && batch.slot_batched->state == SLOT_STATE_GENERATING &&
++            !batch.slot_batched->can_speculate();
++
+         if (batch.slot_batched) {
+             auto & slot_batched      = batch.slot_batched;
+             auto & alora_scale       = batch.alora_scale;
+@@ -3335,6 +3405,7 @@ private:
+                 break; // stop any further processing
+             }
+         }
++        abyss_stats.end_step();
+     }
+ 
+ 
+@@ -4321,11 +4392,16 @@ private:
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
+-            ret = reserve_prompt_graph(off) ? llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()) : -2;
++            const bool reserved = reserve_prompt_graph(off);
++            abyss_stats.mark(abyss_stats.t_proc0);
++            ret = reserved ? llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()) : -2;
++            abyss_stats.mark(abyss_stats.t_proc1);
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
++            abyss_stats.mark(abyss_stats.t_sync);
+         });
++        abyss_stats.mark(abyss_stats.t_yield);
+ 
+         if (ret != 0) {
+             {
+@@ -4502,14 +4578,17 @@ private:
+             const int tok_idx = slot.i_batch - off;
+ 
+             llama_token id;
++            abyss_stats.mark(abyss_stats.t_smpl0);
+             {
+                 scoped_timer timer(t_sampl, n_sampl);
+                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+             }
++            abyss_stats.mark(abyss_stats.t_smpl1);
+ 
+             slot.i_batch = -1;
+ 
+             common_sampler_accept(slot.smpl.get(), id, true);
++            abyss_stats.mark(abyss_stats.t_accept);
+ 
+             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+             const int64_t t_now = ggml_time_us();
+@@ -4533,7 +4612,10 @@ private:
+                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+             }
+ 
+-            if (!process_token(result, slot)) {
++            const bool keep = process_token(result, slot);
++            abyss_stats.mark(abyss_stats.t_token);
++            abyss_stats.finished = !keep;
++            if (!keep) {
+                 // release slot because of stop condition
+                 slot.print_timings();
+                 send_final_response(slot);
+-- 
+2.43.0
+
