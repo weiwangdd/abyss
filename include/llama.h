@@ -1467,6 +1467,12 @@ extern "C" {
     // the total number of samplers in the chain
     LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
+    // abyss: with ABYSS_SAMPLE_FAST=1, the token the chain samples from the n_vocab logits of one output, taken from
+    // the logits themselves when the chain reduces to a dist (with ABYSS_DIST_VEC=1) or greedy sampler over them, all
+    // the samplers before it leaving the candidates as they are; the same token as applying the chain to those
+    // candidates, without building them or writing their probabilities. LLAMA_TOKEN_NULL when the chain does more
+    LLAMA_API llama_token            llama_sampler_chain_sample_logits(struct llama_sampler * chain, const float * logits, int32_t n_vocab);
+
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
 

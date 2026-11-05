@@ -4511,3 +4511,128 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
 }
+
+// abyss: ABYSS_SAMPLE_FAST, see llama_sampler_chain_sample_logits
+
+// a temperature of 0 keeps the first of the highest logits, the one greedy picks too
+static bool abyss_sampler_is_zero_temp(const struct llama_sampler * smpl) {
+    if (smpl->iface == &llama_sampler_temp_i) {
+        return ((const llama_sampler_temp *) smpl->ctx)->temp <= 0.0f;
+    }
+    if (smpl->iface == &llama_sampler_temp_ext_i) {
+        const auto * ctx = (const llama_sampler_temp_ext *) smpl->ctx;
+        return ctx->delta <= 0.0f && ctx->temp <= 0.0f;
+    }
+    return false;
+}
+
+// the largest of x[0..n) as std::max takes it, one at a time from x[0] (so a NaN only when x[0] is one), in sixteen
+// lanes so that the loop vectorizes; a 0 may come out with the other sign
+__attribute__((target_clones("avx512f", "avx2", "default")))
+static float abyss_max_logit(const float * x, size_t n) {
+    float m[16];
+    for (int j = 0; j < 16; ++j) {
+        m[j] = x[0];
+    }
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        for (int j = 0; j < 16; ++j) {
+            m[j] = m[j] < x[i + j] ? x[i + j] : m[j];
+        }
+    }
+    for (; i < n; ++i) {
+        m[0] = m[0] < x[i] ? x[i] : m[0];
+    }
+    float r = m[0];
+    for (int j = 1; j < 16; ++j) {
+        r = r < m[j] ? m[j] : r;
+    }
+    return r;
+}
+
+llama_token llama_sampler_chain_sample_logits(struct llama_sampler * smpl, const float * logits, int32_t n_vocab) {
+    static const bool fast = [] {
+        const char * e = getenv("ABYSS_SAMPLE_FAST");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const bool dist_vec = [] {
+        const char * e = getenv("ABYSS_DIST_VEC");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!fast || smpl == nullptr || smpl->iface != &llama_sampler_chain_i || logits == nullptr || n_vocab < 2) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+    if (chain->is_init || chain->samplers.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const llama_sampler * last = chain->samplers.back().ptr;
+    const bool greedy = last->iface == &llama_sampler_greedy_i;
+    if (!greedy && !(last->iface == &llama_sampler_dist_i && dist_vec)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // the init functions make the samplers whose settings leave the candidates as they are (a top-k of 0, a top-p of
+    // 1, a temperature of 1, the penalties off, ...) empty ones
+    for (size_t k = 0; k + 1 < chain->samplers.size(); ++k) {
+        const llama_sampler * s = chain->samplers[k].ptr;
+        if (s->iface->apply == nullptr || s->iface == &llama_sampler_empty_i || (greedy && abyss_sampler_is_zero_temp(s))) {
+            continue;
+        }
+        return LLAMA_TOKEN_NULL;
+    }
+
+    time_meas tm(chain->t_sample_us, chain->params.no_perf);
+
+    // the candidates would be the logits in token order, so a candidate's index is its token
+    const float max_l = abyss_max_logit(logits, n_vocab);
+    if (greedy) {
+        // the first of the highest, or the first token when its logit is a NaN, as greedy picks them
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (logits[i] == max_l) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    // the dist sampler with ABYSS_DIST_VEC, over the logits instead of a copy of them as candidates, and without
+    // writing the probabilities back to the candidates; a max of 0 with the other sign leaves every exp(x - max) as it is
+    auto * ctx = (llama_sampler_dist *) last->ctx;
+    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+
+    const size_t n  = n_vocab;
+    const size_t nb = (n + abyss_dist_block - 1)/abyss_dist_block;
+    ctx->vec_p.resize(n);
+    ctx->vec_bsum.resize(nb);
+    float  * p    = ctx->vec_p.data();
+    double * bsum = ctx->vec_bsum.data();
+    for (size_t i = 0; i < n; ++i) {
+        p[i] = logits[i] - max_l;
+    }
+    abyss_dist_exp(p, n, bsum);
+
+    double sum_cum = 0.0;
+    for (size_t b = 0; b < nb; ++b) {
+        sum_cum += bsum[b];
+    }
+
+    const double rnd     = dist(ctx->rng);
+    const double sum_tgt = sum_cum*rnd;
+
+    double sum_run = 0.0;
+    size_t b = 0;
+    while (b + 1 < nb && sum_run + bsum[b] < sum_tgt) {
+        sum_run += bsum[b];
+        ++b;
+    }
+    size_t selected = n - 1;
+    for (size_t i = b*abyss_dist_block; i < n; ++i) {
+        sum_run += p[i];
+        if (sum_run >= sum_tgt) {
+            selected = i;
+            break;
+        }
+    }
+    return (llama_token) selected;
+}

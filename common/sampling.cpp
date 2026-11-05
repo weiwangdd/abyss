@@ -687,6 +687,56 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+llama_token common_sampler_sample_fast(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    // the reasoning budget changes the logits only while it forces its tokens
+    if (gsmpl->params.n_probs == 0 && common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING) {
+        llama_synchronize(ctx);
+
+        if (llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL && llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
+                llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+            const auto tm = gsmpl->tm();
+
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            llama_token id = llama_sampler_chain_sample_logits(gsmpl->chain, llama_get_logits_ith(ctx, idx), llama_vocab_n_tokens(vocab));
+            if (id != LLAMA_TOKEN_NULL) {
+                gsmpl->cur_p = { gsmpl->cur.data(), 0, -1, false };
+
+                if (!grammar_should_apply(gsmpl)) {
+                    return id;
+                }
+
+                // the grammar check of the sampled token, as in common_sampler_sample
+                llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+                llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+                llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+                if (single_token_data_array.data[0].logit != -INFINITY) {
+                    return id;
+                }
+
+                // and its resampling: the grammar constraints first, then the chain
+                auto & cur_p = gsmpl->cur_p;
+                gsmpl->set_logits(ctx, idx);
+
+                llama_sampler_apply(gsmpl->rbudget, &cur_p);
+
+                if (grammar_should_apply(gsmpl)) {
+                    llama_sampler_apply(gsmpl->grmr, &cur_p);
+                }
+
+                llama_sampler_apply(gsmpl->chain, &cur_p);
+
+                GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+                return cur_p.data[cur_p.selected].id;
+            }
+        }
+    }
+
+    return common_sampler_sample(gsmpl, ctx, idx, false);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 

@@ -67,6 +67,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// abyss: common_sampler_sample(gsmpl, ctx, idx) that, with ABYSS_SAMPLE_FAST=1, samples from the logits directly when no
+// probabilities are wanted, the reasoning budget is not forcing a token and the chain reduces to a dist or greedy
+// sampler (llama_sampler_chain_sample_logits); the grammar check of the token and the resampling stay as they are.
+// The candidates (common_sampler_get_candidates) are then empty
+llama_token common_sampler_sample_fast(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
