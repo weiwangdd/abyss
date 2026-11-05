@@ -1,5 +1,5 @@
 #!/bin/bash
-# An nsys profile of a decode turn with the settings of ~/abyss-stats/restart.sh as of mx-llama.cpp/0032 (decode_modes.sh
+# An nsys profile of a decode turn with the settings of ~/abyss-stats/restart.sh as of mx-llama.cpp/0035 (decode_modes.sh
 # CAPTURE=1, the last turn of an append-only session of REPEAT corpus copies), read with nsys_layers.py (the cached
 # layers: GPU1 busy, the host waiting, the host computing), nsys_layer.py (where both GPUs wait, and one layer's
 # timeline), nsys_streams.py (GPU1's copies against its kernels) and nsys_kernels.py (the kernels by their own time).
@@ -45,7 +45,7 @@ gpus_free
   export GOMP_SPINCOUNT=100000000 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1
   export ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1
   export ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1
-  export ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1
+  export ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1
   export ABYSS_EXPERT_STATS=$O/expert-stats.json
   for kv in ${EXTRA_ENV:-}; do
     export "$kv"

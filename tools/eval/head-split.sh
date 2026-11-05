@@ -31,7 +31,7 @@ if [ -n "$pid" ]; then
 fi
 
 # with production stopped, neither script stops or restarts it
-OUT=$O BUILD=$B CONFIGS="off:ABYSS_SERVER_STATS=1000 split:ABYSS_SERVER_STATS=1000,ABYSS_HEAD_SPLIT=$F" "$E/cache-gate.sh"
+OUT=$O BUILD=$B CONFIGS="off:ABYSS_SERVER_STATS=1000,ABYSS_HEAD_SPLIT=0 split:ABYSS_SERVER_STATS=1000,ABYSS_HEAD_SPLIT=$F" "$E/cache-gate.sh"
 for log in "$O"/cache-gate-*/server-*.log; do
   echo "### $(basename "$log" .log): $(grep -a -m1 "ABYSS_HEAD_SPLIT" "$log" | sed 's/^.*abyss: //')"
   grep -a "abyss: server stats" "$log" | grep "request end" | sed 's/^.*= //' | awk -F' [+] ' '
