@@ -6,11 +6,25 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 struct llama_logger_state {
     ggml_log_callback log_callback = llama_log_callback_default;
@@ -19,10 +33,91 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
+// abyss: ABYSS_ENGRAM_KEEPALIVE_MS=N: while single steps decode (rows were prefetched in the last half second), a thread
+// reads 4 KiB at a random place of the file mapped at the first table prefetched, every N ms, with O_DIRECT so the page
+// cache stays as it is. The NVMe drive answers a read in about 75 us after up to 5 ms of idling, but in about 280 us
+// after 10 ms and about 600 us after 15 ms or more, with APST off too; a decode step of about 19 ms reads its cold rows
+// once, at its start, so each of those reads found the drive idle, with both GPUs waiting for the rows.
+static void llama_prefetch_keepalive(const void * addr) {
+#if defined(__linux__)
+    static const int interval_ms = [] {
+        const char * e = getenv("ABYSS_ENGRAM_KEEPALIVE_MS");
+        return e != nullptr ? std::max(0, atoi(e)) : 0;
+    }();
+    if (interval_ms <= 0) {
+        return;
+    }
+    static std::atomic<int64_t> last_us{0};
+    last_us.store(ggml_time_us(), std::memory_order_relaxed);
+
+    static std::once_flag once;
+    std::call_once(once, [addr] {
+        // the file mapped at addr, from the process's maps
+        std::string path;
+        if (FILE * f = fopen("/proc/self/maps", "r")) {
+            char line[4096];
+            while (fgets(line, sizeof(line), f)) {
+                unsigned long lo = 0, hi = 0;
+                int pos = 0;
+                if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %n", &lo, &hi, &pos) >= 2 && pos > 0 &&
+                    (uintptr_t) addr >= lo && (uintptr_t) addr < hi) {
+                    path = line + pos;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
+                        path.pop_back();
+                    }
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        // like the other abyss lines, straight to stderr: the log lines of the library do not reach the server log
+        if (path.empty() || path[0] != '/') {
+            fprintf(stderr, "abyss: ABYSS_ENGRAM_KEEPALIVE_MS: no file is mapped at the prefetched rows, so no reads\n");
+            return;
+        }
+        const int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+        struct stat st = {};
+        if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 8192) {
+            fprintf(stderr, "abyss: ABYSS_ENGRAM_KEEPALIVE_MS: cannot read %s with O_DIRECT, so no reads\n", path.c_str());
+            if (fd >= 0) {
+                close(fd);
+            }
+            return;
+        }
+        fprintf(stderr, "abyss: ABYSS_ENGRAM_KEEPALIVE_MS=%d, while decoding a read of 4 KiB of %s every %d ms\n",
+            interval_ms, path.c_str(), interval_ms);
+        const uint64_t blocks = (uint64_t) st.st_size / 4096;
+        std::thread([fd, blocks] {
+            void * buf = nullptr;
+            if (posix_memalign(&buf, 4096, 4096) != 0) {
+                return;
+            }
+            std::mt19937_64 rng((uint64_t) ggml_time_us());
+            bool warned = false;
+            while (true) {
+                if (ggml_time_us() - last_us.load(std::memory_order_relaxed) > 500000) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    continue;
+                }
+                if (pread(fd, buf, 4096, (off_t) (rng() % blocks * 4096)) < 0 && !warned) {
+                    fprintf(stderr, "abyss: ABYSS_ENGRAM_KEEPALIVE_MS: a read failed: %s\n", strerror(errno));
+                    warned = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+            }
+        }).detach();
+    });
+#else
+    GGML_UNUSED(addr);
+#endif
+}
+
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
     if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
         return;
     }
+
+    llama_prefetch_keepalive(tensor->data);
 
     GGML_ASSERT(ggml_is_matrix(tensor));
 
