@@ -41,6 +41,7 @@
 | `0034-head-split.patch` | 输出层分两卡（`ABYSS_HEAD_SPLIT=F`，生产 0.5）：加载时把输出层前 F 的行复制到另一张 GPU，另建一个绑在输出层缓冲区上的视图表示其余的行；单个输出时两张卡同时算，结果在副本那张卡上拼起来（上下文的建图回调把 concat 放过去），logits 逐位相同。调度器加了 `ggml_backend_sched_set_overlap_gpus`，开了分两卡时打开：没有输入的 GPU 分段接在另一张 GPU 的分段后面时，主机不等那一段；从另一张 GPU 来的输入，先让那张卡的流在 GPU 上等本分段那张卡的事件再拷，主机不等。每 token 约快 0.4 ms，GPU0 多占 631 MiB（见 CLAUDE.md「输出层分两卡」）；不设开关时和原来一样 |
 | `0035-sample-fast.patch` | 采样快路径（`ABYSS_SAMPLE_FAST=1`）：采样链里只剩空采样器（各 init 函数把不改候选的设置做成空采样器）加 dist（要 `ABYSS_DIST_VEC=1`）或贪心（前面可以有温度 0）时，`llama_sampler_chain_sample_logits` 直接在一个输出的 logits 上抽，不建 129,280 项的候选数组、不写回概率，选中的 token 和原路径相同（最大值用 16 路向量化的比较，和 `std::max` 逐个比得到同一个值）；`common_sampler_sample_fast` 在不要概率、推理预算没在强制输出时用它，语法检查和重采样照旧，server 解码单 token 时调用它。要概率、有 logit bias（含 `ignore_eos`）时退回原路径，快路径之后候选数组是空的。温度 1.0 每 token 约省 0.16 ms（见 CLAUDE.md「采样快路径」）；不设开关时和原来一样 |
 | `0036-mmvq-tail-q8-1-pool.patch` | 单列 `mul_mat_vec_q` 的尾部（`ABYSS_MMVQ_TAIL=1`）：整块的 K 循环比单个 warp 多跨 25% 以上时也用 `small_k`（每个线程同时算几行，在途的字节更多，每行的求和顺序不变）；`small_k` 下 MXFP4 和 Q8_0 每块 8 行，MXFP4 从对齐的 32 位字取量化值，结果不变。q8_1 缓存的专用池（`ABYSS_Q8_1_CACHE_LEG=1`，配 `GGML_CUDA_Q8_1_CACHE=1`）：缓存按 FIFO 释放，VMM 池只接受逆序释放，所以给它一个任意顺序释放的 legacy 池。test-backend-ops 加了本模型解码的矩阵乘形状作性能用例。每 token GPU 内核约少 0.33 ms，GPU0 显存峰值多约 110 MiB（见 CLAUDE.md「矩阵乘的尾部与 q8_1 缓存」）；不设开关时和原来一样 |
+| `0037-q8-1-pool-small.patch` | `ABYSS_Q8_1_CACHE_LEG=1` 时，q8_1 缓存只放不超过 128 KiB 的项（几个 token 的矩阵乘激活），在专用池里一律按 128 KiB 分配；预填充的批次大小每次不同，照原来量化。0036 的专用池会给每种大小留一块（测试里每张卡多约 100 MiB；生产开着它一小时后 GPU0 空闲降到约 230 MiB，怀疑与此有关）；有了这个补丁，测试里的显存和关掉缓存一样。没有上线（生产 `GGML_CUDA_Q8_1_CACHE=0`） |
 
 ## 安装
 
@@ -65,7 +66,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0029-dist-vec.patch <abyss>/mx-llama.cpp/0030-moe-cache-gate.patch \
   <abyss>/mx-llama.cpp/0031-moe-defer-upload.patch <abyss>/mx-llama.cpp/0032-hc-gather-fuse.patch \
   <abyss>/mx-llama.cpp/0033-server-stats.patch <abyss>/mx-llama.cpp/0034-head-split.patch \
-  <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch
+  <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch \
+  <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

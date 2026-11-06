@@ -1,0 +1,68 @@
+From 70c1b9d6464853839c55da823475f19e6daa208f Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Fri, 6 Nov 2026 13:17:24 +0100
+Subject: [PATCH] abyss: with ABYSS_Q8_1_CACHE_LEG=1 the q8_1 cache takes only
+ entries of up to 128 KiB, the activations of the matrix-vector products of a
+ few tokens, and allocates them all at that one size from its pool of its own,
+ which keeps what is freed and allocates anew for a size none of its free
+ buffers holds; the batches of a prefill, whose sizes vary from call to call,
+ are quantized as before
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e6f766e..ef990a6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2748,20 +2748,31 @@ char * ggml_cuda_q8_1_cache_acquire(
+ 
+     ctx.q8_1_cache_misses++;
+ 
++    // abyss: ABYSS_Q8_1_CACHE_LEG=1 takes the entries from a pool of their own that frees in any order. That pool
++    // keeps what is freed and allocates anew for a size none of its free buffers holds, so the entries are all one
++    // size there, 128 KiB, and only activations of up to that are cached: those of the matrix-vector products of a few
++    // tokens (8 x 8192 quants are 72 KiB). The batches of a prefill, whose sizes vary from call to call, are quantized
++    // as before: a buffer kept for each of their sizes took about 100 MiB on each GPU over 40 prefills of lengths
++    // between 5,700 and 19,300 tokens
++    static const bool leg = [] {
++        const char * e = getenv("ABYSS_Q8_1_CACHE_LEG");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    constexpr size_t leg_bytes = 128 << 10;
++    if (leg && nbytes > leg_bytes) {
++        return nullptr;
++    }
++    const size_t alloc_bytes = leg ? leg_bytes : nbytes;
++
+     // Drop the oldest entries first, which are the ones furthest from any node
+     // still to be executed and so the least likely to be asked for again.
+     while (ctx.q8_1_cache.size() >= GGML_CUDA_Q8_1_CACHE_MAX_ENTRIES) {
+         ctx.q8_1_cache.erase(ctx.q8_1_cache.begin());
+     }
+ 
+-    // abyss: ABYSS_Q8_1_CACHE_LEG=1 takes the entries from a pool of their own that frees in any order
+-    static const bool leg = [] {
+-        const char * e = getenv("ABYSS_Q8_1_CACHE_LEG");
+-        return e != nullptr && atoi(e) != 0;
+-    }();
+     ggml_backend_cuda_context::q8_1_cache_entry e;
+     e.alloc = std::make_unique<ggml_cuda_pool_alloc<char>>(leg ? ctx.q8_1_pool() : ctx.pool());
+-    e.buf   = e.alloc->try_alloc(nbytes);
++    e.buf   = e.alloc->try_alloc(alloc_bytes);
+ 
+     // A second cached activation is optional. Under memory pressure, release the
+     // least-recent entry and retry instead of turning this optimization into a
+@@ -2774,7 +2785,7 @@ char * ggml_cuda_q8_1_cache_acquire(
+                     "evicting a cached activation and retrying\n", ctx.device);
+             ctx.q8_1_cache_pressure_logged = true;
+         }
+-        e.buf = e.alloc->try_alloc(nbytes);
++        e.buf = e.alloc->try_alloc(alloc_bytes);
+     }
+ 
+     if (!e.buf) {
+-- 
+2.43.0
+

@@ -20,10 +20,10 @@
 # request whose sampling reduces to dist or greedy over the logits, as the defaults do, samples from the logits without
 # building the candidates (ABYSS_SAMPLE_FAST=1, 0035), the same tokens; leaving it out is the fallback. The
 # matrix-vector products whose K loop would leave many threads idle take several rows per block (ABYSS_MMVQ_TAIL=1,
-# 0036), and the q8_1 cache, now with a pool of its own, quantizes an activation once for the products that share it
-# (GGML_CUDA_Q8_1_CACHE=1, ABYSS_Q8_1_CACHE_LEG=1, 0036; GPU0 about 110 MiB more at its peak), the same results;
-# ABYSS_MMVQ_TAIL=0 and GGML_CUDA_Q8_1_CACHE=0 are the fallback (without the pool of its own the cache must stay off:
-# it frees out of order, and the VMM pool asserts).
+# 0036), the same results; ABYSS_MMVQ_TAIL=0 is the fallback. The q8_1 cache stays off (GGML_CUDA_Q8_1_CACHE=0): it
+# frees out of order, which the VMM pool asserts on, and with the pool of its own of 0036 (ABYSS_Q8_1_CACHE_LEG=1)
+# GPU0 had about 290 MiB less free after an hour of production than at the peak measured before, likely from that pool
+# keeping a buffer for each size the prefills asked for.
 # HEAD_Q8=1 runs the copy of the model whose output head is Q8_0 instead of BF16 (tools/convert/retype_tensor.py: about
 # 2% faster per request, top-20 KL about 5e-4, the decode-path PPL the same); off by default.
 set -e
@@ -69,7 +69,7 @@ if [ -f expert-stats.json ]; then
 fi
 [ -f server.log ] && mv server.log "server-$(date +%H%M).log"
 cd ~/src/mx-llama.cpp
-ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=1 ABYSS_Q8_1_CACHE_LEG=1 GGML_CUDA_MMQ_PREC=q8 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
+ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_DSV41_INDEXER=1 \
   ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_DECODE_STATS=100 GOMP_SPINCOUNT=100000000 \
   ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
   ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
