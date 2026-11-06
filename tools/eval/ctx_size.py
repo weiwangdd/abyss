@@ -70,12 +70,14 @@ def main():
             json.dump(r["choices"][0]["logprobs"]["content"][:32], open(sys.argv[4], "w"))
         elif cmd == "compare":
             a, b = (json.load(open(p)) for p in sys.argv[3:5])
+            # by token id, as different tokens can have the same text
+            key = lambda t: t.get("id", t["token"])
             n = min(len(a), len(b))
-            same = next((i for i in range(n) if a[i]["token"] != b[i]["token"]), n)
+            same = next((i for i in range(n) if key(a[i]) != key(b[i])), n)
             kl = []
             for i in range(same):
-                pa = {x["token"]: x["logprob"] for x in a[i]["top_logprobs"]}
-                pb = {x["token"]: x["logprob"] for x in b[i]["top_logprobs"]}
+                pa = {key(x): x["logprob"] for x in a[i]["top_logprobs"]}
+                pb = {key(x): x["logprob"] for x in b[i]["top_logprobs"]}
                 floor = min(pb.values())
                 kl.append(sum(math.exp(lp) * (lp - pb.get(tok, floor)) for tok, lp in pa.items()))
             print(f"identical tokens: first {same} of {n}" +

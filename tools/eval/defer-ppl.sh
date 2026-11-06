@@ -1,6 +1,6 @@
 #!/bin/bash
 # Perplexity of the decode path with the MoE expert deferral (ABYSS_MOE_DEFER=1, mx-llama.cpp/0025) and without, or
-# with any switches: llama-abyss-dump with the production settings (those of mx-llama.cpp/0035) forces, one token at a
+# with any switches: llama-abyss-dump with the production settings (those of mx-llama.cpp/0036) forces, one token at a
 # time after a corpus prompt, the corpus text that follows it and a C++ source of the fork (GEN tokens in all, default
 # 4000), saving each token's NLL, once per entry of CONFIGS ("name:VAR=VALUE,VAR=VALUE", the settings on top of
 # production, BIN=<dir> among them for another build and MODEL=<gguf> for another model; default without and with the
@@ -69,11 +69,11 @@ for c in $CONFIGS; do
   done
   mkdir -p "$O/$name"
   echo "### $name: ${settings:-production} $(date +%T)"
-  env GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 \
+  env GGML_CUDA_Q8_1_CACHE=1 ABYSS_Q8_1_CACHE_LEG=1 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 \
     ABYSS_DSV41_INDEXER=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_ADMIT=0.3 \
     ABYSS_MOE_BIG_SPLIT=1 ABYSS_MOE_BIG_CACHE=1 ABYSS_PLAIN_INPUT=1 ABYSS_DECODE_STATS=100 ABYSS_MOE_DEFER=1 \
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
-    ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 "${extra_env[@]}" \
+    ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 "${extra_env[@]}" \
     ABYSS_DUMP_RE= ABYSS_DUMP_DIR="$O/$name" ABYSS_DUMP_FORCE="$O/force.txt" ABYSS_DUMP_GEN="${GEN:-4000}" \
     "$bin/llama-abyss-dump" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \

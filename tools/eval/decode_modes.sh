@@ -26,7 +26,7 @@ NSYS=()
 [ -n "$CAPTURE" ] && NSYS=(nsys launch --session-new=abyss --trace=cuda,osrt --cuda-graph-trace=node)
 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_ENGRAM_PREFETCH=8 ABYSS_CED_PREFILL=1 ABYSS_DSV41_INDEXER=1 \
   ABYSS_MOE_BIG_SPLIT=${ABYSS_MOE_BIG_SPLIT:-1} ABYSS_CKPT_TAIL_MERGE=${ABYSS_CKPT_TAIL_MERGE:-2700} ABYSS_CED_ALIGN=${ABYSS_CED_ALIGN:-1} \
-  GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 "${NSYS[@]}" "$B/llama-server" -m "$M" \
+  GGML_CUDA_Q8_1_CACHE=${GGML_CUDA_Q8_1_CACHE:-0} GGML_CUDA_MMQ_PREC=q8 "${NSYS[@]}" "$B/llama-server" -m "$M" \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' \
   -c 131072 -b 65536 -ub 2048 -np 1 --moe-cache-mib 14000 \

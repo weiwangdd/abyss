@@ -50,13 +50,16 @@ def run(a):
 
 def compare(a):
     xs, ys = (json.load(open(p)) for p in (a.a, a.b))
+    # by token id: different tokens can have the same text (ids 223 and 11827 are both " "), and keyed by text the
+    # second of them took the place of the first
+    key = lambda t: t.get("id", t["token"])
     kls, rows = [], []
     for i, (x, y) in enumerate(zip(xs, ys)):
         n = min(len(x), len(y))
-        same = next((j for j in range(n) if x[j]["token"] != y[j]["token"]), n)
+        same = next((j for j in range(n) if key(x[j]) != key(y[j])), n)
         for j in range(same):
-            px = {t["token"]: t["logprob"] for t in x[j]["top_logprobs"]}
-            py = {t["token"]: t["logprob"] for t in y[j]["top_logprobs"]}
+            px = {key(t): t["logprob"] for t in x[j]["top_logprobs"]}
+            py = {key(t): t["logprob"] for t in y[j]["top_logprobs"]}
             floor = min(py.values())
             kls.append(sum(math.exp(lp) * (lp - py.get(tok, floor)) for tok, lp in px.items()))
         rows.append(f"{same}/{n}")
