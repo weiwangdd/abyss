@@ -1,0 +1,27 @@
+// The pages of the two Engram tables that enter the page cache, that is, are read from the disk: their count per
+// 10 ms of the boot clock, printed every 10 s, for engram_pagecache.py to set against the decode steps of a server
+// log. Runs until stopped (SIGINT) or for 12 hours; the tracepoint fires only on page cache insertions, so it costs
+// nothing while the tables are not read.
+//
+//     sudo bpftrace -q engram-pagecache.bt <inode of one table's file> <inode of the other's> > engram-pagecache.log
+BEGIN
+{
+	printf("start %llu %s\n", nsecs, strftime("%Y-%m-%d %H:%M:%S.%f", nsecs));
+}
+
+tracepoint:filemap:mm_filemap_add_to_page_cache
+/args->i_ino == $1 || args->i_ino == $2/
+{
+	@pages[nsecs / 10000000] = count();
+}
+
+interval:s:10
+{
+	print(@pages);
+	clear(@pages);
+}
+
+interval:s:43200
+{
+	exit();
+}
