@@ -7,7 +7,8 @@ prompt cache keeps the conversation and the expert cache sees new text each time
 one of the modes, round robin: greedy or the server's default sampling, streamed or not. The server log's eval time
 of each request is the decode speed (decode_modes.sh reads it). The turns ignore the end of generation, so a sampled
 answer that makes a tool call can leave the tool-call grammar nothing to accept (the server answers 500); such a turn
-is left out of the conversation and the next one goes on.
+is left out of the conversation and the next one goes on. --seed S samples turn t with the seed S + t, so two servers
+whose logits are the same bit for bit hold the same conversation (and their expert caches the same experts).
 """
 
 import argparse
@@ -63,6 +64,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--modes", default=",".join(MODES))
     ap.add_argument("--capture", help="nsys report of the last turn")
+    ap.add_argument("--seed", type=int, help="sample turn t with seed SEED + t (default: the server picks one)")
     args = ap.parse_args()
 
     corpus = open(args.corpus, encoding="utf-8").read()
@@ -84,6 +86,8 @@ def main():
         messages.append({"role": "user", "content": QUESTIONS[turn % len(QUESTIONS)].format(turn + 1)})
         body = {"messages": messages, "tools": TOOLS, "max_tokens": args.max_tokens, "cache_prompt": True,
                 "ignore_eos": True, **MODES[mode]}
+        if args.seed is not None:
+            body["seed"] = args.seed + turn
         if capture:
             subprocess.run(["nsys", "start", "--session=abyss", f"--output={args.capture}", "--force-overwrite=true"],
                            check=True)

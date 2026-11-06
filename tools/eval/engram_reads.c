@@ -6,7 +6,7 @@
 // the rows not resident before each read.
 //
 // With "idle" after the six table arguments it instead reads one row the page cache does not hold after the disk was idle
-// for 20 ms to 3 s (5 times each), to see what a power state of the NVMe costs the first read after a pause.
+// for 1 ms to 3 s (5 times each), to see what a power state of the NVMe costs the first read after a pause.
 //
 //     gcc -O2 -pthread -o engram_reads engram_reads.c
 //     ./engram_reads <shard> <offset> <rows> <shard> <offset> <rows> [iterations, default 30]
@@ -140,7 +140,7 @@ int main(int argc, char ** argv) {
     }
     rng ^= (uint64_t) now_us();
     if (argc > 7 && strcmp(argv[7], "idle") == 0) {
-        const int idle_ms[] = { 20, 50, 90, 110, 150, 300, 1000, 3000 };
+        const int idle_ms[] = { 1, 2, 5, 10, 15, 20, 30, 50, 90, 110, 150, 300, 1000, 3000 };
         for (size_t k = 0; k < sizeof(idle_ms)/sizeof(idle_ms[0]); k++) {
             double t[5];
             for (int r = 0; r < 5; r++) {

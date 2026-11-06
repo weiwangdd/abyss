@@ -42,6 +42,8 @@
 | `0035-sample-fast.patch` | 采样快路径（`ABYSS_SAMPLE_FAST=1`）：采样链里只剩空采样器（各 init 函数把不改候选的设置做成空采样器）加 dist（要 `ABYSS_DIST_VEC=1`）或贪心（前面可以有温度 0）时，`llama_sampler_chain_sample_logits` 直接在一个输出的 logits 上抽，不建 129,280 项的候选数组、不写回概率，选中的 token 和原路径相同（最大值用 16 路向量化的比较，和 `std::max` 逐个比得到同一个值）；`common_sampler_sample_fast` 在不要概率、推理预算没在强制输出时用它，语法检查和重采样照旧，server 解码单 token 时调用它。要概率、有 logit bias（含 `ignore_eos`）时退回原路径，快路径之后候选数组是空的。温度 1.0 每 token 约省 0.16 ms（见 CLAUDE.md「采样快路径」）；不设开关时和原来一样 |
 | `0036-mmvq-tail-q8-1-pool.patch` | 单列 `mul_mat_vec_q` 的尾部（`ABYSS_MMVQ_TAIL=1`）：整块的 K 循环比单个 warp 多跨 25% 以上时也用 `small_k`（每个线程同时算几行，在途的字节更多，每行的求和顺序不变）；`small_k` 下 MXFP4 和 Q8_0 每块 8 行，MXFP4 从对齐的 32 位字取量化值，结果不变。q8_1 缓存的专用池（`ABYSS_Q8_1_CACHE_LEG=1`，配 `GGML_CUDA_Q8_1_CACHE=1`）：缓存按 FIFO 释放，VMM 池只接受逆序释放，所以给它一个任意顺序释放的 legacy 池。test-backend-ops 加了本模型解码的矩阵乘形状作性能用例。每 token GPU 内核约少 0.33 ms，GPU0 显存峰值多约 110 MiB（见 CLAUDE.md「矩阵乘的尾部与 q8_1 缓存」）；不设开关时和原来一样 |
 | `0037-q8-1-pool-small.patch` | `ABYSS_Q8_1_CACHE_LEG=1` 时，q8_1 缓存只放不超过 128 KiB 的项（几个 token 的矩阵乘激活），在专用池里一律按 128 KiB 分配；预填充的批次大小每次不同，照原来量化。0036 的专用池会给每种大小留一块（测试里每张卡多约 100 MiB；生产开着它一小时后 GPU0 空闲降到约 230 MiB，怀疑与此有关）；有了这个补丁，测试里的显存和关掉缓存一样。没有上线（生产 `GGML_CUDA_Q8_1_CACHE=0`） |
+| `0038-graph-chunk.patch` | CUDA graph 分两段启动（`ABYSS_GRAPH_CHUNK=N`）：超过 4N 个节点的图在第 N 个节点之后、第一个单独计算的节点（或融合组的第一个）之前切成两张 CUDA graph，依次启动。一张图要等启动调用返回才开始跑，GPU0 第 0–11 层、GPU1 第 13–21 层这两张 400 多个内核的大图每次启动 150–170 µs，两卡都在空等；切开后第一段跑的时候发第二段。第二段放在图缓存里由图的键派生的键下，结果不变。生产用 128，会话约快 1%（见 CLAUDE.md「CUDA graph 的启动」）；不设开关时和原来一样 |
+| `0039-engram-keepalive.patch` | 解码时的 NVMe 保活（`ABYSS_ENGRAM_KEEPALIVE_MS=N`）：单 token 解码期间，后台线程每 N ms 用 O_DIRECT 读一次 Engram 表所在文件的随机 4 KiB（文件从 `/proc/self/maps` 找，不经页缓存）。9100 PRO 空闲 15 ms 以上后首读约 600 µs、5 ms 以内约 75 µs，冷的 Engram 行每 token 只在开头读一次，每次都撞上慢的那档。生产用 4，会话约快 1%，输出不变（见 CLAUDE.md「解码时的 NVMe 保活」）；不设开关时和原来一样 |
 
 ## 安装
 
@@ -67,7 +69,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0031-moe-defer-upload.patch <abyss>/mx-llama.cpp/0032-hc-gather-fuse.patch \
   <abyss>/mx-llama.cpp/0033-server-stats.patch <abyss>/mx-llama.cpp/0034-head-split.patch \
   <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch \
-  <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch
+  <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch <abyss>/mx-llama.cpp/0038-graph-chunk.patch \
+  <abyss>/mx-llama.cpp/0039-engram-keepalive.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

@@ -23,7 +23,12 @@
 # 0036), the same results; ABYSS_MMVQ_TAIL=0 is the fallback. The q8_1 cache stays off (GGML_CUDA_Q8_1_CACHE=0): it
 # frees out of order, which the VMM pool asserts on, and with the pool of its own of 0036 (ABYSS_Q8_1_CACHE_LEG=1)
 # GPU0 had about 290 MiB less free after an hour of production than at the peak measured before, likely from that pool
-# keeping a buffer for each size the prefills asked for.
+# keeping a buffer for each size the prefills asked for. A CUDA graph of more than 512 nodes, the run of layers each
+# GPU decodes in one go, is captured and launched as two, so the GPU starts on the first part while the rest is
+# launched (ABYSS_GRAPH_CHUNK=128, 0038), the same results; leaving it out is the fallback. While single steps decode,
+# a thread reads 4 KiB of the Engram file every 4 ms, so the NVMe drive does not idle into its slow first read (about
+# 600 us after 15 ms, 75 us within 5 ms) when a step's cold Engram rows come in (ABYSS_ENGRAM_KEEPALIVE_MS=4, 0039),
+# the same results; leaving it out is the fallback.
 # HEAD_Q8=1 runs the copy of the model whose output head is Q8_0 instead of BF16 (tools/convert/retype_tensor.py: about
 # 2% faster per request, top-20 KL about 5e-4, the decode-path PPL the same); off by default.
 set -e
@@ -73,7 +78,8 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_DECODE_STATS=100 GOMP_SPINCOUNT=100000000 \
   ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
   ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
-  ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 \
+  ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 ABYSS_GRAPH_CHUNK=128 \
+  ABYSS_ENGRAM_KEEPALIVE_MS=4 \
   nohup ./build-m2/bin/llama-server \
   -m $model/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \

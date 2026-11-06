@@ -3,15 +3,17 @@
 # heat, ABYSS_MOE_ADMIT_GATE=1 admits a miss only if hotter than it, ABYSS_MOE_SKIP_ZERO=1 lets the CPU's experts of a
 # token read no zero slot) against the production plan, and later switches the same way (0031: ABYSS_MOE_DEFER_UPLOAD=1
 # defers a token's uploaded experts with the CPU's; 0032: ABYSS_HC_FUSE=1, ABYSS_GATHER_FUSE=1 fuse kernels), on servers
-# with the production settings (now those of 0036, so VAR=0 turns a switch of them off), one per entry of CONFIGS
+# with the production settings (now those of 0039, so VAR=0 turns a switch of them off), one per entry of CONFIGS
 # ("name:VAR=VALUE,VAR=VALUE", the settings on top of those; an entry without them is production; BIN=<dir> among them
 # runs that entry's server from another build, MODEL=<gguf> on another model, T=<n> with n CPU threads instead of 16):
 # greedy_kl.py on PROMPTS corpus slices of 128 greedy tokens each and the 96k prompt of ctx_size.py with its 32 greedy
 # tokens, compared with the first entry's (a cache that admits other experts gives the CPU other experts, whose sums
 # round differently; the zero slots alone change nothing), and the append-only session of decode_modes.py (REPEAT
-# corpus copies, ROUNDS turns per mode), whose decode speed per turn and decode stats are summed up per entry. BUILD
-# picks the binaries (default build-pf). Waits for the production server to go idle, saves its slot and stops it, and
-# restarts it at the end (~/abyss-stats/restart.sh restores the slot).
+# corpus copies, ROUNDS turns per mode; SEED fixes the sampled turns' seeds, so entries whose logits are the same bit
+# for bit hold the same conversation; DROP_CACHE=1 drops the model files from the page cache before each entry, so the
+# Engram rows of that conversation are as cold in every entry), whose decode speed per turn and decode stats are summed
+# up per entry. BUILD picks the binaries (default build-pf). Waits for the production server to go idle, saves its slot
+# and stops it, and restarts it at the end (~/abyss-stats/restart.sh restores the slot).
 set -u
 E=$(cd "$(dirname "$0")" && pwd)
 O=${OUT:-$HOME/abyss-eval}/cache-gate-$(date +%m%d-%H%M)
@@ -74,12 +76,20 @@ for c in $CONFIGS; do
   done
   log=$O/server-$name.log
   echo "### $name: ${settings:-production} $(date +%T)"
+  if [ -n "${DROP_CACHE:-}" ]; then
+    # every entry starts with none of the model's mapped pages (the Engram tables) in the page cache, so a seeded
+    # session finds the rows of its text cold in each entry, not only in the first
+    python3 -I -c 'import os, sys
+for p in sys.argv[1:]:
+    fd = os.open(p, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' "$(dirname "$model")"/*.gguf
+  fi
   env GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1 ABYSS_ENGRAM_PREFETCH=8 \
     ABYSS_DSV41_INDEXER=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_DSV41_DECODE_GATHER=1 ABYSS_MOE_CPU_MISS=1 ABYSS_MOE_BIG_SPLIT=1 \
     ABYSS_MOE_BIG_CACHE=1 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CED_ALIGN=1 ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 \
     ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_DEFER=1 ABYSS_EXPERT_STATS="$O/stats-$name.json" \
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 \
-    ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 "${extra_env[@]}" \
+    ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 \
+    ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 "${extra_env[@]}" \
     "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t "$threads" \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
     -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 --checkpoint-min-step 32768 \
@@ -96,7 +106,8 @@ for c in $CONFIGS; do
       --prompts "${PROMPTS:-8}" | tail -2
     CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" same "$O/same-$name.json"
     DECODE_URL=http://127.0.0.1:$PORT python3 -I "$E/decode_modes.py" "$E/corpus.txt" --repeat "${REPEAT:-6}" \
-      --rounds "${ROUNDS:-3}" --max-tokens 256 > "$O/session-$name.txt" 2>&1 || echo "  session failed, see $O/session-$name.txt"
+      --rounds "${ROUNDS:-3}" --max-tokens 256 ${SEED:+--seed "$SEED"} > "$O/session-$name.txt" 2>&1 ||
+      echo "  session failed, see $O/session-$name.txt"
     kill -TERM $spid 2>/dev/null
     for i in $(seq 60); do kill -0 $spid 2>/dev/null || break; sleep 1; done
     kill -0 $spid 2>/dev/null && kill -TERM $spid

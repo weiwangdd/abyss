@@ -1,0 +1,188 @@
+From 3016bf64a3c85c3e061dd107e4a29dc1ba3661bb Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Fri, 6 Nov 2026 14:41:51 +0100
+Subject: [PATCH] abyss: ABYSS_GRAPH_CHUNK=N captures a graph of more than 4N
+ nodes as two CUDA graphs, cut before the first node from node N on that the
+ evaluation loop computes alone or as the first of a fused group, and launches
+ them one after the other: a CUDA graph starts running only once its launch
+ returns, which for the 400-odd kernels of layers 0-11 on GPU0 and of layers
+ 13-21 on GPU1 takes 0.13-0.17 ms with both GPUs idle, and the first part now
+ runs while the rest is launched; the second part lives in the graph cache
+ under a key derived from the graph's own (ggml_cuda_graph_chunk_key), the
+ graph's entry counts its parts (n_chunks), and a reuse launches each of them,
+ capturing anew when any lacks an executable
+
+---
+ ggml/src/ggml-cuda/common.cuh   |  3 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 92 ++++++++++++++++++++++++++++-----
+ 2 files changed, 82 insertions(+), 13 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d270f86..012135d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1313,6 +1313,9 @@ struct ggml_cuda_graph {
+     int n_prop_checks = 0;
+     int n_prop_resets = 0;
+     bool unstable_disabled = false;
++    // abyss: the CUDA graphs ABYSS_GRAPH_CHUNK captured this graph as (0 or 1: one, this entry's own); the others are
++    // the entries under ggml_cuda_graph_chunk_key
++    int n_chunks = 0;
+     struct node_properties {
+         ggml_tensor node;
+         void *   node_src_data_ptrs[GGML_MAX_SRC];
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ef990a6..f374d3c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3835,6 +3835,34 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     return (const void *) h;
+ }
+ 
++// abyss: ABYSS_GRAPH_CHUNK=N captures a graph of more than 4N nodes as two CUDA graphs, cut before the first node from
++// node N on that the loop computes (alone or as the first of a fused group), and launches them one after the other. A
++// CUDA graph starts running only once its launch returns, which for the few hundred kernels of a run of layers takes
++// 0.1-0.2 ms with the GPU idle; the first part starts it, and runs while the rest is launched. Each cut costs the GPU
++// a few microseconds between the two graphs, so smaller graphs stay whole.
++static int ggml_cuda_graph_chunk_nodes() {
++    static const int n = [] {
++        const char * e = getenv("ABYSS_GRAPH_CHUNK");
++        return e != nullptr ? std::max(0, atoi(e)) : 0;
++    }();
++    return n;
++}
++
++static const void * ggml_cuda_graph_chunk_key(const void * graph_key, int chunk) {
++    return chunk == 0 ? graph_key : (const void *) ((uintptr_t) graph_key ^ (uintptr_t) chunk * (uintptr_t) 0x94D049BB133111EBull);
++}
++
++// abyss: whether every CUDA graph of a graph's chunks has an executable to launch
++static bool ggml_cuda_graph_chunks_ready(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++    const int n_chunks = std::max(1, cuda_ctx->cuda_graph(graph_key)->n_chunks);
++    for (int c = 0; c < n_chunks; c++) {
++        if (cuda_ctx->cuda_graph(ggml_cuda_graph_chunk_key(graph_key, c))->instance == nullptr) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+     bool res = false;
+ 
+@@ -6014,6 +6042,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+     bool                         should_launch_concurrent_events = false;
+ 
++#ifdef USE_CUDA_GRAPH
++    // abyss: ABYSS_GRAPH_CHUNK, the node where the capture ends its CUDA graph and begins the next one
++    const int chunk_nodes = use_cuda_graph && cuda_graph_update_required ? ggml_cuda_graph_chunk_nodes() : 0;
++    int chunk_next = chunk_nodes > 0 && cgraph->n_nodes > 4*chunk_nodes ? chunk_nodes : INT_MAX;
++    int n_chunks   = 0; // the CUDA graphs captured before the current one
++#endif
++
+     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
+         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
+             concurrent_event = &stream_ctx.concurrent_events[node];
+@@ -6103,6 +6138,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
++#ifdef USE_CUDA_GRAPH
++                if (i >= chunk_next && !is_concurrent_event_active) {
++                    // abyss: ABYSS_GRAPH_CHUNK, the CUDA graph so far is a chunk of its own, the rest goes to the next
++                    ggml_cuda_graph * chunk = cuda_ctx->cuda_graph(ggml_cuda_graph_chunk_key(graph_key, n_chunks));
++                    if (chunk->graph != nullptr) {
++                        CUDA_CHECK(cudaGraphDestroy(chunk->graph));
++                        chunk->graph = nullptr;
++                    }
++                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &chunk->graph));
++                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
++                    n_chunks++;
++                    chunk_next = INT_MAX;
++                }
++#endif
+                 if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+@@ -6207,12 +6256,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #ifdef USE_CUDA_GRAPH
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+-            if (graph->graph != nullptr) {
+-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+-                graph->graph = nullptr;
++            // abyss: into the last of the chunks of ABYSS_GRAPH_CHUNK, which is the graph's own entry without them
++            ggml_cuda_graph * last = cuda_ctx->cuda_graph(ggml_cuda_graph_chunk_key(graph_key, n_chunks));
++            if (last->graph != nullptr) {
++                CUDA_CHECK(cudaGraphDestroy(last->graph));
++                last->graph = nullptr;
+             }
+ 
+-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
++            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &last->graph));
++            graph->n_chunks = n_chunks + 1;
++            if (n_chunks > 0) {
++                GGML_LOG_DEBUG("%s: graph of %d nodes captured as %d CUDA graphs\n", __func__, cgraph->n_nodes, n_chunks + 1);
++            }
+             graph_evaluated_or_captured = true; // CUDA graph has been captured
+ 
+             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+@@ -6226,18 +6281,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+     if (use_cuda_graph) {
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
++        // abyss: each of the CUDA graphs of ABYSS_GRAPH_CHUNK, or the one of the graph's own entry
++        const int n_graphs = std::max(1, graph->n_chunks);
+         bool graph_ready = true;
+-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+-            graph_ready = ggml_cuda_graph_try_instantiate(graph);
+-        } else if (cuda_graph_update_required) { // Update graph executable
+-            graph_ready = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
++        for (int c = 0; c < n_graphs && graph_ready; c++) {
++            const void * key = ggml_cuda_graph_chunk_key(graph_key, c);
++            ggml_cuda_graph * chunk = cuda_ctx->cuda_graph(key);
++            if (chunk->instance == nullptr) { // Create executable graph from captured graph.
++                graph_ready = ggml_cuda_graph_try_instantiate(chunk);
++            } else if (cuda_graph_update_required) { // Update graph executable
++                graph_ready = ggml_cuda_graph_update_executable(cuda_ctx, key);
++            }
+         }
+         if (!graph_ready) {
+             GGML_LOG_WARN("%s: device %d graph executable did not fit, using direct execution for this graph\n",
+                     __func__, cuda_ctx->device);
+-            if (graph->graph != nullptr) {
+-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+-                graph->graph = nullptr;
++            for (int c = 0; c < n_graphs; c++) {
++                ggml_cuda_graph * chunk = cuda_ctx->cuda_graph(ggml_cuda_graph_chunk_key(graph_key, c));
++                if (chunk->graph != nullptr) {
++                    CUDA_CHECK(cudaGraphDestroy(chunk->graph));
++                    chunk->graph = nullptr;
++                }
+             }
+             graph->disable_due_to_memory = true;
+ 
+@@ -6249,7 +6313,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             return;
+         }
+         // Launch graph
+-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
++        for (int c = 0; c < n_graphs; c++) {
++            CUDA_CHECK(cudaGraphLaunch(cuda_ctx->cuda_graph(ggml_cuda_graph_chunk_key(graph_key, c))->instance, cuda_ctx->stream()));
++        }
+ #else
+         GGML_UNUSED(graph_key);
+         graph_evaluated_or_captured = true;
+@@ -6341,7 +6407,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                 } else {
+                     use_cuda_graph = true;
+-                    cuda_graph_update_required = graph->instance == nullptr;
++                    cuda_graph_update_required = !ggml_cuda_graph_chunks_ready(cuda_ctx, graph_key);
+                 }
+             }
+         }
+-- 
+2.43.0
+
