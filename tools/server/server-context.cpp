@@ -318,6 +318,11 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
+    // abyss: the checkpoints made in the current task's answer (ABYSS_GEN_CKPT): their spacing, number and time
+    int64_t gen_ckpt_step = 0;
+    int32_t n_gen_ckpt    = 0;
+    int64_t t_gen_ckpt_us = 0;
+
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
@@ -452,6 +457,10 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        gen_ckpt_step = 0;
+        n_gen_ckpt    = 0;
+        t_gen_ckpt_us = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -779,6 +788,9 @@ struct server_slot {
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
+        if (n_gen_ckpt > 0) {
+            SLT_INF(*this, "abyss: %d checkpoints in the answer, %.2f ms\n", n_gen_ckpt, t_gen_ckpt_us / 1e3);
+        }
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
@@ -1437,6 +1449,14 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        // abyss: ABYSS_CKPT_CONTINUE=1 takes the window of a DeepSeek V4.1 checkpoint as 0, as for V4 (see
+        // server_prompt_cache::ckpt_window). With its sliding window as the margin of pos_min_thold, a prompt that
+        // extends the whole slot went back to the newest checkpoint before the slot's end instead of continuing from
+        // there, so each turn of a conversation computed the last answer again
+        if (server_prompt_cache::ckpt_window(ctx_tgt) == 0) {
+            n_swa = 0;
+        }
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -2836,6 +2856,75 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // abyss: ABYSS_GEN_CKPT=N also makes a checkpoint every N generated tokens, before the sampled token goes into the
+    // batch, when the memory holds the prompt and the tokens generated before it, as before a prompt batch. The next
+    // turn of a conversation renders the answer again and can leave the generated tokens before their end (a tool
+    // call's arguments written back another way, another tokenization of the same text); the slot then went back to
+    // the checkpoint at the end of the last prompt and computed the whole answer again. ABYSS_GEN_CKPT_KEEP=M (default
+    // 8) of a task's checkpoints in its answer are kept: once there are M, every other one goes and the spacing doubles,
+    // so they spread over the whole answer. The request's timings print how many were made and their time
+    void create_gen_checkpoint(server_slot & slot) {
+        static const int64_t every = [] {
+            const char * e = getenv("ABYSS_GEN_CKPT");
+            return e != nullptr ? std::max<int64_t>(0, atoll(e)) : 0;
+        }();
+        static const size_t keep = [] {
+            const char * e = getenv("ABYSS_GEN_CKPT_KEEP");
+            return (size_t) (e != nullptr ? std::max<int64_t>(2, atoll(e)) : 8);
+        }();
+        if (every <= 0 || params_base.n_ctx_checkpoints <= 0 || !prompt_checkpoint_storage_lossless ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.can_speculate() ||
+                (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS)) {
+            return;
+        }
+
+        // the generated tokens the memory holds
+        const int64_t n_prompt = slot.task->n_tokens();
+        const int64_t n_gen    = (int64_t) slot.prompt.n_tokens() - n_prompt;
+        if (n_gen <= 0 || n_gen % every != 0) {
+            return;
+        }
+        if (n_gen == every) {
+            slot.gen_ckpt_step = every;
+        }
+        if (slot.gen_ckpt_step <= 0 || n_gen % slot.gen_ckpt_step != 0) {
+            return;
+        }
+
+        const int id_task = slot.task->id;
+        const auto in_answer = [&](const common_prompt_checkpoint & cur) {
+            return cur.id_task == id_task && cur.n_tokens > n_prompt;
+        };
+        size_t n_have = 0;
+        for (const auto & cur : slot.prompt.checkpoints) {
+            n_have += in_answer(cur);
+        }
+        if (n_have >= keep) {
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (in_answer(*it) && ((it->n_tokens - n_prompt) / slot.gen_ckpt_step) % 2 == 1) {
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            slot.gen_ckpt_step *= 2;
+            if (n_gen % slot.gen_ckpt_step != 0) {
+                return;
+            }
+        }
+
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        create_checkpoint(slot, 0, pos_min, pos_max);
+        slot.n_gen_ckpt++;
+        slot.t_gen_ckpt_us += ggml_time_us() - t_start;
+    }
+
     // checkpoints are appended to the slot save file, after the llama state payload
     // they cannot be recreated from the final state alone (a recurrent state cannot be rewound)
     static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
@@ -4025,6 +4114,7 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
+            create_gen_checkpoint(slot);
             slot.handle_last_sampled_token(batch);
         });
 
@@ -4097,6 +4187,10 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // abyss: the tokens the slot held and the common prefix, for the line printed below
+                        const int n_slot_held = slot.prompt.n_tokens();
+                        int n_common = -1;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -4164,6 +4258,7 @@ private:
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                n_common = n_past;
 
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {
@@ -4382,6 +4477,14 @@ private:
                                     }
                                 }
                             }
+                        }
+
+                        // abyss: how much of the slot the task kept: the common prefix of the prompt and the slot, and
+                        // the tokens the slot continues from (a checkpoint's, or the common prefix if it continues from
+                        // there), before the rule below that one token is always computed
+                        if (n_common >= 0) {
+                            SLT_INF(slot, "abyss: the prompt of %d tokens shares %d with the slot's %d, continuing from %d\n",
+                                    slot.task->n_tokens(), n_common, n_slot_held, n_past);
                         }
 
                         // [TAG_PROMPT_LOGITS]

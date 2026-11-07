@@ -1835,8 +1835,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+bool server_prompt_cache::ckpt_continue() {
+    static const bool on = [] {
+        const char * e = getenv("ABYSS_CKPT_CONTINUE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
 int server_prompt_cache::ckpt_window(const llama_context * ctx) {
     const llama_model * model = llama_get_model(ctx);
+    // abyss: a DeepSeek V4 checkpoint is the whole state at one position, as a recurrent model's is, and holds no
+    // window; llama_model_n_swa reports 0 for V4 but the sliding window for V4.1, which has the same memory
+    if (ckpt_continue()) {
+        char arch[32] = {};
+        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
+                strncmp(arch, "deepseek4", 9) == 0) {
+            return 0;
+        }
+    }
     if (llama_model_n_swa(model) > 0) {
         return llama_model_n_swa(model);
     }
@@ -1848,8 +1865,14 @@ int server_prompt_cache::n_usable(const server_prompt & prompt, const server_tok
     if (window < 0) {
         return lcp;
     }
-    // the slot restores the newest checkpoint within the common prefix, even when the new tokens extend the whole prompt;
-    // checkpoints holding a window also need n_swa tokens before the prefix ends (server_context: pos_min_thold)
+    // with ABYSS_CKPT_CONTINUE, a memory whose checkpoints hold no window continues from its end when the new tokens
+    // extend the whole prompt
+    if (window == 0 && ckpt_continue() && lcp == (int) prompt.tokens.size() && (int) tokens_new.size() > lcp) {
+        return lcp;
+    }
+    // otherwise the slot restores the newest checkpoint within the common prefix (without ABYSS_CKPT_CONTINUE a DeepSeek
+    // V4.1 slot does even when the new tokens extend the whole prompt); checkpoints holding a window also need n_swa
+    // tokens before the prefix ends (server_context: pos_min_thold)
     int64_t res = 0;
     for (const auto & ckpt : prompt.checkpoints) {
         const bool whole_state = ckpt.pos_min == ckpt.pos_max;

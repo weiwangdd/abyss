@@ -756,8 +756,13 @@ struct server_prompt_cache {
 
     void update();
 
+    // abyss: ABYSS_CKPT_CONTINUE=1: a DeepSeek V4.1 memory continues from its end when a prompt extends the whole slot,
+    // as V4's does, instead of going back to the newest checkpoint before the end (see ckpt_window)
+    static bool ckpt_continue();
+
     // abyss: -1 if the memory goes back to any position, otherwise it goes back only to a checkpoint and this is the
-    // window a checkpoint may hold (n_swa, 0 for a recurrent or hybrid model)
+    // window a checkpoint may hold (n_swa, 0 for a recurrent or hybrid model, and for DeepSeek V4 and V4.1 with
+    // ABYSS_CKPT_CONTINUE)
     static int ckpt_window(const llama_context * ctx);
 
     // abyss: how many tokens of tokens_new the state of prompt serves without recomputing them
