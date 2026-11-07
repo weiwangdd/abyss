@@ -1,9 +1,9 @@
 #!/bin/bash
 # How much of the last answer a conversation's next turn computes again (mx-llama.cpp/0041), each entry of CONFIGS
 # ("name:VAR=VALUE,VAR=VALUE" on top of the production settings, now those of 0041, BIN=<dir> among them for another
-# build; default both switches of 0041 off, ABYSS_CKPT_CONTINUE=1 alone, which continues from the slot's end when the
-# prompt extends the whole slot, and production, which adds checkpoints in the answer, ABYSS_GEN_CKPT=256) on a fresh
-# server: gen_ckpt.py (PROMPTS corpus slices, each a greedy turn 1 with the tools, its turn 2 and a turn 2b that
+# build; default without and with the checkpoints in the answer, ABYSS_GEN_CKPT=256; since 0042 a slot always
+# continues from its end when the prompt extends the whole slot, which a build with 0041 but not 0042 does only with
+# ABYSS_CKPT_CONTINUE=1, so the behavior before 0041 needs BIN=<a build without 0041>) on a fresh server: gen_ckpt.py (PROMPTS corpus slices, each a greedy turn 1 with the tools, its turn 2 and a turn 2b that
 # changes the answer at 60%, with top-20 logprobs; turn 1 must be the same in all entries, turns 2 and 2b are compared
 # with the first entry; a later slice's turn 1 can differ already, by the expert cache the earlier turns left), then
 # the agent session of agent_turns.py (TURNS turns of MAX_TOKENS tokens, greedy, on REPEAT corpus copies). Prints per
@@ -16,7 +16,7 @@ O=${OUT:-$HOME/abyss-eval}/gen-ckpt-$(date +%m%d-%H%M)
 B=${BUILD:-$HOME/src/mx-llama.cpp/build-pf/bin}
 M=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf}
 PORT=${PORT:-8090}
-CONFIGS=${CONFIGS:-"base:ABYSS_CKPT_CONTINUE=0,ABYSS_GEN_CKPT=0 cont:ABYSS_GEN_CKPT=0 gen"}
+CONFIGS=${CONFIGS:-"cont:ABYSS_GEN_CKPT=0 gen"}
 mkdir -p "$O"
 
 pid=$(pgrep -x llama-server)

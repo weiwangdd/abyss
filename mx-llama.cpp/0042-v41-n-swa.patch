@@ -1,0 +1,127 @@
+From 6125731eaa72503495feb4748e79ef84e0570342 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Sat, 7 Nov 2026 19:02:25 +0100
+Subject: [PATCH] abyss: llama_model_n_swa returns 0 for DeepSeek V4.1 as for
+ V4, as upstream does since 74bca3950: its memory goes back only to a
+ checkpoint, the whole state at one position, and with the sliding window as
+ the server's margin a prompt that extends the whole slot went back to the
+ newest checkpoint before the slot's end; this replaces ABYSS_CKPT_CONTINUE of
+ the patch before, with the same result as that switch on:
+ server_prompt_cache::ckpt_window comes out 0 through the rule for hybrid
+ models (V4 and V4.1 count as hybrid), n_usable's continue rule applies to
+ every memory whose checkpoints hold no window, and the server's n_swa needs
+ no override
+
+---
+ src/llama-model.cpp             |  5 ++++-
+ tools/server/server-context.cpp |  8 --------
+ tools/server/server-task.cpp    | 27 ++++-----------------------
+ tools/server/server-task.h      |  7 +------
+ 4 files changed, 9 insertions(+), 38 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 40ef8ef..6025fe4 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3748,7 +3748,10 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
+ int32_t llama_model_n_swa(const llama_model * model) {
+     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
+     // other compression ratios, so we return 0 here
+-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
++    // abyss: DeepSeek V4.1 has the same memory (upstream returns 0 for it too since 74bca3950); with its sliding window
++    // here, the server took the window as the margin of the checkpoints to go back to, and a prompt that extends the
++    // whole slot went back to the newest checkpoint before the slot end instead of continuing from there
++    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
+         return 0;
+     }
+     return model->hparams.n_swa;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b6d5141..171b0d2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1376,14 +1376,6 @@ private:
+ 
+         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+ 
+-        // abyss: ABYSS_CKPT_CONTINUE=1 takes the window of a DeepSeek V4.1 checkpoint as 0, as for V4 (see
+-        // server_prompt_cache::ckpt_window). With its sliding window as the margin of pos_min_thold, a prompt that
+-        // extends the whole slot went back to the newest checkpoint before the slot's end instead of continuing from
+-        // there, so each turn of a conversation computed the last answer again
+-        if (server_prompt_cache::ckpt_window(ctx_tgt) == 0) {
+-            n_swa = 0;
+-        }
+-
+         // Necessary similarity of prompt for slot selection
+         slot_prompt_similarity = params_base.slot_prompt_similarity;
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 897106b..e54b0c2 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1793,25 +1793,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::ckpt_continue() {
+-    static const bool on = [] {
+-        const char * e = getenv("ABYSS_CKPT_CONTINUE");
+-        return e != nullptr && atoi(e) != 0;
+-    }();
+-    return on;
+-}
+-
+ int server_prompt_cache::ckpt_window(const llama_context * ctx) {
+     const llama_model * model = llama_get_model(ctx);
+-    // abyss: a DeepSeek V4 checkpoint is the whole state at one position, as a recurrent model's is, and holds no
+-    // window; llama_model_n_swa reports 0 for V4 but the sliding window for V4.1, which has the same memory
+-    if (ckpt_continue()) {
+-        char arch[32] = {};
+-        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
+-                strncmp(arch, "deepseek4", 9) == 0) {
+-            return 0;
+-        }
+-    }
+     if (llama_model_n_swa(model) > 0) {
+         return llama_model_n_swa(model);
+     }
+@@ -1823,14 +1806,12 @@ int server_prompt_cache::n_usable(const server_prompt & prompt, const server_tok
+     if (window < 0) {
+         return lcp;
+     }
+-    // with ABYSS_CKPT_CONTINUE, a memory whose checkpoints hold no window continues from its end when the new tokens
+-    // extend the whole prompt
+-    if (window == 0 && ckpt_continue() && lcp == (int) prompt.tokens.size() && (int) tokens_new.size() > lcp) {
++    // a memory whose checkpoints hold no window continues from its end when the new tokens extend the whole prompt
++    if (window == 0 && lcp == (int) prompt.tokens.size() && (int) tokens_new.size() > lcp) {
+         return lcp;
+     }
+-    // otherwise the slot restores the newest checkpoint within the common prefix (without ABYSS_CKPT_CONTINUE a DeepSeek
+-    // V4.1 slot does even when the new tokens extend the whole prompt); checkpoints holding a window also need n_swa
+-    // tokens before the prefix ends (server_context: pos_min_thold)
++    // otherwise the slot restores the newest checkpoint within the common prefix; checkpoints holding a window also
++    // need n_swa tokens before the prefix ends (server_context: pos_min_thold)
+     int64_t res = 0;
+     for (const auto & ckpt : prompt.checkpoints) {
+         const bool whole_state = ckpt.pos_min == ckpt.pos_max;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 497a306..cc70713 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -679,13 +679,8 @@ struct server_prompt_cache {
+ 
+     void update();
+ 
+-    // abyss: ABYSS_CKPT_CONTINUE=1: a DeepSeek V4.1 memory continues from its end when a prompt extends the whole slot,
+-    // as V4's does, instead of going back to the newest checkpoint before the end (see ckpt_window)
+-    static bool ckpt_continue();
+-
+     // abyss: -1 if the memory goes back to any position, otherwise it goes back only to a checkpoint and this is the
+-    // window a checkpoint may hold (n_swa, 0 for a recurrent or hybrid model, and for DeepSeek V4 and V4.1 with
+-    // ABYSS_CKPT_CONTINUE)
++    // window a checkpoint may hold (n_swa, 0 for a recurrent or hybrid model; DeepSeek V4 and V4.1 count as hybrid)
+     static int ckpt_window(const llama_context * ctx);
+ 
+     // abyss: how many tokens of tokens_new the state of prompt serves without recomputing them
+-- 
+2.43.0
+
