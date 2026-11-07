@@ -3,9 +3,10 @@
 # heat, ABYSS_MOE_ADMIT_GATE=1 admits a miss only if hotter than it, ABYSS_MOE_SKIP_ZERO=1 lets the CPU's experts of a
 # token read no zero slot) against the production plan, and later switches the same way (0031: ABYSS_MOE_DEFER_UPLOAD=1
 # defers a token's uploaded experts with the CPU's; 0032: ABYSS_HC_FUSE=1, ABYSS_GATHER_FUSE=1 fuse kernels), on servers
-# with the production settings (now those of 0039, so VAR=0 turns a switch of them off), one per entry of CONFIGS
+# with the production settings (now those of 0040, so VAR=0 turns a switch of them off), one per entry of CONFIGS
 # ("name:VAR=VALUE,VAR=VALUE", the settings on top of those; an entry without them is production; BIN=<dir> among them
-# runs that entry's server from another build, MODEL=<gguf> on another model, T=<n> with n CPU threads instead of 16):
+# runs that entry's server from another build, MODEL=<gguf> on another model, T=<n> with n CPU threads instead of 16,
+# CACHE=<MiB> with another --moe-cache-mib than the production 21100):
 # greedy_kl.py on PROMPTS corpus slices of 128 greedy tokens each and the 96k prompt of ctx_size.py with its 32 greedy
 # tokens, compared with the first entry's (a cache that admits other experts gives the CPU other experts, whose sums
 # round differently; the zero slots alone change nothing), and the append-only session of decode_modes.py (REPEAT
@@ -62,6 +63,7 @@ for c in $CONFIGS; do
   bin=$B
   model=$M
   threads=16
+  cache=21100
   for k in "${!extra_env[@]}"; do
     if [[ ${extra_env[$k]} == BIN=* ]]; then
       bin=${extra_env[$k]#BIN=}
@@ -71,6 +73,9 @@ for c in $CONFIGS; do
       unset 'extra_env[k]'
     elif [[ ${extra_env[$k]} == T=* ]]; then
       threads=${extra_env[$k]#T=}
+      unset 'extra_env[k]'
+    elif [[ ${extra_env[$k]} == CACHE=* ]]; then
+      cache=${extra_env[$k]#CACHE=}
       unset 'extra_env[k]'
     fi
   done
@@ -89,10 +94,10 @@ for p in sys.argv[1:]:
     ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_DEFER=1 ABYSS_EXPERT_STATS="$O/stats-$name.json" \
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 \
     ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 \
-    ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 "${extra_env[@]}" \
+    ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1 "${extra_env[@]}" \
     "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t "$threads" \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
-    -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 --checkpoint-min-step 32768 \
+    -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib "$cache" --checkpoint-min-step 32768 \
     --jinja --chat-template-file "$HOME/abyss-stats/tmpl/v41.jinja" --no-reasoning-preserve \
     --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0 --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 &
   spid=$!

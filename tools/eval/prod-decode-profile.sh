@@ -1,5 +1,5 @@
 #!/bin/bash
-# An nsys profile of a decode turn with the settings of ~/abyss-stats/restart.sh as of mx-llama.cpp/0039 (decode_modes.sh
+# An nsys profile of a decode turn with the settings of ~/abyss-stats/restart.sh as of mx-llama.cpp/0040 (decode_modes.sh
 # CAPTURE=1, the last turn of an append-only session of REPEAT corpus copies), read with nsys_layers.py (the cached
 # layers: GPU1 busy, the host waiting, the host computing), nsys_layer.py (where both GPUs wait, and one layer's
 # timeline), nsys_streams.py (GPU1's copies against its kernels), nsys_kernels.py (the kernels by their own time) and
@@ -49,11 +49,12 @@ gpus_free
   export ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1
   export ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1
   export ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1
-  export ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_EXPERT_STATS=$O/expert-stats.json
+  export ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1
+  export ABYSS_EXPERT_STATS=$O/expert-stats.json
   for kv in ${EXTRA_ENV:-}; do
     export "$kv"
   done
-  export EXTRA='-c 196608 --moe-cache-mib 20500 -ot blk\.12\.ffn_(gate|up)_exps\.=CUDA0 --checkpoint-min-step 32768
+  export EXTRA='-c 196608 --moe-cache-mib 21100 -ot blk\.12\.ffn_(gate|up)_exps\.=CUDA0 --checkpoint-min-step 32768
     --no-reasoning-preserve --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0'
   echo "### decode turn $(date +%T)"
   CAPTURE=1 REPEAT=${REPEAT:-6} ROUNDS=1 MAX_TOKENS=${MAX_TOKENS:-256} "$E/decode_modes.sh" > "$O/decode.txt" 2>&1

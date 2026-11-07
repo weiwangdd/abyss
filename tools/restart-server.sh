@@ -28,7 +28,10 @@
 # launched (ABYSS_GRAPH_CHUNK=128, 0038), the same results; leaving it out is the fallback. While single steps decode,
 # a thread reads 4 KiB of the Engram file every 4 ms, so the NVMe drive does not idle into its slow first read (about
 # 600 us after 15 ms, 75 us within 5 ms) when a step's cold Engram rows come in (ABYSS_ENGRAM_KEEPALIVE_MS=4, 0039),
-# the same results; leaving it out is the fallback.
+# the same results; leaving it out is the fallback. The output head is not loaded whole: its halves are read straight
+# onto the two GPUs (ABYSS_HEAD_SPLIT_ONLY=1, 0040), which leaves GPU1 631 MiB that the expert cache takes (21100 MiB
+# instead of 20500), and a batch carries one output; MTP and DSpark need the whole head, and leaving the switch out
+# with the cache back at 20500 is the fallback.
 # HEAD_Q8=1 runs the copy of the model whose output head is Q8_0 instead of BF16 (tools/convert/retype_tensor.py: about
 # 2% faster per request, top-20 KL about 5e-4, the decode-path PPL the same); off by default.
 set -e
@@ -79,12 +82,12 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
   ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
   ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 ABYSS_GRAPH_CHUNK=128 \
-  ABYSS_ENGRAM_KEEPALIVE_MS=4 \
+  ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1 \
   nohup ./build-m2/bin/llama-server \
   -m $model/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU" -ot "blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
-  -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20500 \
+  -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 21100 \
   --checkpoint-min-step 32768 --slot-save-path $HOME/abyss-stats/slots \
   --jinja --chat-template-file $HOME/abyss-stats/tmpl/v41.jinja --no-reasoning-preserve \
   --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0 \

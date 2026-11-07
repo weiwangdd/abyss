@@ -1,0 +1,209 @@
+From fbe0daef66dd3a23f6823a1577755da0809c1279 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Sat, 7 Nov 2026 12:48:15 +0100
+Subject: [PATCH] abyss: ABYSS_HEAD_SPLIT_ONLY=1 with ABYSS_HEAD_SPLIT=F leaves
+ the output head out of the load (TENSOR_SKIP in deepseek4 and deepseek41) and
+ reads its first F of rows from the file straight onto the first other GPU and
+ the rest onto the head's own, as tensors of their own (output_split,
+ output_rest; dummy buffers in the pass that only sizes the model, which
+ counts their size); the head's GPU then holds only its part, 631 MiB less for
+ DeepSeek V4.1 Flash; every batch takes the split, so llama_context caps
+ n_outputs_max at the number of sequences, which the compute buffers are
+ reserved for; MTP and DFlash drafts, which read the whole head, cannot run
+ with it
+
+---
+ src/llama-context.cpp     | 10 +++++
+ src/llama-model.cpp       | 79 +++++++++++++++++++++++++++++++++++++++
+ src/llama-model.h         |  8 +++-
+ src/models/deepseek4.cpp  |  8 ++--
+ src/models/deepseek41.cpp |  3 +-
+ 5 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9630705..2855e11 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -277,6 +277,16 @@ llama_context::llama_context(
+     }
+ 
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
++    // abyss: without the whole head (ABYSS_HEAD_SPLIT_ONLY) the logits of every output are joined on the GPU of the
++    // head's first rows, which has room for a few only: a batch carries at most one output per sequence, and the
++    // compute buffers are reserved for that
++    if (model.output == nullptr && model.output_split != nullptr) {
++        const uint32_t n_max = std::max<uint32_t>(1, cparams.n_seq_max);
++        if (cparams.n_outputs_max > n_max) {
++            fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT_ONLY, at most %u output(s) per batch (was %u)\n", n_max, cparams.n_outputs_max);
++            cparams.n_outputs_max = n_max;
++        }
++    }
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index c7615ff..40ef8ef 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2467,6 +2467,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // abyss: ABYSS_HEAD_SPLIT_ONLY=1 with ABYSS_HEAD_SPLIT=F: the head was skipped (deepseek4, deepseek41); its first F of
++    // rows go to the first other GPU and the rest to the head's own, read from the file straight onto them, or as
++    // dummy buffers in the pass that only sizes the model (which returns below), so that its graphs place them too
++    if (const char * e = getenv("ABYSS_HEAD_SPLIT"); e != nullptr && output == nullptr && llama_abyss_head_split_only()) {
++        const auto it = ml.weights_map.find(tn(LLM_TENSOR_OUTPUT, "weight").str());
++        if (it == ml.weights_map.end()) {
++            throw std::runtime_error("ABYSS_HEAD_SPLIT_ONLY: the model has no output head");
++        }
++        const ggml_tensor * meta = it->second.tensor;
++        ggml_backend_dev_t dev_out   = pimpl->dev_output.dev;
++        ggml_backend_dev_t dev_split = nullptr;
++        for (const auto & d : devices) {
++            if (!d.is_meta && d.dev != dev_out && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                dev_split = d.dev;
++                break;
++            }
++        }
++        const int64_t n_rows  = meta->ne[1];
++        const int64_t n_split = std::clamp<int64_t>(llround(atof(e) * n_rows), 0, n_rows);
++        if (dev_out == nullptr || ggml_backend_dev_type(dev_out) != GGML_BACKEND_DEVICE_TYPE_GPU || dev_split == nullptr ||
++                n_split <= 0 || n_split >= n_rows) {
++            throw std::runtime_error("ABYSS_HEAD_SPLIT_ONLY needs the head on a GPU, another GPU and a share of rows in (0, 1)");
++        }
++        const size_t row_bytes = ggml_row_size(meta->type, meta->ne[0]);
++        llama_file * file = ml.files.at(it->second.idx).get();
++        std::vector<uint8_t> chunk(64u << 20);
++        auto load_part = [&](ggml_backend_dev_t dev, const char * name, int64_t row0, int64_t rows) {
++            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
++            ggml_context_ptr ctx(ggml_init(ip));
++            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), meta->type, meta->ne[0], rows);
++            ggml_set_name(t, name);
++            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
++            if (ml.no_alloc) {
++                // the pass that only sizes the model: a dummy buffer tells the scheduler where the part lives, and the
++                // memory breakdown counts its size
++                ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, 0));
++                t->buffer = buf.get();
++                std::vector<ggml_backend_buffer_ptr> bufs;
++                bufs.emplace_back(std::move(buf));
++                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
++                return t;
++            }
++            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++            if (!buf) {
++                throw std::runtime_error(format("ABYSS_HEAD_SPLIT_ONLY: could not allocate %.1f MiB on %s",
++                        ggml_nbytes(t) / 1048576.0, ggml_backend_dev_name(dev)));
++            }
++            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            const size_t n = ggml_nbytes(t);
++            for (size_t done = 0; done < n; ) {
++                const size_t len = std::min(chunk.size(), n - done);
++                file->seek(it->second.offs + (size_t) row0*row_bytes + done, SEEK_SET);
++                file->read_raw(chunk.data(), len);
++                ggml_backend_tensor_set(t, chunk.data(), done, len);
++                done += len;
++            }
++            std::vector<ggml_backend_buffer_ptr> bufs;
++            bufs.emplace_back(std::move(buf));
++            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
++            return t;
++        };
++        output_split = load_part(dev_split, "output_split.weight", 0, n_split);
++        output_rest  = load_part(dev_out, "output_rest.weight", n_split, n_rows - n_split);
++        if (!ml.no_alloc) {
++            fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT=%s ABYSS_HEAD_SPLIT_ONLY=1, rows 0-%lld of %lld of the output head (%.1f MiB) "
++                "on %s and the other %lld (%.1f MiB) on %s, the head not loaded whole\n", e, (long long) n_split - 1,
++                (long long) n_rows, ggml_nbytes(output_split) / 1048576.0, ggml_backend_dev_name(dev_split),
++                (long long) (n_rows - n_split), ggml_nbytes(output_rest) / 1048576.0, ggml_backend_dev_name(dev_out));
++        }
++    }
++
+     if (ml.no_alloc) {
+         return true;
+     }
+@@ -2908,6 +2979,14 @@ ggml_backend_dev_t llama_model::dev_output() const {
+     return pimpl->dev_output.dev;
+ }
+ 
++bool llama_abyss_head_split_only() {
++    static const bool on = [] {
++        const char * e = getenv("ABYSS_HEAD_SPLIT_ONLY");
++        return e != nullptr && atoi(e) != 0 && getenv("ABYSS_HEAD_SPLIT") != nullptr;
++    }();
++    return on;
++}
++
+ template<typename F>
+ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, F & fn) {
+     ggml_init_params params = {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 130c61b..0ac910b 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -677,7 +677,9 @@ struct llama_model {
+     struct ggml_tensor * output_norm_b   = nullptr;
+     struct ggml_tensor * output          = nullptr;
+     // abyss: ABYSS_HEAD_SPLIT, a copy of the head's first rows on another GPU and a view of the other rows, bound to the
+-    // head's buffer so that the scheduler keeps their product on the head's GPU (llama_model_base::load_tensors)
++    // head's buffer so that the scheduler keeps their product on the head's GPU (llama_model_base::load_tensors); with
++    // ABYSS_HEAD_SPLIT_ONLY the two parts are the only copy of the head, output stays null and both are tensors of
++    // their own
+     struct ggml_tensor * output_split    = nullptr;
+     struct ggml_tensor * output_rest     = nullptr;
+     struct ggml_tensor * output_b        = nullptr;
+@@ -836,6 +838,10 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
+ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
+ 
+ // model must inherit from this
++// abyss: ABYSS_HEAD_SPLIT_ONLY=1 with ABYSS_HEAD_SPLIT=F: the output head is not loaded whole; F of its rows are read
++// from the file onto another GPU and the rest onto the head's own (deepseek4, deepseek41)
++bool llama_abyss_head_split_only();
++
+ struct llama_model_base : public llama_model {
+     friend struct llama_model;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index a26f35c..55d3eaf 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -101,7 +101,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+ 
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
++            llama_abyss_head_split_only() ? TENSOR_SKIP : 0);
+ 
+     hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, head_hc_flags);
+     hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, head_hc_flags);
+@@ -2035,8 +2036,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     // abyss: ABYSS_HEAD_SPLIT (llama_model::output_split): a single output's logits are computed on two GPUs at once,
+     // the first rows from the copy on the other GPU and the rest on the head's own, and joined on the other GPU (the
+     // context's graph callback puts the concat there, so that neither GPU waits for the other before its own rows);
+-    // each row is the same dot product as before
+-    if (model.output_split != nullptr && n_outputs == 1) {
++    // each row is the same dot product as before; without the whole head (ABYSS_HEAD_SPLIT_ONLY) every batch goes this
++    // way, at most one output per sequence (llama_context limits n_outputs_max)
++    if (model.output_split != nullptr && (n_outputs == 1 || model.output == nullptr)) {
+         ggml_tensor * rows_split = ggml_mul_mat(ctx0, model.output_split, cur);
+         ggml_tensor * rows_rest  = ggml_mul_mat(ctx0, model.output_rest, cur);
+         cur = ggml_concat(ctx0, rows_split, rows_rest, 0);
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 4888d8b..7a762e8 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -116,7 +116,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
+ 
+     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
++            llama_abyss_head_split_only() ? TENSOR_SKIP : 0);
+ 
+     // V4.1 folds the hyper-connection copies with the mix of the last layer, so it carries no output_hc_* head tensors of its own.
+ 
+-- 
+2.43.0
+

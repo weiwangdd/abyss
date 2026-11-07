@@ -44,6 +44,7 @@
 | `0037-q8-1-pool-small.patch` | `ABYSS_Q8_1_CACHE_LEG=1` 时，q8_1 缓存只放不超过 128 KiB 的项（几个 token 的矩阵乘激活），在专用池里一律按 128 KiB 分配；预填充的批次大小每次不同，照原来量化。0036 的专用池会给每种大小留一块（测试里每张卡多约 100 MiB；生产开着它一小时后 GPU0 空闲降到约 230 MiB，怀疑与此有关）；有了这个补丁，测试里的显存和关掉缓存一样。没有上线（生产 `GGML_CUDA_Q8_1_CACHE=0`） |
 | `0038-graph-chunk.patch` | CUDA graph 分两段启动（`ABYSS_GRAPH_CHUNK=N`）：超过 4N 个节点的图在第 N 个节点之后、第一个单独计算的节点（或融合组的第一个）之前切成两张 CUDA graph，依次启动。一张图要等启动调用返回才开始跑，GPU0 第 0–11 层、GPU1 第 13–21 层这两张 400 多个内核的大图每次启动 150–170 µs，两卡都在空等；切开后第一段跑的时候发第二段。第二段放在图缓存里由图的键派生的键下，结果不变。生产用 128，会话约快 1%（见 CLAUDE.md「CUDA graph 的启动」）；不设开关时和原来一样 |
 | `0039-engram-keepalive.patch` | 解码时的 NVMe 保活（`ABYSS_ENGRAM_KEEPALIVE_MS=N`）：单 token 解码期间，后台线程每 N ms 用 O_DIRECT 读一次 Engram 表所在文件的随机 4 KiB（文件从 `/proc/self/maps` 找，不经页缓存）。9100 PRO 空闲 15 ms 以上后首读约 600 µs、5 ms 以内约 75 µs，冷的 Engram 行每 token 只在开头读一次，每次都撞上慢的那档。生产用 4，会话约快 1%，输出不变（见 CLAUDE.md「解码时的 NVMe 保活」）；不设开关时和原来一样 |
+| `0040-head-split-only.patch` | 输出层只分两半加载（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`）：输出层不整张加载，前 F 的行从文件直接读到另一张 GPU，其余读到输出层自己的 GPU；不管几个输出都两卡各算一半，每批的输出数限成序列数。GPU1 少占 631 MiB，生产把它给了专家缓存（20500 → 21100 MiB，会话约快 0.5%，见 CLAUDE.md「输出层只分两半加载」）；MTP、DSpark 要读整张输出层，不能同开；不设开关时和原来一样 |
 
 ## 安装
 
@@ -70,7 +71,7 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0033-server-stats.patch <abyss>/mx-llama.cpp/0034-head-split.patch \
   <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch \
   <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch <abyss>/mx-llama.cpp/0038-graph-chunk.patch \
-  <abyss>/mx-llama.cpp/0039-engram-keepalive.patch
+  <abyss>/mx-llama.cpp/0039-engram-keepalive.patch <abyss>/mx-llama.cpp/0040-head-split-only.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
