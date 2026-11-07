@@ -45,6 +45,7 @@
 | `0038-graph-chunk.patch` | CUDA graph 分两段启动（`ABYSS_GRAPH_CHUNK=N`）：超过 4N 个节点的图在第 N 个节点之后、第一个单独计算的节点（或融合组的第一个）之前切成两张 CUDA graph，依次启动。一张图要等启动调用返回才开始跑，GPU0 第 0–11 层、GPU1 第 13–21 层这两张 400 多个内核的大图每次启动 150–170 µs，两卡都在空等；切开后第一段跑的时候发第二段。第二段放在图缓存里由图的键派生的键下，结果不变。生产用 128，会话约快 1%（见 CLAUDE.md「CUDA graph 的启动」）；不设开关时和原来一样 |
 | `0039-engram-keepalive.patch` | 解码时的 NVMe 保活（`ABYSS_ENGRAM_KEEPALIVE_MS=N`）：单 token 解码期间，后台线程每 N ms 用 O_DIRECT 读一次 Engram 表所在文件的随机 4 KiB（文件从 `/proc/self/maps` 找，不经页缓存）。9100 PRO 空闲 15 ms 以上后首读约 600 µs、5 ms 以内约 75 µs，冷的 Engram 行每 token 只在开头读一次，每次都撞上慢的那档。生产用 4，会话约快 1%，输出不变（见 CLAUDE.md「解码时的 NVMe 保活」）；不设开关时和原来一样 |
 | `0040-head-split-only.patch` | 输出层只分两半加载（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`）：输出层不整张加载，前 F 的行从文件直接读到另一张 GPU，其余读到输出层自己的 GPU；不管几个输出都两卡各算一半，每批的输出数限成序列数。GPU1 少占 631 MiB，生产把它给了专家缓存（20500 → 21100 MiB，会话约快 0.5%，见 CLAUDE.md「输出层只分两半加载」）；MTP、DSpark 要读整张输出层，不能同开；不设开关时和原来一样 |
+| `0041-continue-slot-end-gen-checkpoints.patch` | 上一轮回答不再重算。`ABYSS_CKPT_CONTINUE=1`：V4、V4.1 的检查点窗口按 0 算（`server_prompt_cache::ckpt_window` 按架构名判断，server 的 n_swa 跟着为 0）。`llama_model_n_swa` 对 V4.1 返回滑窗 128，server 拿它当退回检查点的余量，新提示词完整包含槽位时也退回上一轮提示词末尾的检查点，现在改为从槽位末尾接着算，`n_usable` 也按整段算。`ABYSS_GEN_CKPT=N`：生成过程中每 N 个 token 存一个检查点（在采样出的 token 进批次之前），每个请求最多留 `ABYSS_GEN_CKPT_KEEP`（默认 8）个，满了隔一个删一个、间距加倍；重新分词后断在回答中间的下一轮退回最近的一个。server 每个请求都打一行「和槽位共享多少、从哪接着算」，不受开关控制。生产用 `ABYSS_CKPT_CONTINUE=1`、`ABYSS_GEN_CKPT=256`，多轮智能体后续轮次的预填充约快 0.5 s（见 CLAUDE.md「上一轮回答不再重算」）；不设开关时除了这行日志和原来一样 |
 
 ## 安装
 
@@ -71,7 +72,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0033-server-stats.patch <abyss>/mx-llama.cpp/0034-head-split.patch \
   <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch \
   <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch <abyss>/mx-llama.cpp/0038-graph-chunk.patch \
-  <abyss>/mx-llama.cpp/0039-engram-keepalive.patch <abyss>/mx-llama.cpp/0040-head-split-only.patch
+  <abyss>/mx-llama.cpp/0039-engram-keepalive.patch <abyss>/mx-llama.cpp/0040-head-split-only.patch \
+  <abyss>/mx-llama.cpp/0041-continue-slot-end-gen-checkpoints.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
