@@ -47,6 +47,7 @@
 | `0040-head-split-only.patch` | 输出层只分两半加载（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`）：输出层不整张加载，前 F 的行从文件直接读到另一张 GPU，其余读到输出层自己的 GPU；不管几个输出都两卡各算一半，每批的输出数限成序列数。GPU1 少占 631 MiB，生产把它给了专家缓存（20500 → 21100 MiB，会话约快 0.5%，见 CLAUDE.md「输出层只分两半加载」）；MTP、DSpark 要读整张输出层，不能同开；不设开关时和原来一样 |
 | `0041-continue-slot-end-gen-checkpoints.patch` | 上一轮回答不再重算。`ABYSS_CKPT_CONTINUE=1`：V4、V4.1 的检查点窗口按 0 算（`server_prompt_cache::ckpt_window` 按架构名判断，server 的 n_swa 跟着为 0）。`llama_model_n_swa` 对 V4.1 返回滑窗 128，server 拿它当退回检查点的余量，新提示词完整包含槽位时也退回上一轮提示词末尾的检查点，现在改为从槽位末尾接着算，`n_usable` 也按整段算。`ABYSS_GEN_CKPT=N`：生成过程中每 N 个 token 存一个检查点（在采样出的 token 进批次之前），每个请求最多留 `ABYSS_GEN_CKPT_KEEP`（默认 8）个，满了隔一个删一个、间距加倍；重新分词后断在回答中间的下一轮退回最近的一个。server 每个请求都打一行「和槽位共享多少、从哪接着算」，不受开关控制。生产用 `ABYSS_CKPT_CONTINUE=1`、`ABYSS_GEN_CKPT=256`，多轮智能体后续轮次的预填充约快 0.5 s（见 CLAUDE.md「上一轮回答不再重算」）；不设开关时除了这行日志和原来一样。`ABYSS_CKPT_CONTINUE` 这部分后来由 0042 按上游的写法取代 |
 | `0042-v41-n-swa.patch` | `llama_model_n_swa` 对 V4.1 也返回 0，和 V4 一样（上游 74bca3950 起也是这样）：这种内存只能退回检查点，server 却拿 V4.1 的滑窗当退回检查点的余量。取代 0041 的 `ABYSS_CKPT_CONTINUE`：`ckpt_window` 走 hybrid 模型那条规则得 0（V4、V4.1 都算 hybrid），`n_usable` 的「整段延续就从末尾接着算」对所有不带窗口的检查点都成立，server 不再改写 n_swa；和开着那个开关时结果相同，开关不再起作用 |
+| `0043-cuda-graph-idle-eviction.patch` | CUDA graph 空闲之后不被清掉，照上游 00f113ece（#30662）：缓存原来每 5 s 扫一遍、删掉 10 s 没用过的图，对话每轮之间（用户、工具）和长的预填充都会停过 10 s，下一轮第一次解码就把所有解码图连同正要用的那张一起删掉、逐个重新捕获；现在 10 s 没查过图就给所有图再留 10 s，扫的时候也不删正要用的那张。结果不变，只是少捕获（`tools/eval/graph-idle.sh`） |
 
 ## 安装
 
@@ -74,7 +75,8 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0035-sample-fast.patch <abyss>/mx-llama.cpp/0036-mmvq-tail-q8-1-pool.patch \
   <abyss>/mx-llama.cpp/0037-q8-1-pool-small.patch <abyss>/mx-llama.cpp/0038-graph-chunk.patch \
   <abyss>/mx-llama.cpp/0039-engram-keepalive.patch <abyss>/mx-llama.cpp/0040-head-split-only.patch \
-  <abyss>/mx-llama.cpp/0041-continue-slot-end-gen-checkpoints.patch <abyss>/mx-llama.cpp/0042-v41-n-swa.patch
+  <abyss>/mx-llama.cpp/0041-continue-slot-end-gen-checkpoints.patch <abyss>/mx-llama.cpp/0042-v41-n-swa.patch \
+  <abyss>/mx-llama.cpp/0043-cuda-graph-idle-eviction.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选
