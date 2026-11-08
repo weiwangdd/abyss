@@ -1,0 +1,54 @@
+# MLPerf Agentic Inference for one llama-server on this machine: examples/10_Agentic_Inference/dsv4_agentic_benchmark.yaml
+# of mlcommons/endpoints (520eb4d) with its model parameters and dataset settings as they are, the dataset cut to the
+# conversations of subset.py, one conversation at a time and no SWE-bench accuracy phase. Not a valid submission: the
+# subset, the concurrency and the missing SWE-bench run all depart from the rules. run.sh sets the variables.
+name: "deepseek-v4.1-flash-agentic-abyss"
+version: "1.0"
+type: "online"
+
+model_params:
+  name: "deepseek-ai/DeepSeek-V4.1-Flash"
+  tokenizer_name: "${MLPERF_TOKENIZER}"
+  temperature: 1.0
+  top_k: 0
+  top_p: 0.95
+  max_new_tokens: ${MLPERF_MAX_NEW_TOKENS:-8192}
+  streaming: "on"
+  chat_template_kwargs:
+    thinking: true
+    reasoning_effort: max
+
+datasets:
+  - name: agentic_subset
+    type: performance
+    path: "${MLPERF_DATASET}"
+    accuracy_config:
+      eval_method: agentic_inference_inline
+      num_repeats: 1
+    agentic_inference:
+      turn_timeout_s: 3600.0
+      enable_salt: true
+      inject_tool_delay: true
+      num_trajectories_to_issue: ${MLPERF_TRAJECTORIES}
+      stop_issuing_on_first_user_complete: false
+
+settings:
+  runtime:
+    max_issue_duration_ms: ${MLPERF_MAX_MS:-2700000}
+  load_pattern:
+    type: agentic_inference
+    target_concurrency: 1
+  client:
+    num_workers: 1
+    max_connections: 1
+    warmup_connections: 0
+    max_idle_time: 0.5
+
+endpoint_config:
+  endpoints:
+    - "${MLPERF_ENDPOINT}"
+  api_type: openai
+
+report_dir: "${MLPERF_REPORT_DIR}"
+# the client would pin itself to the 5 fastest cores, among those of the server's CPU experts
+enable_cpu_affinity: false
