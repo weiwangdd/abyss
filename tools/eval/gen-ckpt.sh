@@ -1,9 +1,10 @@
 #!/bin/bash
 # How much of the last answer a conversation's next turn computes again (mx-llama.cpp/0041), each entry of CONFIGS
-# ("name:VAR=VALUE,VAR=VALUE" on top of the production settings, now those of 0041, BIN=<dir> among them for another
-# build; default without and with the checkpoints in the answer, ABYSS_GEN_CKPT=256; since 0042 a slot always
-# continues from its end when the prompt extends the whole slot, which a build with 0041 but not 0042 does only with
-# ABYSS_CKPT_CONTINUE=1, so the behavior before 0041 needs BIN=<a build without 0041>) on a fresh server: gen_ckpt.py (PROMPTS corpus slices, each a greedy turn 1 with the tools, its turn 2 and a turn 2b that
+# ("name:VAR=VALUE,VAR=VALUE" on top of the production settings, BIN=<dir> among them for another build; default
+# without and with the checkpoints in the answer, ABYSS_GEN_CKPT=256; since 0042 a slot always continues from its end
+# when the prompt extends the whole slot, which a build with 0041 but not 0042 does only with ABYSS_CKPT_CONTINUE=1
+# among the entry's settings, so the behavior before 0041 needs BIN=<a build without 0041>) on a fresh server:
+# gen_ckpt.py (PROMPTS corpus slices, each a greedy turn 1 with the tools, its turn 2 and a turn 2b that
 # changes the answer at 60%, with top-20 logprobs; turn 1 must be the same in all entries, turns 2 and 2b are compared
 # with the first entry; a later slice's turn 1 can differ already, by the expert cache the earlier turns left), then
 # the agent session of agent_turns.py (TURNS turns of MAX_TOKENS tokens, greedy, on REPEAT corpus copies). Prints per
@@ -68,7 +69,7 @@ for c in $CONFIGS; do
     ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 \
     ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 \
     ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1 \
-    ABYSS_CKPT_CONTINUE=1 ABYSS_GEN_CKPT=256 \
+    ABYSS_GEN_CKPT=256 \
     "${extra_env[@]}" \
     "$bin/llama-server" -m "$M" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
     -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU' -ot 'blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \

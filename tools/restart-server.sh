@@ -32,11 +32,13 @@
 # onto the two GPUs (ABYSS_HEAD_SPLIT_ONLY=1, 0040), which leaves GPU1 631 MiB that the expert cache takes (21100 MiB
 # instead of 20500), and a batch carries one output; MTP and DSpark need the whole head, and leaving the switch out
 # with the cache back at 20500 is the fallback. A prompt that extends the whole slot continues from the slot's end
-# instead of going back to the newest checkpoint before it (ABYSS_CKPT_CONTINUE=1, 0041: the server took V4.1's
-# sliding window as the window of its checkpoints, so each turn of a conversation computed the last answer again), and
+# instead of going back to the newest checkpoint before it (0042, as upstream: llama_model_n_swa is 0 for V4.1 as for
+# V4; before, the server took V4.1's sliding window as the window of its checkpoints, so each turn of a conversation
+# computed the last answer again, which 0041's ABYSS_CKPT_CONTINUE=1 had turned off by the architecture's name), and
 # the answer gets a checkpoint every 256 generated tokens, so a next turn that leaves the answer before its end (a
 # token sequence that tokenizes back another way) goes back only to there (ABYSS_GEN_CKPT=256); the next turn then sees
-# the answer's memory from the decode, top-20 KL about 1e-3, and leaving them out is the fallback.
+# the answer's memory from the decode, top-20 KL about 1e-3, and leaving ABYSS_GEN_CKPT out is the fallback for the
+# checkpoints in answers.
 # HEAD_Q8=1 runs the copy of the model whose output head is Q8_0 instead of BF16 (tools/convert/retype_tensor.py: about
 # 2% faster per request, top-20 KL about 5e-4, the decode-path PPL the same); off by default.
 set -e
@@ -87,7 +89,7 @@ ABYSS_EXPERT_STATS=$HOME/abyss-stats/expert-stats.json GGML_CUDA_Q8_1_CACHE=0 GG
   ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1 \
   ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1 ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 \
   ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 ABYSS_GRAPH_CHUNK=128 \
-  ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_CKPT_CONTINUE=1 ABYSS_GEN_CKPT=256 \
+  ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_GEN_CKPT=256 \
   nohup ./build-m2/bin/llama-server \
   -m $model/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
