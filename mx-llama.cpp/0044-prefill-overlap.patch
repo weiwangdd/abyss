@@ -1,0 +1,724 @@
+From bfa58adc735d7e2471cde9516751624fe4b5abdb Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Sun, 8 Nov 2026 23:40:19 +0100
+Subject: [PATCH] abyss: ABYSS_OVERLAP=1 lets the two GPUs work on consecutive
+ ubatches of a prompt at once, GPU0 on the next ubatch's layers 0-11 while
+ GPU1 computes this one's 13-39, with one copy of the inputs, no more device
+ memory and the same results: the host no longer waits for a GPU before it
+ copies the inputs of a split there - a large graph input for a busy GPU is
+ staged and uploaded on the split's stream behind its queued work (an idle GPU
+ or a small input is copied as before), host inputs from CPU splits likewise
+ up to ABYSS_OVERLAP_HOST_MAX (1 GiB), each staged input alternates two pinned
+ buffers per backend with an event each, outgrown staging buffers are freed at
+ the next synchronize (cudaFreeHost synchronizes the device), a new graph
+ layout drains the backends only when a buffer would grow (the mask inputs
+ grow every ubatch), and empty inputs (the output rows of a ubatch without
+ outputs, for the halves of the output head) are neither copied nor waited
+ for, which made GPU0 wait for all of GPU1's queued work at the end of each
+ ubatch; the MoE selections for cb_moe_ids alternate two pinned buffers with
+ an event per backend instead of a synchronize per ubatch; with
+ CUDA_SCALE_LAUNCH_QUEUES=4x a 96k-token prefill takes 28.7 s instead of 40.9
+ and 193k 58.1 instead of 83.5, an agent session's later turns and the decode
+ the same; ABYSS_SYNC_TRACE=<ms> prints the host waits of the scheduler with
+ their source line and input
+
+---
+ ggml/src/ggml-backend.cpp | 242 ++++++++++++++++++++++++++++++++++----
+ src/llama-context.cpp     | 104 +++++++++++++---
+ src/llama-context.h       |  10 ++
+ 3 files changed, 315 insertions(+), 41 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 43be9c4..982c73e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -944,6 +944,8 @@ struct ggml_backend_sched_input_staging {
+     int copy_id;
+     size_t size;
+     ggml_backend_buffer_t buffer;
++    ggml_backend_event_t event; // abyss: with ABYSS_OVERLAP, after the last upload from the buffer
++    bool recorded;
+ };
+ 
+ struct ggml_backend_sched_timing {
+@@ -1042,6 +1044,9 @@ struct ggml_backend_sched {
+ 
+     bool async_host_inputs; // abyss: see ggml_backend_sched_set_async_host_inputs
+     bool overlap_gpus;      // abyss: see ggml_backend_sched_set_overlap_gpus
++    std::unordered_map<uint64_t, int> * abyss_stage_toggle; // abyss: ABYSS_OVERLAP, the next buffer of each staged input
++    std::vector<ggml_backend_buffer_t> * abyss_stage_retired; // abyss: ABYSS_OVERLAP, outgrown staging buffers
++    ggml_backend_event_t abyss_probe_events[GGML_SCHED_MAX_BACKENDS]; // abyss: ABYSS_OVERLAP, see abyss_backend_busy
+     ggml_backend_event_t overlap_events[GGML_SCHED_MAX_BACKENDS]; // abyss: for overlap_gpus, made when first needed
+ 
+     char * context_buffer;
+@@ -1070,6 +1075,69 @@ static int ggml_backend_sched_env_int(const char * name, int fallback) {
+     return value != nullptr ? atoi(value) : fallback;
+ }
+ 
++// abyss: ABYSS_OVERLAP=1 lets the host go on while a GPU still works on the previous ubatch: a graph input of a GPU split
++// is staged and uploaded on the split's stream behind the work queued there, and with one copy of the inputs that work
++// is all that reads it, so the host does not wait for the GPU first; a host input of a GPU split from a CPU split goes
++// the same way up to ABYSS_OVERLAP_HOST_MAX bytes (default 1 GiB; 1 MiB without the switch, as before)
++static bool abyss_overlap() {
++    static const bool v = []() {
++        const char * e = getenv("ABYSS_OVERLAP");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return v;
++}
++
++static size_t abyss_async_host_input_max() {
++    static const size_t v = []() {
++        if (!abyss_overlap()) {
++            return (size_t) 1024*1024;
++        }
++        const char * e = getenv("ABYSS_OVERLAP_HOST_MAX");
++        return e != nullptr ? (size_t) atoll(e) : (size_t) 1024*1024*1024;
++    }();
++    return v;
++}
++
++// abyss: ABYSS_SYNC_TRACE=<ms> prints each host wait of the scheduler of at least that long, with its source line
++static int64_t abyss_sync_trace_min_us() {
++    static const int64_t v = []() {
++        const char * e = getenv("ABYSS_SYNC_TRACE");
++        return e != nullptr ? (int64_t) (atof(e) * 1000) : (int64_t) -1;
++    }();
++    return v;
++}
++
++static const char * abyss_sync_what = "";
++
++static void abyss_sync_backend(ggml_backend_t backend, int line) {
++    const int64_t min_us = abyss_sync_trace_min_us();
++    if (min_us < 0) {
++        ggml_backend_synchronize(backend);
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_synchronize(backend);
++    const int64_t dt = ggml_time_us() - t0;
++    if (dt >= min_us) {
++        fprintf(stderr, "abyss sync: line %d %s %.2f ms at %.6f for %s\n", line, ggml_backend_name(backend), dt / 1e3, t0 / 1e6,
++                abyss_sync_what);
++    }
++}
++
++static void abyss_sync_event(ggml_backend_event_t event, int line) {
++    const int64_t min_us = abyss_sync_trace_min_us();
++    if (min_us < 0) {
++        ggml_backend_event_synchronize(event);
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_event_synchronize(event);
++    const int64_t dt = ggml_time_us() - t0;
++    if (dt >= min_us) {
++        fprintf(stderr, "abyss sync: line %d event %.2f ms at %.6f for %s\n", line, dt / 1e3, t0 / 1e6, abyss_sync_what);
++    }
++}
++
+ static int ggml_backend_sched_default_n_copies(ggml_backend_t * backends, int n_backends, bool parallel) {
+     if (!parallel) {
+         return 1;
+@@ -1177,8 +1245,18 @@ static void ggml_backend_sched_timing_trace_input(
+ }
+ 
+ static void ggml_backend_sched_free_input_staging(ggml_backend_sched_t sched) {
++    if (sched->abyss_stage_retired != nullptr) {
++        for (ggml_backend_buffer_t buf : *sched->abyss_stage_retired) {
++            ggml_backend_buffer_free(buf);
++        }
++        delete sched->abyss_stage_retired;
++        sched->abyss_stage_retired = nullptr;
++    }
++    delete sched->abyss_stage_toggle;
++    sched->abyss_stage_toggle = nullptr;
+     for (int i = 0; i < sched->n_input_staging; i++) {
+         ggml_backend_buffer_free(sched->input_staging[i].buffer);
++        ggml_backend_event_free(sched->input_staging[i].event);
+     }
+     free(sched->input_staging);
+     sched->input_staging = nullptr;
+@@ -1186,6 +1264,38 @@ static void ggml_backend_sched_free_input_staging(ggml_backend_sched_t sched) {
+     sched->input_staging_capacity = 0;
+ }
+ 
++// abyss: with ABYSS_OVERLAP, whether a GPU still has work queued. A large input of a split on an idle GPU is copied
++// directly, as without the switch: waiting for that GPU costs nothing then, and staging would cost the host a memcpy of
++// the input on the critical path of a call of a ubatch or two
++static bool abyss_backend_busy(ggml_backend_sched_t sched, int backend_id) {
++    ggml_backend_t backend = sched->backends[backend_id];
++    if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_GPU ||
++            backend->device == nullptr || backend->device->iface.event_query == nullptr) {
++        return true;
++    }
++    if (sched->abyss_probe_events[backend_id] == nullptr) {
++        sched->abyss_probe_events[backend_id] = ggml_backend_event_new(ggml_backend_get_device(backend));
++        if (sched->abyss_probe_events[backend_id] == nullptr) {
++            return true;
++        }
++    }
++    ggml_backend_event_record(sched->abyss_probe_events[backend_id], backend);
++    return !ggml_backend_event_query(sched->abyss_probe_events[backend_id]);
++}
++
++// abyss: with ABYSS_OVERLAP, mark the upload just queued from a staging buffer, so the buffer's next use waits for it
++static void abyss_staging_record(ggml_backend_sched_input_staging * staging, ggml_backend_t backend) {
++    if (!abyss_overlap()) {
++        return;
++    }
++    if (staging->event == nullptr) {
++        staging->event = ggml_backend_event_new(ggml_backend_get_device(backend));
++        GGML_ASSERT(staging->event != nullptr);
++    }
++    ggml_backend_event_record(staging->event, backend);
++    staging->recorded = true;
++}
++
+ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
+         ggml_backend_sched_t sched,
+         size_t tensor_id,
+@@ -1194,6 +1304,17 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
+         size_t size) {
+     GGML_ASSERT(size > 0);
+ 
++    // abyss: with ABYSS_OVERLAP each input has two staging buffers per backend and takes the other one on each use, so
++    // a use waits only for the upload of the use before the last, whatever the graphs between
++    if (abyss_overlap()) {
++        if (sched->abyss_stage_toggle == nullptr) {
++            sched->abyss_stage_toggle = new std::unordered_map<uint64_t, int>();
++        }
++        int & next = (*sched->abyss_stage_toggle)[((uint64_t) tensor_id << 8) | (uint64_t) backend_id];
++        copy_id = next;
++        next ^= 1;
++    }
++
+     ggml_backend_sched_input_staging * slot = nullptr;
+     for (int i = 0; i < sched->n_input_staging; i++) {
+         ggml_backend_sched_input_staging * cur = &sched->input_staging[i];
+@@ -1219,9 +1340,17 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
+             /* .copy_id    = */ copy_id,
+             /* .size       = */ 0,
+             /* .buffer     = */ nullptr,
++            /* .event      = */ nullptr,
++            /* .recorded   = */ false,
+         };
+     }
+ 
++    // abyss: with ABYSS_OVERLAP each buffer waits for its own last upload only, before it is written or replaced
++    if (abyss_overlap() && slot->recorded) {
++        abyss_sync_event(slot->event, __LINE__);
++        slot->recorded = false;
++    }
++
+     if (slot->buffer == nullptr || slot->size < size) {
+         // Grow in geometric steps rather than to the exact size. Pinned host
+         // allocation and free synchronize the device, so a slot that grows by
+@@ -1234,7 +1363,15 @@ static ggml_backend_sched_input_staging * ggml_backend_sched_get_input_staging(
+         }
+         size = alloc_size;
+ 
+-        ggml_backend_buffer_free(slot->buffer);
++        if (abyss_overlap() && slot->buffer != nullptr) {
++            // abyss: freeing pinned memory synchronizes the device, keep it until ggml_backend_sched_synchronize
++            if (sched->abyss_stage_retired == nullptr) {
++                sched->abyss_stage_retired = new std::vector<ggml_backend_buffer_t>();
++            }
++            sched->abyss_stage_retired->push_back(slot->buffer);
++        } else {
++            ggml_backend_buffer_free(slot->buffer);
++        }
+ 
+         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
+         ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+@@ -1319,6 +1456,9 @@ static size_t ggml_backend_sched_non_graph_input_staging_max_size(ggml_backend_t
+ }
+ 
+ static bool ggml_backend_sched_should_stage_input(ggml_backend_t backend, const ggml_tensor * input, size_t size) {
++    if (abyss_overlap() && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++        return size > 0;
++    }
+     if (ggml_backend_sched_input_staging_max_size() == 0) {
+         return false;
+     }
+@@ -2330,8 +2470,24 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+ 
+         // the re-allocation may cause the split inputs to be moved to a different address
+         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+-        for (int i = 0; i < sched->n_backends; i++) {
+-            ggml_backend_synchronize(sched->backends[i]);
++        // abyss: with ABYSS_OVERLAP every write of the next graph to a buffer goes behind the work queued on its backend
++        // (kernels and staged uploads on its stream, copies from another GPU after an event of it, a host buffer written
++        // only by the host after its synchronous copies), so a new layout in the same buffers needs no drain; it stays
++        // when the reserve would reallocate a buffer that the queued work still uses
++        bool drain = true;
++        abyss_sync_what = "the new layout";
++        if (abyss_overlap()) {
++            size_t sizes[GGML_SCHED_MAX_BACKENDS] = {0};
++            ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
++            drain = false;
++            for (int i = 0; i < sched->n_backends; i++) {
++                if (sizes[i] > ggml_gallocr_get_buffer_size(sched->galloc, i)) {
++                    drain = true;
++                }
++            }
++        }
++        for (int i = 0; drain && i < sched->n_backends; i++) {
++            abyss_sync_backend(sched->backends[i], __LINE__);
+         }
+ 
+         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+@@ -2377,6 +2533,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+         sched->timing.n_splits += sched->timing.enabled ? 1 : 0;
+         ggml_backend_event_t input_staging_event = sched->input_staging_events[split_backend_id][sched->cur_copy];
++        abyss_sync_what = "the start of the split";
++        int abyss_busy = -1;
++        auto abyss_stage_large = [&](size_t size) {
++            if (size <= 1024*1024) {
++                return true;
++            }
++            if (abyss_busy < 0) {
++                abyss_busy = abyss_backend_busy(sched, split_backend_id) ? 1 : 0;
++            }
++            return abyss_busy == 1;
++        };
+         bool input_staging_event_waited = false;
+         bool input_staging_dst_waited = false;
+         bool input_staging_event_needs_record = false;
+@@ -2396,9 +2563,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !host_goes_on &&
+                 !gpu_goes_on) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
++                abyss_sync_event(sched->events[prev_backend_id][sched->cur_copy], __LINE__);
+             } else {
+-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
++                abyss_sync_backend(sched->backends[prev_backend_id], __LINE__);
+             }
+         }
+ 
+@@ -2411,6 +2578,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+             struct ggml_tensor * input = split->inputs[input_id];
++            abyss_sync_what = input->name;
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+             if (pass == 0 && input != input_cpy && !split->inputs_read[input_id]) {
+                 continue;
+@@ -2426,7 +2594,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             ggml_is_contiguous(input) &&
+                             ggml_is_contiguous(input_cpy) &&
+                             split_backend->iface.set_tensor_async != nullptr &&
+-                            input_staging_event != nullptr) {
++                            input_staging_event != nullptr &&
++                            (!abyss_overlap() || abyss_stage_large(input_size))) {
+                         // Synchronize the previous H2D from this (backend, copy) staging slot
+                         // before get_input_staging may free and reallocate the buffer on a size
+                         // grow. Otherwise the realloc could release a buffer that an in-flight
+@@ -2434,8 +2603,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         // orders the wait ahead of the allocation the same way.
+                         if (!input_staging_event_waited) {
+                             const int64_t t0 = ggml_backend_sched_timing_now(sched);
+-                            if (sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
+-                                ggml_backend_event_synchronize(input_staging_event);
++                            if (!abyss_overlap() && sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
++                                abyss_sync_event(input_staging_event, __LINE__);
+                                 sched->timing.us_graph_input_stage_wait += ggml_backend_sched_timing_dt(sched, t0);
+                             }
+                             sched->input_staging_events_recorded[split_backend_id][sched->cur_copy] = false;
+@@ -2458,8 +2627,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 t0 = ggml_backend_sched_timing_now(sched);
+                                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+-                                } else {
+-                                    ggml_backend_synchronize(split_backend);
++                                } else if (!abyss_overlap()) {
++                                    abyss_sync_backend(split_backend, __LINE__);
+                                 }
+                                 sched->timing.us_graph_input_dst_wait += ggml_backend_sched_timing_dt(sched, t0);
+                                 input_staging_dst_waited = true;
+@@ -2467,6 +2636,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                             t0 = ggml_backend_sched_timing_now(sched);
+                             ggml_backend_tensor_set_async(split_backend, input_cpy, input_staging, 0, input_size);
++                            abyss_staging_record(staging, split_backend);
+                             sched->timing.us_graph_input_set_async += ggml_backend_sched_timing_dt(sched, t0);
+                             input_staging_event_needs_record = true;
+                             input_copied = true;
+@@ -2474,13 +2644,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             ggml_backend_sched_timing_trace_input(sched, "staged", input, input_cpy, input_backend, split_backend);
+                         }
+                     }
++                    // abyss: with ABYSS_OVERLAP an empty input (the output rows of a ubatch without outputs) copies nothing, so it
++                    // does not wait for the GPU either
++                    if (!input_copied && abyss_overlap() && ggml_nbytes(input) == 0) {
++                        input_copied = true;
++                    }
+                     if (!input_copied) {
+                         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                         int64_t t0 = ggml_backend_sched_timing_now(sched);
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                            abyss_sync_event(sched->events[split_backend_id][sched->cur_copy], __LINE__);
+                         } else {
+-                            ggml_backend_synchronize(split_backend);
++                            abyss_sync_backend(split_backend, __LINE__);
+                         }
+                         sched->timing.us_graph_input_wait += ggml_backend_sched_timing_dt(sched, t0);
+                         t0 = ggml_backend_sched_timing_now(sched);
+@@ -2493,6 +2668,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             } else {
+                 sched->timing.n_non_graph_inputs += sched->timing.enabled ? 1 : 0;
+ 
++                // abyss: with ABYSS_OVERLAP an empty input (the rows of a ubatch without outputs for the halves of the
++                // output head) is not copied, so it does not make one GPU wait for all the work queued on the other
++                if (abyss_overlap() && ggml_nbytes(input) == 0) {
++                    continue;
++                }
++
+                 // abyss: async_host_inputs: a small host input of a GPU split from a CPU split is copied on the split
+                 // backend's stream, after the work queued on it, so the host does not wait for the GPU here. The pinned
+                 // staging buffer keeps the data until the copy has run
+@@ -2501,11 +2682,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         input->buffer != nullptr && ggml_backend_buffer_is_host(input->buffer) &&
+                         ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                         ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+-                        async_size > 0 && async_size <= 1024*1024 && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
++                        async_size > 0 && async_size <= abyss_async_host_input_max() &&
++                        (async_size <= 1024*1024 || abyss_stage_large(async_size)) && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
+                         split_backend->iface.set_tensor_async != nullptr && input_staging_event != nullptr) {
+                     if (!input_staging_event_waited) {
+-                        if (sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
+-                            ggml_backend_event_synchronize(input_staging_event);
++                        if (!abyss_overlap() && sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
++                            abyss_sync_event(input_staging_event, __LINE__);
+                         }
+                         sched->input_staging_events_recorded[split_backend_id][sched->cur_copy] = false;
+                         input_staging_event_waited = true;
+@@ -2516,6 +2698,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     GGML_ASSERT(input_staging != nullptr);
+                     memcpy(input_staging, input->data, async_size);
+                     ggml_backend_tensor_set_async(split_backend, input_cpy, input_staging, 0, async_size);
++                    abyss_staging_record(staging, split_backend);
+                     input_staging_event_needs_record = true;
+                     sched->timing.n_non_graph_inputs_staged += sched->timing.enabled ? 1 : 0;
+                     ggml_backend_sched_timing_trace_input(sched, "non_graph_async_host", input, input_cpy, input_backend, split_backend);
+@@ -2533,7 +2716,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // keep the async pipeline. This is configured per scheduler because
+                 // contexts with different ubatch sizes can share one process.
+                 if (sched->sync_non_graph_inputs) {
+-                    ggml_backend_synchronize(split_backend);
++                    abyss_sync_backend(split_backend, __LINE__);
+                 }
+                 // abyss: with overlap_gpus and no events of the copies, an input from another GPU is copied on that GPU's
+                 // stream (the CUDA async copy) after the stream has waited, on the GPUs, for the work queued on the split
+@@ -2554,7 +2737,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+-                    ggml_backend_synchronize(split_backend);
++                    abyss_sync_backend(split_backend, __LINE__);
+                 }
+                 sched->timing.us_non_graph_input_wait += ggml_backend_sched_timing_dt(sched, t0);
+ 
+@@ -2577,7 +2760,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
+                     t0 = ggml_backend_sched_timing_now(sched);
+-                    ggml_backend_synchronize(input_backend);
++                    abyss_sync_backend(input_backend, __LINE__);
+                     sched->timing.us_moe_ids += ggml_backend_sched_timing_dt(sched, t0);
+ 
+                     // get the ids
+@@ -2598,7 +2781,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         t0 = ggml_backend_sched_timing_now(sched);
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+-                        ggml_backend_synchronize(ids_backend);
++                        abyss_sync_backend(ids_backend, __LINE__);
+                         sched->timing.us_moe_ids += ggml_backend_sched_timing_dt(sched, t0);
+ 
+                         // find the used experts
+@@ -2674,8 +2857,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 input_staging_event != nullptr) {
+                             if (!input_staging_event_waited) {
+                                 t0 = ggml_backend_sched_timing_now(sched);
+-                                if (sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
+-                                    ggml_backend_event_synchronize(input_staging_event);
++                                if (!abyss_overlap() && sched->input_staging_events_recorded[split_backend_id][sched->cur_copy]) {
++                                    abyss_sync_event(input_staging_event, __LINE__);
+                                     sched->timing.us_non_graph_input_stage_wait += ggml_backend_sched_timing_dt(sched, t0);
+                                 }
+                                 sched->input_staging_events_recorded[split_backend_id][sched->cur_copy] = false;
+@@ -2694,6 +2877,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                             t0 = ggml_backend_sched_timing_now(sched);
+                             ggml_backend_tensor_set_async(split_backend, input_cpy, input_staging, 0, input_size);
++                            abyss_staging_record(staging, split_backend);
+                             sched->timing.us_non_graph_input_set_async += ggml_backend_sched_timing_dt(sched, t0);
+ 
+                             input_staging_event_needs_record = true;
+@@ -2705,11 +2889,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         if (!input_staged) {
+                             sched->timing.n_non_graph_inputs_fallback += sched->timing.enabled ? 1 : 0;
+                             t0 = ggml_backend_sched_timing_now(sched);
+-                            ggml_backend_synchronize(input_backend);
++                            abyss_sync_backend(input_backend, __LINE__);
+                             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                                abyss_sync_event(sched->events[split_backend_id][sched->cur_copy], __LINE__);
+                             } else {
+-                                ggml_backend_synchronize(split_backend);
++                                abyss_sync_backend(split_backend, __LINE__);
+                             }
+                             sched->timing.us_non_graph_input_fallback_wait += ggml_backend_sched_timing_dt(sched, t0);
+                             t0 = ggml_backend_sched_timing_now(sched);
+@@ -2764,7 +2948,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 // abyss: with async_host_inputs a range the callback reads nothing of is left running, as without a
+                 // callback, so the host can compute meanwhile (the expert stats read only the routing)
+                 if (need || !sched->async_host_inputs) {
+-                    ggml_backend_synchronize(split_backend);
++                    abyss_sync_backend(split_backend, __LINE__);
+                 }
+ 
+                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+@@ -2889,6 +3073,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+             ggml_backend_event_free(sched->input_staging_events[b][c]);
+         }
+         ggml_backend_event_free(sched->overlap_events[b]);
++        ggml_backend_event_free(sched->abyss_probe_events[b]);
+     }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+@@ -3008,6 +3193,13 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
+         sched->next_copy = 0;
+     }
++    // abyss: the outgrown staging buffers of ABYSS_OVERLAP, now that nothing reads them
++    if (sched->abyss_stage_retired != nullptr) {
++        for (ggml_backend_buffer_t buf : *sched->abyss_stage_retired) {
++            ggml_backend_buffer_free(buf);
++        }
++        sched->abyss_stage_retired->clear();
++    }
+ }
+ 
+ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 2855e11..e006bd1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -938,12 +938,30 @@ void llama_context::sched_reserve() {
+             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+ }
+ 
++// abyss: ABYSS_SYNC_TRACE=<ms> prints each ggml_backend_sched_synchronize of the context of at least that long
++static void abyss_sched_sync(ggml_backend_sched_t sched, int line) {
++    static const int64_t min_us = []() {
++        const char * e = getenv("ABYSS_SYNC_TRACE");
++        return e != nullptr ? (int64_t) (atof(e) * 1000) : (int64_t) -1;
++    }();
++    if (min_us < 0) {
++        ggml_backend_sched_synchronize(sched);
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_sched_synchronize(sched);
++    const int64_t dt = ggml_time_us() - t0;
++    if (dt >= min_us) {
++        fprintf(stderr, "abyss sync: llama-context line %d %.2f ms at %.6f\n", line, dt / 1e3, t0 / 1e6);
++    }
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
+-    ggml_backend_sched_synchronize(sched.get());
++    abyss_sched_sync(sched.get(), __LINE__);
+ 
+     moe_ids_flush();
+ 
+@@ -974,6 +992,15 @@ void llama_context::synchronize() {
+     t_compute_start_us = 0;
+ }
+ 
++// abyss: ABYSS_OVERLAP=1, as in the scheduler: the GPUs work on a ubatch while the host goes on to the next one
++static bool abyss_overlap_ctx() {
++    static const bool v = []() {
++        const char * e = getenv("ABYSS_OVERLAP");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return v;
++}
++
+ // abyss: each MoE layer's selected experts (an output of the graph) are copied to a pinned buffer with the logits and
+ // handed to cparams.cb_moe_ids at the next synchronize, so a decode waits for nothing more than its logits; the
+ // selections of an earlier ubatch still in the buffer are handed over first
+@@ -988,12 +1015,27 @@ void llama_context::moe_ids_read(const llm_graph_result * res) {
+         return;
+     }
+ 
+-    if (!moe_ids_pending.empty()) {
+-        ggml_backend_sched_synchronize(sched.get());
++    const bool ring = abyss_overlap_ctx();
++    int ib = 0;
++    if (ring) {
++        // the other buffer than the last ubatch's: its copies are behind the work of the ubatch before the last
++        ib = moe_ids_cur ^ 1;
++        if (moe_ids_recorded[ib]) {
++            for (auto & be : moe_ids_events[ib]) {
++                ggml_backend_event_synchronize(be.second.get());
++            }
++            moe_ids_recorded[ib] = false;
++        }
++        moe_ids_flush_buf(ib);
++        moe_ids_cur = ib;
++    } else if (!moe_ids_pending.empty()) {
++        abyss_sched_sync(sched.get(), __LINE__);
+         moe_ids_flush();
+     }
++    ggml_backend_buffer_ptr & buf_ids = ib ? buf_moe_ids2 : buf_moe_ids;
++    std::vector<moe_ids_entry> & pending = ib ? moe_ids_pending2 : moe_ids_pending;
+ 
+-    if (!buf_moe_ids || ggml_backend_buffer_get_size(buf_moe_ids.get()) < nbytes) {
++    if (!buf_ids || ggml_backend_buffer_get_size(buf_ids.get()) < nbytes) {
+         // room for a full ubatch, so that the buffer is allocated once
+         const size_t size = std::max(nbytes,
+             (size_t) model.hparams.n_layer() * model.hparams.n_expert_used_max() * cparams.n_ubatch * sizeof(int32_t));
+@@ -1004,11 +1046,11 @@ void llama_context::moe_ids_read(const llm_graph_result * res) {
+         if (host_buft) {
+             buft = host_buft;
+         }
+-        buf_moe_ids.reset(ggml_backend_buft_alloc_buffer(buft, size));
+-        GGML_ASSERT(buf_moe_ids != nullptr);
++        buf_ids.reset(ggml_backend_buft_alloc_buffer(buft, size));
++        GGML_ASSERT(buf_ids != nullptr);
+     }
+ 
+-    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_moe_ids.get());
++    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_ids.get());
+     size_t offs = 0;
+     for (size_t il = 0; il < res->t_moe_ids.size(); il++) {
+         ggml_tensor * t = res->t_moe_ids[il];
+@@ -1018,20 +1060,50 @@ void llama_context::moe_ids_read(const llm_graph_result * res) {
+         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+         GGML_ASSERT(backend != nullptr);
+         ggml_backend_tensor_get_async(backend, t, base + offs, 0, ggml_nbytes(t));
+-        moe_ids_pending.push_back({ (int32_t) il, (int32_t) t->ne[0], (int32_t) t->ne[1], offs });
++        pending.push_back({ (int32_t) il, (int32_t) t->ne[0], (int32_t) t->ne[1], offs });
+         offs += ggml_nbytes(t);
++        if (ring) {
++            bool known = false;
++            for (const auto & be : moe_ids_events[ib]) {
++                known = known || be.first == backend;
++            }
++            if (!known) {
++                moe_ids_events[ib].emplace_back(backend, ggml_backend_event_ptr(ggml_backend_event_new(ggml_backend_get_device(backend))));
++                GGML_ASSERT(moe_ids_events[ib].back().second != nullptr);
++            }
++        }
++    }
++    if (ring) {
++        // after the copies queued above on each backend
++        for (auto & be : moe_ids_events[ib]) {
++            ggml_backend_event_record(be.second.get(), be.first);
++        }
++        moe_ids_recorded[ib] = true;
+     }
+ }
+ 
+ void llama_context::moe_ids_flush() {
+-    if (moe_ids_pending.empty()) {
++    if (abyss_overlap_ctx()) {
++        // all the copies are done after a synchronize: the older buffer first
++        moe_ids_flush_buf(moe_ids_cur ^ 1);
++        moe_ids_flush_buf(moe_ids_cur);
++        moe_ids_recorded[0] = moe_ids_recorded[1] = false;
++        return;
++    }
++    moe_ids_flush_buf(0);
++}
++
++void llama_context::moe_ids_flush_buf(int i) {
++    std::vector<moe_ids_entry> & pending = i ? moe_ids_pending2 : moe_ids_pending;
++    if (pending.empty()) {
+         return;
+     }
+-    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf_moe_ids.get());
+-    for (const auto & e : moe_ids_pending) {
++    const ggml_backend_buffer_ptr & buf_ids = i ? buf_moe_ids2 : buf_moe_ids;
++    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf_ids.get());
++    for (const auto & e : pending) {
+         cparams.cb_moe_ids(e.il, (const int32_t *) (base + e.offs), e.n_used, e.n_tokens, cparams.cb_moe_ids_user_data);
+     }
+-    moe_ids_pending.clear();
++    pending.clear();
+ }
+ 
+ const llama_model & llama_context::get_model() const {
+@@ -1902,7 +1974,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return env && atoi(env) != 0;
+         }();
+         if (cparams.pipeline_parallel && !reuse_no_drain) {
+-            ggml_backend_sched_synchronize(sched.get());
++            abyss_sched_sync(sched.get(), __LINE__);
+         }
+ 
+         n_reused++;
+@@ -1917,7 +1989,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // when a server slot joins, leaves, or is replaced. Ordinary single-sequence
+         // shape changes retain their cross-ubatch overlap.
+         if (cparams.pipeline_parallel && !graph_seq_ids.empty() && graph_sequence_layout_changed) {
+-            ggml_backend_sched_synchronize(sched.get());
++            abyss_sched_sync(sched.get(), __LINE__);
+         }
+ 
+         gf_res_prev_active = nullptr;
+@@ -2654,7 +2726,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+                         // the prefill pipelining within each ring-sized window.
+                         const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
+                         if (n_copies > 1 && (++embd_pre_norm_accum_ub % n_copies) == 0) {
+-                            ggml_backend_sched_synchronize(sched.get());
++                            abyss_sched_sync(sched.get(), __LINE__);
+                         }
+                     }
+                 } else {
+@@ -3099,7 +3171,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+         // whose copy waits on it on the device.
+         const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
+         if (!taps_static && n_copies > 1 && (++layer_inp_accum_ub % n_copies) == 0) {
+-            ggml_backend_sched_synchronize(sched.get());
++            abyss_sched_sync(sched.get(), __LINE__);
+         }
+     }
+     return extracted;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index f75f77e..1d4344a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -490,8 +490,18 @@ private:
+     std::vector<moe_ids_entry> moe_ids_pending;
+     ggml_backend_buffer_ptr    buf_moe_ids; // pinned
+ 
++    // abyss: with ABYSS_OVERLAP the selections alternate between that buffer and this one, each with an event per backend
++    // after its copies, so a ubatch hands over the selections of the one before the last after waiting for their copies
++    // only, not for all the work queued on the GPUs
++    std::vector<moe_ids_entry> moe_ids_pending2;
++    ggml_backend_buffer_ptr    buf_moe_ids2; // pinned
++    std::vector<std::pair<ggml_backend_t, ggml_backend_event_ptr>> moe_ids_events[2];
++    bool moe_ids_recorded[2] = { false, false };
++    int  moe_ids_cur = 1; // the buffer of the last ubatch, so the first one takes the first buffer
++
+     void moe_ids_read(const llm_graph_result * res);
+     void moe_ids_flush();
++    void moe_ids_flush_buf(int i);
+ 
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+-- 
+2.43.0
+
