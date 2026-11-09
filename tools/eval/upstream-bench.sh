@@ -10,9 +10,11 @@
 # template (the prompt and tokens of fixed requests, upstream_template.py), greedy (greedy_kl.py on PROMPTS corpus
 # slices), same (the 96k prompt of ctx_size.py, its prefill and 32 greedy tokens), session (decode_modes.py: REPEAT
 # corpus copies, ROUNDS turns per mode, SEED), agent (agent_turns.py: AGENT_TURNS turns of AGENT_TOKENS tokens on
-# AGENT_REPEAT copies), fill (ctx_size.py fill FILL, default 196608). Each entry prints its load time, both GPUs' memory
+# AGENT_REPEAT copies), fill (ctx_size.py fill FILL, default 196608), split (ckpt_split.py: two conversations with many
+# messages from scratch, edited at about 60% and one more turn, with the llama_decode() calls and checkpoints the
+# server log shows for each, from mx-llama.cpp/0045 on). Each entry prints its load time, both GPUs' memory
 # after loading and at the peak (sampled every 0.5 s), what its log says about buffers and the MoE cache, and the
-# tests' results; greedy, same and template are compared with the first entry. FORK_ARGS and UP_ARGS add arguments to
+# tests' results; greedy, same, template and split are compared with the first entry. FORK_ARGS and UP_ARGS add arguments to
 # the servers of that kind (UP_ARGS="-lv 4" makes upstream log its MoE cache statistics at exit, and a few debug lines
 # per token). DROP_CACHE=1 drops the model files from
 # the page cache before each entry. Waits for the production server to go idle, saves its slot and stops it, and
@@ -80,7 +82,7 @@ for c in $CONFIGS; do
       ABYSS_EXPERT_STATS="$O/stats-$name.json" ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_DECODE_PREFETCH=1 ABYSS_DIST_VEC=1
       ABYSS_MOE_EVICT=cold ABYSS_MOE_ADMIT_GATE=1 ABYSS_MOE_SKIP_ZERO=1 ABYSS_HC_FUSE=1 ABYSS_GATHER_FUSE=1
       ABYSS_HEAD_SPLIT=0.5 ABYSS_SAMPLE_FAST=1 ABYSS_MMVQ_TAIL=1 ABYSS_GRAPH_CHUNK=128 ABYSS_ENGRAM_KEEPALIVE_MS=4
-      ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_GEN_CKPT=256 ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x)
+      ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_GEN_CKPT=256 ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x ABYSS_CKPT_COUNT_START=1)
     kind_args=(${FORK_ARGS:-})
   else
     bin=$UP_BIN model=$UP_MODEL cache=${UP_CACHE:-16000} tmpl=$O/v41-upstream.jinja
@@ -136,6 +138,8 @@ for p in sys.argv[1:]:
             echo "  agent_turns.py failed, see $O/agent-$name.txt"
           sed 's/^/  agent /' "$O/agent-$name.txt" ;;
         fill) CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" fill "${FILL:-196608}" "$O/fill-$name.json" | sed 's/^/  /' ;;
+        split) CKPT_URL=http://127.0.0.1:$PORT python3 -I "$E/ckpt_split.py" "$E/corpus.txt" run "$O/split-$name.json" --log "$log" |
+            sed 's/^/  split /' ;;
       esac
     done
     kill -TERM $spid 2>/dev/null
@@ -164,6 +168,8 @@ for p in sys.argv[1:]:
           python3 -I "$E/greedy_kl.py" compare "$O/greedy-$first.json" "$O/greedy-$name.json" | sed "s/^/  $first vs $name, corpus slices: /" ;;
         same) [ -s "$O/same-$first.json" ] && [ -s "$O/same-$name.json" ] &&
           echo "  $first vs $name, 96k prompt: $(python3 -I "$E/ctx_size.py" "$E/corpus.txt" compare "$O/same-$first.json" "$O/same-$name.json")" ;;
+        split) [ -s "$O/split-$first.json" ] && [ -s "$O/split-$name.json" ] &&
+          python3 -I "$E/ckpt_split.py" "$E/corpus.txt" compare "$O/split-$first.json" "$O/split-$name.json" | sed "s/^/  $first vs $name, split /" ;;
       esac
     done
   fi
