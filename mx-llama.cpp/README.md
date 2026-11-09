@@ -52,6 +52,8 @@
 | `0045-ckpt-count-start.patch` | 长提示词按 `--checkpoint-min-step` 在用户消息开头拆调用建检查点时，算上这次调用开头要建的检查点（`ABYSS_CKPT_COUNT_START=1`）：这个检查点在组完 batch 之后才建，原来下一条用户消息拿上一个检查点量步长，紧接着又切一刀，成了几百 token、不建检查点的调用，CED 下每次多读一遍主机内存里的专家（约 1.7 s）；`ABYSS_CKPT_TAIL_MERGE` 的末段合并也从这个检查点起就生效（原来要等列表里有了检查点）。检查点的位置不变，只少了最后一次调用开头那个多余的。16 条消息的 9.6 万 token 提示词从头算 6 → 4 次调用（36.0 → 30.6 s），11.2 万 token 的智能体会话 8 → 5 次（42.1 → 36.9 s）。每个请求在耗时后面多一行 `abyss: the prompt took N calls, a + b + … tokens, checkpoints at …`（不受开关控制）（`tools/eval/ckpt_split.py`、`upstream-bench.sh` 的 `split`） |
 | `0046-weight-nowait.patch` | 大批次上传不再让主机等（`ABYSS_WEIGHT_NOWAIT=1`）：调度器拷一段主机上的权重之前，没有事件时原来都先让主机等目标卡做完；第 22–39 层大批次分给 GPU0 的专家分 gate、up、down 三段上传，主机每段都要等上一段传完，CPU 那份专家要等三段都排完才开始，每层末尾两卡一起空约 23 ms。交给拷贝回调的主机权重不再先等：回调把拷贝排在目标卡自己的流上、在用到同一块显存的计算之后，读设备数据或改写主机数据的路径（专家缓存查表、读 id）本来自己同步。智能体之后每轮预填充 2.33 → 1.96 s，9.6 万 token 提示词 27.6 → 26.8 s，结果逐位相同（`tools/eval/big-pipe.sh`、`nsys_big.py`） |
 
+实验，不在上面的序列里，没有上线：`experiments/tp-layers.diff`（fork 分支 `abyss-tp`，叠在 `0046` 上）让 `-sm layer` 下的前 N 层在一个跨两卡的 Meta 设备上张量并行（`ABYSS_TP_LAYERS=N`，`ABYSS_TP_SPLIT=F` 是第一张卡的份额，`ABYSS_TP_SEAM=0` 关掉交接处的卡上直拷），另把 Engram 的 `engram_q`、`engram_k` 按 cast 测设备支持（原来按 MUL，CUDA 没有 BF16 的 MUL，它们被放在 CPU，每层两小段 CPU）。同样的专家缓存下解码快约 1.2 ms/token，长提示词预填充慢约 8%，Meta 设备每卡多一块计算缓冲区，缓存要少约 7 GB，所以停在原型（见 CLAUDE.md「第 0–19 层张量并行原型」）。在 `0046` 之后 `git apply <abyss>/mx-llama.cpp/experiments/tp-layers.diff`
+
 ## 安装
 
 ```bash

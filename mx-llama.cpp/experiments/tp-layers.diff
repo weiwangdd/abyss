@@ -1,0 +1,288 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index c308ed7..18ef0f1 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -106,6 +106,7 @@ extern "C" {
+     GGML_API size_t         ggml_backend_meta_n_stages      (ggml_backend_t meta_backend);
+     GGML_API void           ggml_backend_meta_graph_begin   (ggml_backend_t meta_backend);
+     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
++    GGML_API struct ggml_tensor * ggml_backend_meta_mirrored_tensor(const struct ggml_tensor * tensor, size_t index);
+ 
+     //
+     // Backend (stream)
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 54476db..b7fc20d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -799,6 +799,25 @@ static uint32_t ggml_backend_meta_mirror_lane_mask(const ggml_backend_meta_split
+ 
+ // True when lane j holds no copy of the MIRRORED tensor that owns this tensor's data, so reads, writes and compute must not touch that lane.
+ // A view carries its full shape on every lane, so presence is decided by the view root, which is where the mask left an empty tensor.
++static bool ggml_backend_meta_mirror_lane_absent(const struct ggml_tensor * tensor, size_t j);
++
++// abyss: the copy on lane j of a tensor the Meta device holds whole on every lane, null when it holds it split, or not
++// on that lane; a plain backend of the lane's device copies the tensor from there (ABYSS_TP_LAYERS)
++struct ggml_tensor * ggml_backend_meta_mirrored_tensor(const struct ggml_tensor * tensor, size_t j) {
++    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) || !ggml_is_contiguous(tensor)) {
++        return nullptr;
++    }
++    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
++    if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED || ss.n_segments != 1 || ggml_backend_meta_mirror_lane_absent(tensor, j)) {
++        return nullptr;
++    }
++    ggml_tensor * simple = ggml_backend_meta_buffer_simple_tensor(tensor, j);
++    if (simple == nullptr || simple->data == nullptr || !ggml_is_contiguous(simple) || ggml_nbytes(simple) != ggml_nbytes(tensor)) {
++        return nullptr;
++    }
++    return simple;
++}
++
+ static bool ggml_backend_meta_mirror_lane_absent(const struct ggml_tensor * tensor, size_t j) {
+     const ggml_tensor * root = tensor;
+     while (root->view_src != nullptr) {
+@@ -1631,19 +1650,27 @@ static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+     return ggml_is_view(tensor) && ggml_backend_buffer_is_host(tensor->view_src->buffer);
+ }
+ 
++// abyss: with a Meta device next to plain GPUs (ABYSS_TP_LAYERS) a split of the Meta device can also hold a view of
++// another device's tensor: a view op starts no split, so a view the next layer builds before its first op (the
++// compressor state of the first layer after the Meta device's) lands in the split before it. Like a host view it is
++// not computed here, and a consumer on the Meta device gets the scheduler's copy of it
++static bool ggml_backend_meta_is_foreign_view(const struct ggml_tensor * tensor) {
++    return ggml_is_view(tensor) && tensor->view_src->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->view_src->buffer);
++}
++
+ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+     // [TAG_META_HOST_VIEWS]
+     // TODO: technically, this check should not be needed if the backend scheduler correctly prevents assigning
+     //       such host-buffer views to the meta backend. figure out how to update the scheduler logic to achieve that
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/30217
+     if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+-        if (!ggml_backend_meta_is_host_view(tensor)) {
++        if (!ggml_backend_meta_is_host_view(tensor) && !ggml_backend_meta_is_foreign_view(tensor)) {
+             // name the tensor rather than aborting on a bare line number, this fires under -tps when a node ends up outside the meta buffer
+             GGML_LOG_ERROR("%s: tensor '%s' (op %s) is not in a meta buffer, it is in '%s'%c",
+                     __func__, tensor->name, ggml_op_name(tensor->op),
+                     tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)", 10);
+         }
+-        GGML_ASSERT(ggml_backend_meta_is_host_view(tensor));
++        GGML_ASSERT(ggml_backend_meta_is_host_view(tensor) || ggml_backend_meta_is_foreign_view(tensor));
+ 
+         // the view is not allocated in the meta buffer, it is not split across the sub-devices
+         return { GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1 };
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f2b4024..1b60dc5 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1293,6 +1293,49 @@ static bool abyss_backend_busy(ggml_backend_sched_t sched, int backend_id) {
+     return !ggml_backend_event_query(sched->abyss_probe_events[backend_id]);
+ }
+ 
++// abyss: with a Meta device among the backends (ABYSS_TP_LAYERS), an input it computed whole on every lane is copied
++// for a split on a GPU that one of its lanes runs on from that lane, on the GPU: the lane's stream waits for the work the
++// split's backend has queued (it may still read the memory of the copy, as with overlap_gpus), the CUDA copy then follows
++// the lane's work on its stream and the split's stream waits for it. The host used to wait for the whole Meta device and
++// copy the tensor through host memory, so it could queue nothing after the seam until the Meta device was done.
++// ABYSS_TP_SEAM=0 keeps that path
++static bool abyss_meta_seam_copy(ggml_backend_sched_t sched, ggml_backend_t input_backend, int split_backend_id,
++        const struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
++    static const bool enabled = [] {
++        const char * e = getenv("ABYSS_TP_SEAM");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    ggml_backend_t split_backend = sched->backends[split_backend_id];
++    if (!enabled || input_backend == nullptr || !ggml_backend_is_meta(input_backend) || ggml_backend_is_meta(split_backend) ||
++            split_backend->iface.cpy_tensor_async == NULL ||
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_GPU ||
++            input_cpy->buffer == NULL || !ggml_is_contiguous(input_cpy)) {
++        return false;
++    }
++    ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
++    for (size_t j = 0; j < ggml_backend_meta_n_backends(input_backend); j++) {
++        ggml_backend_t lane = ggml_backend_meta_simple_backend(input_backend, j);
++        if (ggml_backend_get_device(lane) != dev) {
++            continue;
++        }
++        ggml_tensor * src = ggml_backend_meta_mirrored_tensor(input, j);
++        if (src == NULL || ggml_nbytes(src) != ggml_nbytes(input_cpy)) {
++            return false;
++        }
++        if (sched->overlap_events[split_backend_id] == NULL) {
++            sched->overlap_events[split_backend_id] = ggml_backend_event_new(dev);
++        }
++        ggml_backend_event_t ev = sched->overlap_events[split_backend_id];
++        if (ev == NULL) {
++            return false;
++        }
++        ggml_backend_event_record(ev, split_backend);
++        ggml_backend_event_wait(lane, ev);
++        return split_backend->iface.cpy_tensor_async(lane, split_backend, src, input_cpy);
++    }
++    return false;
++}
++
+ // abyss: with ABYSS_OVERLAP, mark the upload just queued from a staging buffer, so the buffer's next use waits for it
+ static void abyss_staging_record(ggml_backend_sched_input_staging * staging, ggml_backend_t backend) {
+     if (!abyss_overlap()) {
+@@ -2728,6 +2771,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 if (sched->sync_non_graph_inputs) {
+                     abyss_sync_backend(split_backend, __LINE__);
+                 }
++                // abyss: an input from the Meta device of ABYSS_TP_LAYERS, copied on the GPU
++                if (abyss_meta_seam_copy(sched, input_backend, split_backend_id, input, input_cpy)) {
++                    sched->timing.us_non_graph_input_wait += ggml_backend_sched_timing_dt(sched, t0);
++                    continue;
++                }
+                 // abyss: with overlap_gpus and no events of the copies, an input from another GPU is copied on that GPU's
+                 // stream (the CUDA async copy) after the stream has waited, on the GPUs, for the work queued on the split
+                 // backend, instead of the host waiting for that work
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 3e73c50..7dba533 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -837,8 +837,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_HC_HEAD_UP,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ENGRAM_EMBED,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+-    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+-    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    // abyss: the graph casts these bf16 weights to f32 before it multiplies them, and a device that has no bf16 MUL (CUDA)
++    // left them on the CPU: their casts were CPU splits of their own, two in each Engram layer, which cut the layers of a
++    // Meta device (ABYSS_TP_LAYERS) into three calls a token
++    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
++    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+     {LLM_TENSOR_HC_ATTN_FN,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_HC_ATTN_BASE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+     {LLM_TENSOR_HC_ATTN_SCALE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e006bd1..8a51764 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -478,7 +478,8 @@ llama_context::llama_context(
+             !model.has_tensor_overrides() &&
+             ((model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1) ||
+              model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) &&
+-            cparams.moe_cache_size == 0; // not supported by the MoE cache
++            cparams.moe_cache_size == 0 && // not supported by the MoE cache
++            llama_abyss_tp_layers() == 0;  // abyss: nor by the Meta device of ABYSS_TP_LAYERS
+ 
+         // The MTP draft context replays only a few small (single-layer) decodes at begin(); a deep
+         // pipeline ring adds idle compute-buffer copies with no throughput benefit for that tiny
+@@ -609,8 +610,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             // A fused node that the scheduler placed on a sibling device of the same kind, one that supports the op, is not a
+             // missing-support fallback. It happens when every input of the node was produced on the previous layer's device,
+             // as with the DeepSeek-V4.1 carried hyper-connection mix under -sm layer. The unfused chain would sit there too.
++            // abyss: the same holds for the first layer after those of ABYSS_TP_LAYERS, whose carried mix comes from the
++            // Meta device
+             const bool sibling_ok = device_fused != nullptr && device_layer != nullptr && device_fused != device_layer &&
+-                ggml_backend_dev_type(device_fused) == ggml_backend_dev_type(device_layer) &&
++                (ggml_backend_dev_type(device_fused) == ggml_backend_dev_type(device_layer) ||
++                 ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_META) &&
+                 ggml_backend_dev_supports_op(device_fused, node.tensor);
+             if (sibling_ok) {
+                 LLAMA_LOG_INFO("%s: layer %d is assigned to device %s and %s runs on sibling device %s, accepted\n",
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6025fe4..89a6240 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1242,7 +1242,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     }
+     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
+-        const float * tensor_split = ud->model->tensor_split();
++        // abyss: under ABYSS_TP_LAYERS the model's tensor split places the layers, so the two lanes take ABYSS_TP_SPLIT
++        const float tp_split[2] = { llama_abyss_tp_split(), 1.0f - llama_abyss_tp_split() };
++        const bool  tp_hybrid   = ud->model->split_mode() == LLAMA_SPLIT_MODE_LAYER && llama_abyss_tp_layers() > 0;
++        GGML_ASSERT(!tp_hybrid || ud->n_devices == 2);
++        const float * tensor_split = tp_hybrid ? tp_split : ud->model->tensor_split();
+         std::vector<float> tensor_split_scan;
+         tensor_split_scan.reserve(n_lanes);
+         // In multi-stage TP we shard only across this stage's lanes [lane_base, lane_base+tps).
+@@ -2125,6 +2129,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         pimpl->dev_layer[il] = get_layer_buft_list(il);
+     }
+ 
++    // abyss: ABYSS_TP_LAYERS=N gives the layers [0, N) that are on a GPU to the Meta device (see llama_abyss_tp_layers)
++    if (split_mode == LLAMA_SPLIT_MODE_LAYER && llama_abyss_tp_layers() > 0) {
++        const auto it = std::find_if(devices.begin(), devices.end(), [](const llama_device & d) { return d.is_meta; });
++        if (it == devices.end()) {
++            throw std::runtime_error("ABYSS_TP_LAYERS needs two GPUs");
++        }
++        const int n_tp = std::min<int>(llama_abyss_tp_layers(), hparams.n_layer());
++        for (int il = 0; il < n_tp; ++il) {
++            if (pimpl->dev_layer[il].dev != cpu_dev) {
++                pimpl->dev_layer[il] = { it->dev, &pimpl->gpu_buft_list.at(it->dev) };
++            }
++        }
++        LLAMA_LOG_INFO("%s: abyss: layers [0, %d) on %s\n", __func__, n_tp, ggml_backend_dev_name(it->dev));
++    }
++
+     // assign the output layer
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+ 
+@@ -2987,6 +3006,22 @@ bool llama_abyss_head_split_only() {
+     return on;
+ }
+ 
++int32_t llama_abyss_tp_layers() {
++    static const int32_t n = [] {
++        const char * e = getenv("ABYSS_TP_LAYERS");
++        return e != nullptr ? std::max(atoi(e), 0) : 0;
++    }();
++    return n;
++}
++
++float llama_abyss_tp_split() {
++    static const float f = [] {
++        const char * e = getenv("ABYSS_TP_SPLIT");
++        return e != nullptr ? std::clamp((float) atof(e), 0.05f, 0.95f) : 0.5f;
++    }();
++    return f;
++}
++
+ template<typename F>
+ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, F & fn) {
+     ggml_init_params params = {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 0ac910b..72adf65 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -842,6 +842,12 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
+ // from the file onto another GPU and the rest onto the head's own (deepseek4, deepseek41)
+ bool llama_abyss_head_split_only();
+ 
++// abyss: ABYSS_TP_LAYERS=N runs the layers [0, N) tensor-parallel on a Meta device over the first two GPUs, listed after
++// the GPUs themselves, and leaves the other layers to -sm layer; ABYSS_TP_SPLIT=F is the first GPU's share of each split
++// weight (default 0.5)
++int32_t llama_abyss_tp_layers();
++float   llama_abyss_tp_split();
++
+ struct llama_model_base : public llama_model {
+     friend struct llama_model;
+ 
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 5abec87..b8fd0ec 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -346,6 +346,21 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+         // add GPUs
+         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
+ 
++        // abyss: ABYSS_TP_LAYERS adds a Meta device over the first two GPUs after the GPUs themselves, for the layers it
++        // runs tensor-parallel (see llama_abyss_tp_layers)
++        if (params.split_mode == LLAMA_SPLIT_MODE_LAYER && llama_abyss_tp_layers() > 0 && gpus.size() >= 2) {
++            ggml_backend_dev_t tp_devs[2] = { gpus[0].dev, gpus[1].dev };
++            model->get_split_state_ud.n_devices = 2;
++            model->get_split_state_ud.n_stages  = 1;
++            model->get_split_state_ud.model     = model;
++            LLAMA_LOG_INFO("%s: abyss: a Meta device over %s and %s for the layers [0, %d), first share %.3f\n", __func__,
++                    ggml_backend_dev_name(tp_devs[0]), ggml_backend_dev_name(tp_devs[1]), llama_abyss_tp_layers(),
++                    llama_abyss_tp_split());
++            model->devices.push_back({
++                true, ggml_backend_meta_device(tp_devs, 2, 2, llama_meta_device_get_split_state, &model->get_split_state_ud)
++            });
++        }
++
+         // add integrated GPUs only if no discrete GPUs were found
+         // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
+         if (gpus.empty()) {

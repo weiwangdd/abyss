@@ -6,18 +6,21 @@
 # production, GGML_CUDA_MMQ_PREC=q8 (upstream's default for MXFP4 on Blackwell is 4-bit activations, the official
 # reference is W4A8) and the template with the V4.1 tag literal upstream detects. Settings: CACHE=<MiB>
 # (--moe-cache-mib, default 21100 for fork, UP_CACHE for up), SHARE=<f> (--moe-cache-cpu-share, up only, default
-# UP_SHARE), T=<n> CPU threads, BIN=<dir>, MODEL=<gguf>; other VAR=VALUE go to the environment. TESTS, in order:
+# UP_SHARE), T=<n> CPU threads, BIN=<dir>, MODEL=<gguf>, TS=<split> (-ts, default 12/29), OT=<overrides> (-ot, default
+# production's two, ';' standing for ','), ARGS=<arguments> (added to that entry's command line, ';' standing for ' ');
+# other VAR=VALUE go to the environment. TESTS, in order:
 # template (the prompt and tokens of fixed requests, upstream_template.py), greedy (greedy_kl.py on PROMPTS corpus
 # slices), same (the 96k prompt of ctx_size.py, its prefill and 32 greedy tokens), session (decode_modes.py: REPEAT
 # corpus copies, ROUNDS turns per mode, SEED), agent (agent_turns.py: AGENT_TURNS turns of AGENT_TOKENS tokens on
 # AGENT_REPEAT copies), fill (ctx_size.py fill FILL, default 196608), split (ckpt_split.py: two conversations with many
 # messages from scratch, edited at about 60% and one more turn, with the llama_decode() calls and checkpoints the
-# server log shows for each, from mx-llama.cpp/0045 on). Each entry prints its load time, both GPUs' memory
+# server log shows for each, from mx-llama.cpp/0045 on), short (one greedy completion of 8 tokens on a short prompt,
+# to log a few decode steps). Each entry prints its load time, both GPUs' memory
 # after loading and at the peak (sampled every 0.5 s), what its log says about buffers and the MoE cache, and the
 # tests' results; greedy, same, template and split are compared with the first entry. FORK_ARGS and UP_ARGS add arguments to
 # the servers of that kind (UP_ARGS="-lv 4" makes upstream log its MoE cache statistics at exit, and a few debug lines
 # per token). DROP_CACHE=1 drops the model files from
-# the page cache before each entry. Waits for the production server to go idle, saves its slot and stops it, and
+# the page cache before each entry, STOP_ON_FAIL=1 skips the entries after one whose server does not come up. Waits for the production server to go idle, saves its slot and stops it, and
 # restarts it at the end (RESTART=0 never, RESTART=1 also when it was not running; ~/abyss-stats/restart.sh restores
 # the slot).
 set -u
@@ -73,6 +76,9 @@ for c in $CONFIGS; do
   [ -n "$settings" ] && IFS=, read -r -a extra_env <<< "$settings"
   threads=16
   share=${UP_SHARE:-0}
+  ts=12/29
+  entry_args=()
+  ot='blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0'
   if [ "$kind" = fork ]; then
     bin=$FORK_BIN model=$FORK_MODEL cache=21100 tmpl=$HOME/abyss-stats/tmpl/v41.jinja
     base_env=(GGML_CUDA_Q8_1_CACHE=0 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CED_PREFILL=1
@@ -96,9 +102,13 @@ for c in $CONFIGS; do
       T=*) threads=${extra_env[$k]#T=}; unset 'extra_env[k]' ;;
       CACHE=*) cache=${extra_env[$k]#CACHE=}; unset 'extra_env[k]' ;;
       SHARE=*) share=${extra_env[$k]#SHARE=}; unset 'extra_env[k]' ;;
+      TS=*) ts=${extra_env[$k]#TS=}; unset 'extra_env[k]' ;;
+      OT=*) ot=${extra_env[$k]#OT=}; ot=${ot//;/,}; unset 'extra_env[k]' ;;
+      ARGS=*) a=${extra_env[$k]#ARGS=}; read -r -a entry_args <<< "${a//;/ }"; unset 'extra_env[k]' ;;
     esac
   done
   [ "$kind" = up ] && kind_args+=("$share")
+  kind_args+=("${entry_args[@]}")
   log=$O/server-$name.log
   echo "### $name ($kind): cache $cache MiB${kind_args[*]:+, ${kind_args[*]}}${settings:+, $settings} $(date +%T)"
   if [ -n "${DROP_CACHE:-}" ]; then
@@ -110,8 +120,7 @@ for p in sys.argv[1:]:
   mpid=$!
   t0=$SECONDS
   env "${base_env[@]}" "${extra_env[@]}" \
-    "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t "$threads" \
-    -ot 'blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0' \
+    "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts "$ts" -fa 1 -lm dio -t "$threads" -ot "$ot" \
     -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib "$cache" "${kind_args[@]}" --checkpoint-min-step 32768 \
     --jinja --chat-template-file "$tmpl" --no-reasoning-preserve \
     --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0 --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 &
@@ -140,6 +149,10 @@ for p in sys.argv[1:]:
         fill) CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" fill "${FILL:-196608}" "$O/fill-$name.json" | sed 's/^/  /' ;;
         split) CKPT_URL=http://127.0.0.1:$PORT python3 -I "$E/ckpt_split.py" "$E/corpus.txt" run "$O/split-$name.json" --log "$log" |
             sed 's/^/  split /' ;;
+        short) curl -s -m 300 "http://127.0.0.1:$PORT/completion" -H "Content-Type: application/json" \
+            -d '{"prompt": "The capital of France is", "n_predict": 8, "temperature": 0, "cache_prompt": false}' |
+            python3 -I -c 'import json, sys; r = json.load(sys.stdin); print(repr(r.get("content")), r.get("timings", {}).get("predicted_per_second"))' |
+            sed 's/^/  short /' ;;
       esac
     done
     kill -TERM $spid 2>/dev/null
@@ -175,6 +188,10 @@ for p in sys.argv[1:]:
   fi
   [ -z "$first" ] && first=$name
   gpus_free
+  if [ $up = 0 ] && [ -n "${STOP_ON_FAIL:-}" ]; then
+    echo "### $name did not come up, skipping the rest"
+    break
+  fi
 done
 
 if [ "${RESTART:-}" != 0 ] && { [ -n "$pid" ] || [ "${RESTART:-}" = 1 ]; }; then
