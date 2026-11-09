@@ -323,6 +323,10 @@ struct server_slot {
     int32_t n_gen_ckpt    = 0;
     int64_t t_gen_ckpt_us = 0;
 
+    // abyss: the llama_decode() calls the current task's prompt took (their sizes) and where they made checkpoints
+    std::vector<int32_t> prompt_calls;
+    std::vector<int32_t> prompt_ckpts;
+
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
@@ -461,6 +465,9 @@ struct server_slot {
         gen_ckpt_step = 0;
         n_gen_ckpt    = 0;
         t_gen_ckpt_us = 0;
+
+        prompt_calls.clear();
+        prompt_ckpts.clear();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -790,6 +797,19 @@ struct server_slot {
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
         if (n_gen_ckpt > 0) {
             SLT_INF(*this, "abyss: %d checkpoints in the answer, %.2f ms\n", n_gen_ckpt, t_gen_ckpt_us / 1e3);
+        }
+
+        if (!prompt_calls.empty()) {
+            std::string calls;
+            for (const auto n : prompt_calls) {
+                calls += (calls.empty() ? "" : " + ") + std::to_string(n);
+            }
+            std::string ckpts;
+            for (const auto n : prompt_ckpts) {
+                ckpts += " " + std::to_string(n);
+            }
+            SLT_INF(*this, "abyss: the prompt took %zu calls, %s tokens, checkpoints at%s\n", prompt_calls.size(),
+                    calls.c_str(), ckpts.empty() ? " none" : ckpts.c_str());
         }
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
@@ -4635,6 +4655,21 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // abyss: ABYSS_CKPT_COUNT_START=1 counts the checkpoint this batch makes at its start (after the loop
+                    // below, so that it holds the state before the batch) when the loop decides where to break: the next user
+                    // message is measured from it, and the merged tail applies once it is the first checkpoint. Measured from
+                    // the checkpoint before it, a step reached at the start of the batch let the next user message break the
+                    // prompt again, into a call of a few hundred tokens that made no checkpoint and, with the CED-aware
+                    // prefill, read the host-resident experts once more (about 1.7 s a call)
+                    static const bool ckpt_count_start = [] {
+                        const char * e = getenv("ABYSS_CKPT_COUNT_START");
+                        return e != nullptr && atoi(e) != 0;
+                    }();
+                    const int32_t n_batch_start = slot.prompt.n_tokens();
+                    const bool ckpt_at_start = ckpt_count_start && do_checkpoint && spans.is_user_start(n_batch_start) && (
+                            slot.prompt.checkpoints.empty() || n_batch_start == last_user_pos ||
+                            n_batch_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4682,7 +4717,7 @@ private:
                             const char * e = getenv("ABYSS_CKPT_TAIL_MERGE");
                             return e != nullptr ? std::max(0, atoi(e)) : 0;
                         }();
-                        const bool in_merged_tail = ckpt_tail_merge > 0 && !slot.prompt.checkpoints.empty() &&
+                        const bool in_merged_tail = ckpt_tail_merge > 0 && (!slot.prompt.checkpoints.empty() || ckpt_at_start) &&
                             slot.task->n_tokens() - slot.prompt.n_tokens() > 4 &&
                             slot.task->n_tokens() - slot.prompt.n_tokens() < ckpt_tail_merge;
 
@@ -4691,7 +4726,12 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            if (ckpt_at_start) {
+                                // abyss: the checkpoint at the start of this batch is the last one
+                                if (pos == last_user_pos || pos > n_batch_start + params_base.checkpoint_min_step) {
+                                    break;
+                                }
+                            } else if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -4775,6 +4815,13 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    if (n_tokens_cur > 0) {
+                        slot.prompt_calls.push_back(n_tokens_cur);
+                    }
+                    if (do_checkpoint && prompt_checkpoint_storage_lossless) {
+                        slot.prompt_ckpts.push_back(n_tokens_start);
                     }
                 }
 
