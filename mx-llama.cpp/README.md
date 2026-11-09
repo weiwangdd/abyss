@@ -50,6 +50,7 @@
 | `0043-cuda-graph-idle-eviction.patch` | CUDA graph 空闲之后不被清掉，照上游 00f113ece（#30662）：缓存原来每 5 s 扫一遍、删掉 10 s 没用过的图，对话每轮之间（用户、工具）和长的预填充都会停过 10 s，下一轮第一次解码就把所有解码图连同正要用的那张一起删掉、逐个重新捕获；现在 10 s 没查过图就给所有图再留 10 s，扫的时候也不删正要用的那张。结果不变，只是少捕获（`tools/eval/graph-idle.sh`） |
 | `0044-prefill-overlap.patch` | 长提示词预填充两卡流水线（`ABYSS_OVERLAP=1`，配环境变量 `CUDA_SCALE_LAUNCH_QUEUES=4x`）：GPU0 算下一个 ubatch 的第 0–11 层时，GPU1 同时算这一个的第 13–39 层，输入只有一份、不加显存、结果逐位相同。主机给一张卡拷输入前不再先等它：卡还有活排着时，大的请求输入经锁页暂存区在它的流上按顺序传（卡空闲或 1 MiB 以下照旧直接拷），CPU 段传来的输入同样（上限 `ABYSS_OVERLAP_HOST_MAX`，默认 1 GiB）；每个输入在每张卡上两个暂存缓冲区轮流用、各有事件；变大的暂存区留到下一次 `ggml_backend_sched_synchronize` 才释放（释放锁页内存会同步整张卡）；新的图布局只在缓冲区要变大时才停卡（掩码副本每个 ubatch 都长）；0 字节的输入（没有输出的 ubatch 的输出行、输出层两半的 0 行隐状态）不拷也不等，后者的跨卡等待原来让 GPU0 每个 ubatch 都等 GPU1 做完；专家统计（0026）交出选择结果改成两个锁页缓冲区加事件轮流，不再每个 ubatch 同步一次。9.6 万 token 预填充 40.9 → 28.7 s，19.3 万 83.5 → 58.1 s，增量轮次和解码不变。`ABYSS_SYNC_TRACE=<ms>` 打印调度器里主机的等待和输入名（`tools/eval/prefill-pipe.sh`、`nsys_pipe.py`） |
 | `0045-ckpt-count-start.patch` | 长提示词按 `--checkpoint-min-step` 在用户消息开头拆调用建检查点时，算上这次调用开头要建的检查点（`ABYSS_CKPT_COUNT_START=1`）：这个检查点在组完 batch 之后才建，原来下一条用户消息拿上一个检查点量步长，紧接着又切一刀，成了几百 token、不建检查点的调用，CED 下每次多读一遍主机内存里的专家（约 1.7 s）；`ABYSS_CKPT_TAIL_MERGE` 的末段合并也从这个检查点起就生效（原来要等列表里有了检查点）。检查点的位置不变，只少了最后一次调用开头那个多余的。16 条消息的 9.6 万 token 提示词从头算 6 → 4 次调用（36.0 → 30.6 s），11.2 万 token 的智能体会话 8 → 5 次（42.1 → 36.9 s）。每个请求在耗时后面多一行 `abyss: the prompt took N calls, a + b + … tokens, checkpoints at …`（不受开关控制）（`tools/eval/ckpt_split.py`、`upstream-bench.sh` 的 `split`） |
+| `0046-weight-nowait.patch` | 大批次上传不再让主机等（`ABYSS_WEIGHT_NOWAIT=1`）：调度器拷一段主机上的权重之前，没有事件时原来都先让主机等目标卡做完；第 22–39 层大批次分给 GPU0 的专家分 gate、up、down 三段上传，主机每段都要等上一段传完，CPU 那份专家要等三段都排完才开始，每层末尾两卡一起空约 23 ms。交给拷贝回调的主机权重不再先等：回调把拷贝排在目标卡自己的流上、在用到同一块显存的计算之后，读设备数据或改写主机数据的路径（专家缓存查表、读 id）本来自己同步。智能体之后每轮预填充 2.33 → 1.96 s，9.6 万 token 提示词 27.6 → 26.8 s，结果逐位相同（`tools/eval/big-pipe.sh`、`nsys_big.py`） |
 
 ## 安装
 
@@ -79,7 +80,7 @@ git apply <abyss>/mx-llama.cpp/0007-abyss-dump.patch <abyss>/mx-llama.cpp/0008-d
   <abyss>/mx-llama.cpp/0039-engram-keepalive.patch <abyss>/mx-llama.cpp/0040-head-split-only.patch \
   <abyss>/mx-llama.cpp/0041-continue-slot-end-gen-checkpoints.patch <abyss>/mx-llama.cpp/0042-v41-n-swa.patch \
   <abyss>/mx-llama.cpp/0043-cuda-graph-idle-eviction.patch <abyss>/mx-llama.cpp/0044-prefill-overlap.patch \
-  <abyss>/mx-llama.cpp/0045-ckpt-count-start.patch
+  <abyss>/mx-llama.cpp/0045-ckpt-count-start.patch <abyss>/mx-llama.cpp/0046-weight-nowait.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target llama-abyss-dump llama-abyss-chat-tokens   # 对拍工具，可选

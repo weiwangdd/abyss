@@ -1,0 +1,58 @@
+From 37fac360453ae5d53e4687d8f3d240154abca828 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Mon, 9 Nov 2026 21:07:56 +0100
+Subject: [PATCH] abyss: ABYSS_WEIGHT_NOWAIT=1 lets the host copy a split's
+ host weights through the copy callback without first waiting for the split's
+ GPU: the callback queues the copy on that GPU's stream, after the work there
+ that uses the memory, and synchronizes itself where it reads device data or
+ rewrites host data it copies from (the MoE cache's slot map); the wait kept
+ the host from issuing the next upload of a large batch's experts to GPU0, and
+ from the CPU's share of them, until the previous upload was done (34 waits,
+ 620 ms in an agent turn), so both GPUs waited about 23 ms in every decoder
+ layer; an agent turn's prefill after the first takes 1.96 s instead of 2.33
+ (mean of 9 turns), a 96k-token prompt 26.8 s instead of 27.6, decode and the
+ results the same
+
+---
+ ggml/src/ggml-backend.cpp | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 982c73e..f2b4024 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1087,6 +1087,16 @@ static bool abyss_overlap() {
+     return v;
+ }
+ 
++// abyss: ABYSS_WEIGHT_NOWAIT=1, the host does not wait for a GPU before the copy callback takes a host weight of a split
++// there (see ggml_backend_sched_compute_splits)
++static bool abyss_weight_nowait() {
++    static const bool v = []() {
++        const char * e = getenv("ABYSS_WEIGHT_NOWAIT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return v;
++}
++
+ static size_t abyss_async_host_input_max() {
+     static const size_t v = []() {
+         if (!abyss_overlap()) {
+@@ -2736,7 +2746,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     ggml_backend_event_wait(input_backend, overlap_event);
+                 } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+-                } else {
++                } else if (!(abyss_weight_nowait() && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input))) {
++                    // abyss: with ABYSS_WEIGHT_NOWAIT a host weight for the copy callback goes without this wait. The
++                    // callback queues the weight's copy on the split backend's stream, after the work there that uses
++                    // the memory, and synchronizes itself where it reads device data or rewrites host data it copies
++                    // from (the MoE cache's slot map); a path it leaves to the scheduler syncs as before. Waiting here
++                    // kept the host from issuing the next upload of a large batch's experts to GPU0, and from the
++                    // CPU's share of them, until the previous upload was done
+                     abyss_sync_backend(split_backend, __LINE__);
+                 }
+                 sched->timing.us_non_graph_input_wait += ggml_backend_sched_timing_dt(sched, t0);
+-- 
+2.43.0
+
