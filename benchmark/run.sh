@@ -1,14 +1,16 @@
 #!/bin/bash
 # The standard benchmarks (README.md) against production and upstream llama.cpp, in one stop of production: for each
-# server of SERVERS (default "fork up", see servers.sh) and each benchmark of BENCHES (default "mlperf agentx"), a fresh
-# server on $PORT, the benchmark's run.sh against it, the server stopped; then the comparison (compare.py) and production
-# restarted (RESTART=0 never, RESTART=1 also when it was not running). Output in $OUT/bench-<date> on blackwell.
+# server of SERVERS (default "fork up", see servers.sh) and each benchmark of BENCHES (default "mlperf agentx tracelab"),
+# but the BENCH-SERVER pairs of SKIP, a fresh server on $PORT, the benchmark's run.sh against it, the server stopped; then
+# the comparison (compare.py) and production restarted (RESTART=0 never, RESTART=1 also when it was not running). Output
+# in $OUT/bench-<date> on blackwell.
 set -u
 B=$(cd "$(dirname "$0")" && pwd)
 source "$B/servers.sh"
 O=${OUT:-$HOME/abyss-eval}/bench-$(date +%m%d-%H%M)
 SERVERS=${SERVERS:-"fork up"}
-BENCHES=${BENCHES:-"mlperf agentx"}
+BENCHES=${BENCHES:-"mlperf agentx tracelab"}
+SKIP=${SKIP:-}
 mkdir -p "$O"
 
 if nvidia-smi --query-gpu=index,pcie.link.gen.max --format=csv,noheader | awk -F', ' '$2 < 5 { bad = 1 } END { exit bad }'; then :; else
@@ -18,6 +20,7 @@ case " $SERVERS " in *" fork "*|*" up "*) bench_stop_production ;; esac
 
 for bench in $BENCHES; do
   for server in $SERVERS; do
+    case " $SKIP " in *" $bench-$server "*) continue ;; esac
     echo "### $bench on $server $(date +%T)"
     if bench_start "$server" "$bench-$server" "$O"; then
       "$B/$bench/run.sh" "http://127.0.0.1:$PORT" "$O" "$server"

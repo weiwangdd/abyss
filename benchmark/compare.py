@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The servers of one run.sh side by side: compare.py OUT_DIR SERVER [SERVER ...] prints a Markdown table per
-benchmark (mlperf-SERVER, agentx-SERVER under OUT_DIR, read by each benchmark's summary.py), with the first server
-over the second where there are two."""
+benchmark (mlperf-SERVER, agentx-SERVER, tracelab-SERVER under OUT_DIR, read by each benchmark's summary.py; TraceLab
+by AgentX's), with the first server over the second where there are two."""
 
 import importlib.util
 import os
@@ -47,6 +47,9 @@ ROWS = {
         ("output tokens per request, mean", lambda r: r["osl_mean"], None),
     ],
 }
+# TraceLab is replayed by the AgentX harness, the same artifacts
+ROWS["tracelab"] = ROWS["agentx"]
+SUMMARY = {"tracelab": "agentx"}
 
 
 def cell(v):
@@ -61,7 +64,7 @@ def main():
     out, servers = sys.argv[1], sys.argv[2:]
     for bench, rows in ROWS.items():
         dirs = {s: os.path.join(out, f"{bench}-{s}") for s in servers}
-        results = {s: module(bench).load(d) if os.path.isdir(d) else None for s, d in dirs.items()}
+        results = {s: module(SUMMARY.get(bench, bench)).load(d) if os.path.isdir(d) else None for s, d in dirs.items()}
         if not any(results.values()):
             continue
         print(f"\n### {bench}\n")
