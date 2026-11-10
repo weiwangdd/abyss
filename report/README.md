@@ -1,6 +1,6 @@
 # 技术报告
 
-`report.pdf` 是到 2026-10-28 为止的优化过程，源文件是 `report.tex`。版式参考 DeepSeek-V4.1-Flash 的技术报告，图表用 pgfplots 画，数据直接写在源文件里，出处见仓库根目录的 `CLAUDE.md`（各项的日期、脚本和结果；10-25 以前的也在 `docs/scheduler.md`）。
+`report.pdf` 是到 2026-11-10 为止的优化过程（补丁到 `0046`，包括第 0–19 层张量并行的原型、和上游 llama.cpp 的对比、三个标准 benchmark），源文件是 `report.tex`。版式参考 DeepSeek-V4.1-Flash 的技术报告，图表用 pgfplots 画，数据直接写在源文件里，出处见仓库根目录的 `CLAUDE.md`（各项的日期、脚本和结果；10-25 以前的也在 `docs/scheduler.md`），标准 benchmark 的见 `benchmark/README.md`。
 
 ## 编译
 
