@@ -1,21 +1,21 @@
 # Abyss
 
-在一台双卡工作站上，以原生 MXFP4 精度运行 DeepSeek-V4.1-Flash（总参数 763B）：模型权重按访问热度分布在显存、内存和 NVMe 三层，用一组 [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) 补丁和调度逻辑，在单机上跑超出显存容量的大模型。
+English | [中文](README.zh-CN.md)
 
-**English summary.** Abyss runs DeepSeek-V4.1-Flash (763B parameters, native MXFP4 experts) on one workstation with two 96 GB GPUs, 192 GB of RAM and an NVMe drive, placing weights in VRAM, DRAM or NVMe by how often they are used. It is a series of 46 patches to mx-llama.cpp (a llama.cpp fork) plus conversion, evaluation and benchmark scripts. On this machine it decodes about 52 tok/s in an append-only conversation with 96K tokens of context and prefills a 48K-token prompt in about 14 s. The documentation is in Chinese; the technical report is available in English as [report/report-en.pdf](report/report-en.pdf) (Chinese original: [report/report.pdf](report/report.pdf)).
+Abyss runs DeepSeek-V4.1-Flash (763B parameters) at native MXFP4 precision on a single workstation with two GPUs. It places the model's weights in VRAM, host memory or NVMe according to how often they are used, and runs a model larger than the GPUs' memory on one machine with a series of patches to [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) (a llama.cpp fork) and its scheduling logic.
 
-## 做了什么
+## What it does
 
-原生权重约 474 GiB，超过这台机器显存加内存的总量。Abyss 的做法：第 0–21 层（全部编码器层和前两层解码器层）的专家常驻显存；后 18 层的专家放在锁页内存里，GPU 上留一块专家缓存放常用的，未命中的由 CPU 直接算；两张 Engram 大表留在 NVMe 上按需读取。在这个布局上，按剖析逐项去掉多余的计算、读取和等待，主要有：
+The native weights take about 474 GiB, more than this machine's VRAM and host memory combined. Abyss keeps the experts of layers 0–21 (all encoder layers and the first two decoder layers) resident in VRAM. The experts of the last 18 layers live in pinned host memory: an expert cache on the GPU holds the frequently used ones, and the CPU computes the misses directly. The two large Engram tables stay on NVMe and are read on demand. On top of this layout, a series of profiling-driven changes removes unnecessary computation, reads and waits:
 
-- **顺着模型结构少算**：预填充时解码器层只算后面还看得到的 token（CED 感知预填充）；补上官方的稀疏注意力索引器；解码注意力只取 top-k 行。
-- **按热度放数据**：GPU 专家缓存，按热度准入、按衰减热度淘汰，未命中交给 CPU。
-- **让 CPU、PCIe 和两张 GPU 同时干活**：CPU 算的专家晚一层加回残差（专家延后）；预填充的大批次分给 CPU、GPU0 和缓存三路；长提示词在两张卡上流水。
-- **少重复**：提示词末段一遍算完，上一轮的回答不再重算，去掉主机上几处不必要的同步。
+- **Compute less, following the model's structure**: during prefill, the decoder layers compute only the tokens that later tokens can still see (CED-aware prefill); the official sparse attention indexer; decode attention gathers only the top-k rows.
+- **Place data by heat**: a GPU expert cache with heat-based admission and eviction by decayed heat; misses go to the CPU.
+- **Keep the CPU, PCIe and both GPUs busy at once**: experts computed on the CPU are added back to the residual one layer later (expert deferral); big prefill batches are split three ways between the CPU, GPU0 and the cache; long prompts are pipelined across the two GPUs.
+- **Repeat less**: the tail of a prompt is computed in one pass, the previous turn's answer is no longer recomputed, and several unnecessary host synchronizations are gone.
 
-精度：路由专家是原生 MXFP4，不做低于 4 bit 的量化；每项改动都和改动前对拍，唯一改变计算的近似是专家延后，解码路径的 PPL 差别在误差以内。详见技术报告。
+Precision: the routed experts stay in native MXFP4, with no quantization below 4 bits. Every change is cross-checked against the version before it; the only approximation that changes the computation is expert deferral, and its effect on decode-path perplexity is within the error bars. Details are in the technical report.
 
-## 结果
+## Results
 
 ![Single-stream decode speed as the optimizations were added](docs/images/decode.png)
 
@@ -23,60 +23,62 @@
 
 <img src="docs/images/prefill.png" alt="Prefill time of a 48K-token prompt as the optimizations were added" width="72%">
 
-*Prefill time of a 48K-token prompt. Light bars: Engram page cache warm. Dark bars: an agent session's first turn with the page cache dropped. Dashed line: upstream llama.cpp with the same weights and launch settings, page cache dropped. Both charts are Figure 1 of the [technical report](report/report.pdf).*
+*Prefill time of a 48K-token prompt. Light bars: Engram page cache warm. Dark bars: an agent session's first turn with the page cache dropped. Dashed line: upstream llama.cpp with the same weights and launch settings, page cache dropped. Both charts are Figure 1 of the [technical report](report/report-en.pdf).*
 
-在下面这台机器上（2026 年 11 月，数字取自技术报告）：
+On the machine below (November 2026; the numbers come from the technical report):
 
-- 解码：只追加的多轮会话里约 52 tok/s（9.6 万上下文），生产上按请求约 50 tok/s；最开始的 mx-llama.cpp 是 14.1 tok/s。
-- 预填充：4.8 万 token 的新提示词约 14 s（约 3,400 tok/s），9.6 万 token 约 27 s；智能体会话之后每轮（1,000–2,300 个新 token）约 2 s。
-- 上下文 19.2 万 token。
+- Decode: about 52 tok/s in an append-only multi-turn session with 96K context, and about 50 tok/s per request in production; the unpatched mx-llama.cpp ran at 14.1 tok/s.
+- Prefill: about 14 s for a new 48K-token prompt (about 3,400 tok/s) and about 27 s for 96K tokens; each later turn of an agent session (1,000–2,300 new tokens) takes about 2 s.
+- Context: 192K tokens.
 
-和上游 llama.cpp 比（2026-11-07，同一份权重、同样的启动参数、同一天测；之后 Abyss 的预填充又快了约 35%）：
+Against upstream llama.cpp (2026-11-07, with the same weights and launch parameters, measured the same day; Abyss's prefill has become about 35% faster since):
 
-| | Abyss | 上游 llama.cpp |
+| | Abyss | Upstream llama.cpp |
 |---|---:|---:|
-| 解码，9.6 万上下文的多轮会话 | 49.2 tok/s | 39.3 tok/s |
-| 4.8 万 token 新提示词的预填充 | 21.0 s | 109.4 s |
-| 9.6 万 token 新提示词的预填充 | 41.7 s | 220.5 s |
-| 智能体之后每轮的预填充 | 2.36 s | 4.38 s |
+| Decode, multi-turn session at 96K context | 49.2 tok/s | 39.3 tok/s |
+| Prefill, new 48K-token prompt | 21.0 s | 109.4 s |
+| Prefill, new 96K-token prompt | 41.7 s | 220.5 s |
+| Prefill, each later agent turn | 2.36 s | 4.38 s |
 
-另外用三个公开智能体 benchmark 的数据和客户端跑了子集（单槽位、并发 1），同样的工作量 Abyss 用时约为上游的一半。这些不是官方结果，见下面的说明和 [benchmark/README.md](benchmark/README.md)。
+We also ran subsets of three public agent benchmarks with their data and clients (one slot, concurrency 1); for the same work, Abyss took about half as long as upstream. These are not official results; see the notes below and [benchmark/README.md](benchmark/README.md).
 
-## 硬件
+## Hardware
 
-- GPU：2 × NVIDIA RTX PRO 6000 Blackwell Max-Q（每张 96 GB），PCIe 5.0 x8 / x8，没有 NVLink
-- CPU：AMD Ryzen 9 9950X（16 核）
-- 内存：4 × 48 GB DDR5，双通道，6000 MT/s
-- 存储：Samsung 9100 PRO 4 TB（PCIe 5.0），放 Engram 表
+- GPU: 2 × NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each), PCIe 5.0 x8 / x8, no NVLink
+- CPU: AMD Ryzen 9 9950X (16 cores)
+- Memory: 4 × 48 GB DDR5, dual channel, 6000 MT/s
+- Storage: Samsung 9100 PRO 4 TB (PCIe 5.0), holding the Engram tables
 
-BIOS 里的 IOMMU 要关：开着时两卡之间的直接拷贝会返回成功、数据却没写进去。层切分、专家缓存大小和各项开关都是按这台机器调的，换一套硬件要重新调。
+The IOMMU must be disabled in the BIOS: with it on, direct copies between the two GPUs report success but write nothing. The layer split, the expert cache size and the switches are tuned for this machine and need retuning on other hardware.
 
-## 仓库内容
+## Repository layout
 
-| 位置 | 内容 |
+| Path | Contents |
 |---|---|
-| [mx-llama.cpp/](mx-llama.cpp/README.md) | 46 个补丁（`0001`–`0046`）、V4.1 的对话模板和两个小工具；README 里有每个补丁的作用、开关和打补丁的命令 |
-| [tools/convert/](tools/convert) | 从官方权重转换 GGUF（`v41convert.py`）、换一个张量的类型、改成上游 llama.cpp 的布局 |
-| [tools/eval/](tools/eval) | 对拍、测速和剖析脚本 |
-| [tools/restart-server.sh](tools/restart-server.sh) | 生产 server 的启动脚本，带全部开关 |
-| [benchmark/](benchmark/README.md) | 三个公开 benchmark 的运行脚本和结果 |
-| [report/](report/README.md) | 技术报告：中文版 `report.pdf`、英文版 `report-en.pdf`，以及它们的 LaTeX 源文件 |
-| [docs/](docs/scheduler.md) | 早期的调度器设计和架构图 |
-| [CLAUDE.md](CLAUDE.md) | 详细的实验记录：每项改动的数据、脚本、日期和这台机器的注意事项 |
+| [mx-llama.cpp/](mx-llama.cpp/README.md) | 46 patches (`0001`–`0046`), the V4.1 chat template and two small tools; its README lists what each patch does, its switch, and the commands to apply them |
+| [tools/convert/](tools/convert) | Converting the official weights to GGUF (`v41convert.py`), changing one tensor's type, and converting to upstream llama.cpp's layout |
+| [tools/eval/](tools/eval) | Scripts for cross-checks, benchmarks and profiling |
+| [tools/restart-server.sh](tools/restart-server.sh) | The production server's launch script, with every switch |
+| [benchmark/](benchmark/README.md) | Scripts and results for the three public benchmarks |
+| [report/](report/README.md) | The technical report in English (`report-en.pdf`) and Chinese (`report.pdf`), with their LaTeX sources |
+| [docs/](docs/scheduler.md) | The early scheduler design and the architecture figure |
+| [CLAUDE.md](CLAUDE.md) | Detailed lab notes: the data, scripts and dates of every change, and this machine's quirks |
 
-## 怎么用
+Apart from this README and the English report, the documentation is in Chinese.
 
-1. **编译**：取 mx-llama.cpp 的提交 `c4d12e2`，按 [mx-llama.cpp/README.md](mx-llama.cpp/README.md) 的顺序打补丁，用 CUDA 编译（`-DCMAKE_CUDA_ARCHITECTURES=120`）。
-2. **权重**：下载 [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)，再拿 [mxxm-t 的 MXFP4 GGUF](https://huggingface.co/mxxm-t/DeepSeek-V4.1-Flash-GGUF) 作模板，用 `tools/convert/v41convert.py` 转换，结果约 383 GiB（做法见技术报告第 9 节）。
-3. **启动**：完整的启动命令在技术报告的附录 B，`tools/restart-server.sh` 是生产用的脚本，路径按自己的机器改。
-4. **对拍和测速**：`tools/eval/` 的脚本默认按这台机器的目录布局（`~/src/mx-llama.cpp`、`~/models`、`~/abyss-eval`），大多可以用环境变量改；运行前要先停掉 server。
+## How to use
 
-## 说明
+1. **Build**: check out mx-llama.cpp at commit `c4d12e2`, apply the patches in the order given in [mx-llama.cpp/README.md](mx-llama.cpp/README.md), and build with CUDA (`-DCMAKE_CUDA_ARCHITECTURES=120`).
+2. **Weights**: download [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), take [mxxm-t's MXFP4 GGUF](https://huggingface.co/mxxm-t/DeepSeek-V4.1-Flash-GGUF) as the template, and convert with `tools/convert/v41convert.py`. The result is about 383 GiB (see Section 9 of the technical report).
+3. **Launch**: the full launch command is in Appendix B of the technical report; `tools/restart-server.sh` is the production script, so adjust its paths to your machine.
+4. **Cross-checks and benchmarks**: the scripts in `tools/eval/` assume this machine's directory layout (`~/src/mx-llama.cpp`, `~/models`, `~/abyss-eval`), and most of it can be changed with environment variables. Stop the server before running them.
 
-- 这是在一台机器上做的实验性项目，不是通用的推理框架。
-- `benchmark/` 里的数字是自己跑的子集，只用来比较 Abyss 和上游 llama.cpp。其中 MLPerf Agentic Inference 那一项只用了它的数据和客户端，不符合 MLPerf 的规则，不是 MLPerf 结果，没有经过 MLCommons 验证（Result not verified by MLCommons Association）；AgentX 和 TraceLab 也不是有效提交。
-- MLPerf 是 MLCommons Association 的商标。本项目和 DeepSeek、NVIDIA、MLCommons、SemiAnalysis 都没有关联。
+## Notes
 
-## 许可证
+- This is an experimental project built on one machine, not a general-purpose inference framework.
+- The numbers in `benchmark/` come from subsets we ran ourselves and serve only to compare Abyss with upstream llama.cpp. The MLPerf Agentic Inference runs used only its data and client and do not follow MLPerf's rules, so they are not MLPerf results and were not verified by MLCommons Association (Result not verified by MLCommons Association). The AgentX and TraceLab runs are not valid submissions either.
+- MLPerf is a trademark of MLCommons Association. This project is not affiliated with DeepSeek, NVIDIA, MLCommons or SemiAnalysis.
 
-MIT，见 [LICENSE](LICENSE)。有些文件来自或改自其他项目（mx-llama.cpp / llama.cpp、DeepSeek、MLCommons），见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+## License
+
+MIT; see [LICENSE](LICENSE). Some files come from or are adapted from other projects (mx-llama.cpp / llama.cpp, DeepSeek, MLCommons); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

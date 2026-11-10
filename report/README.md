@@ -19,7 +19,7 @@ tectonic -X compile report-en.tex   # 英文版
 
 ## README 的图
 
-首页 README 里的两张图是报告图 1 的 (a)、(b)，标签改成了英文，源文件是 `readme-figures.tex`（每页一张图）。改了数据或标签后重新生成：
+首页 README 的两张图是报告图 1 的 (a)、(b)：英文版 `README.md` 用英文标签，中文版 `README.zh-CN.md` 用中文标签。源文件是 `readme-figures.tex`（第 1、2 页英文，第 3、4 页中文，数据只写在两个宏里）。改了数据或标签后重新生成：
 
 ```bash
 cd report
@@ -27,6 +27,8 @@ tectonic -X compile --only-cached readme-figures.tex
 swiftc -O figpng.swift -o /tmp/figpng            # 把 PDF 的一页渲染成 PNG 并裁掉白边，只用 macOS 自带的 PDFKit
 /tmp/figpng readme-figures.pdf 1 3 12 ../docs/images/decode.png
 /tmp/figpng readme-figures.pdf 2 3 12 ../docs/images/prefill.png
+/tmp/figpng readme-figures.pdf 3 3 12 ../docs/images/decode-zh.png
+/tmp/figpng readme-figures.pdf 4 3 12 ../docs/images/prefill-zh.png
 ```
 
 参数依次是 PDF、页码、放大倍数（3 倍约 216 dpi）、四周留白的像素和输出文件。

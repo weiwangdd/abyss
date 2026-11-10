@@ -1,11 +1,14 @@
-% The two charts of the report's Figure 1 with English labels, for the top-level README: one chart per page.
+% The two charts of the report's Figure 1 for the READMEs, one chart per page: pages 1-2 with English labels
+% (README.md), pages 3-4 with Chinese labels (README.zh-CN.md). The data is written once, in the two macros.
 % Build: tectonic -X compile --only-cached readme-figures.tex, then render each page to a cropped PNG
-% (docs/images/decode.png and docs/images/prefill.png; see report/README.md).
+% (docs/images/decode.png, prefill.png, decode-zh.png, prefill-zh.png; see report/README.md).
 \documentclass[11pt]{article}
 
 \usepackage[a4paper,landscape,margin=1cm]{geometry}
 \usepackage{fontspec}
+\usepackage{xeCJK}
 \setmainfont{Palatino}
+\setCJKmainfont[BoldFont={Songti SC Bold}]{Songti SC}
 \usepackage{tikz}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
@@ -29,16 +32,15 @@
   },
 }
 
-\begin{document}
-
-% (a) decode speed as the optimizations were added
+% (a) decode speed as the optimizations were added: #1 y label, #2 tick labels, #3 and #4 the legend entries
+\newcommand{\decodechart}[4]{%
 \begin{tikzpicture}
   \begin{axis}[abyss,
     width=17cm, height=6.2cm,
     ybar, bar width=13pt, ymin=0, ymax=60,
-    ylabel={Decode speed (tok/s)},
+    ylabel={#1},
     xtick={1,2,3,4,5,6,7,8,9,10,11},
-    xticklabels={Baseline, Expert\\cache, Miss\\split, Session, Cache\\20.5 GB, Expert\\deferral, Split-K, Admit\\gate, Head\\split, DDR5\\6000, Cache\\21.1 GB},
+    xticklabels={#2},
     xticklabel style={font=\scriptsize,align=center,text width=1.45cm},
     nodes near coords={\pgfmathprintnumber[fixed,fixed zerofill,precision=1]{\pgfplotspointmeta}},
     nodes near coords style={font=\scriptsize},
@@ -46,29 +48,55 @@
     legend style={at={(0.01,0.99)},anchor=north west}]
     \addplot[fill=dslight,draw=dsblue,bar shift=0pt,area legend] coordinates {(1,14.1) (2,25.2) (3,36.1)};
     \addplot[fill=dsblue,draw=dsblue,bar shift=0pt,area legend] coordinates {(4,31.8) (5,38.6) (6,40.6) (7,43.9) (8,46.8) (9,48.5) (10,49.2) (11,52.0)};
-    \legend{{48K context, the same prompt a second time}, {96K context, append-only multi-turn session}}
+    \legend{{#3}, {#4}}
   \end{axis}
-\end{tikzpicture}
+\end{tikzpicture}}
 
-\newpage
-
-% (b) prefill time of a 48K-token prompt
+% (b) prefill time of a 48K-token prompt: #1 y label, #2 tick labels, #3 the upstream line's label, #4 and #5 the legend
+\newcommand{\prefillchart}[5]{%
 \begin{tikzpicture}
   \begin{axis}[abyss,
     width=12cm, height=6.2cm,
     ybar, bar width=16pt, ymin=0, ymax=150,
-    ylabel={Prefill time (s)},
+    ylabel={#1},
     xtick={1,2,3,4,5,6},
-    xticklabels={Baseline, CED\\FFN, CED\\attn., Sparse\\indexer, 2-GPU\\pipeline, No host\\wait},
+    xticklabels={#2},
     xticklabel style={font=\scriptsize,align=center,text width=1.4cm},
     nodes near coords, nodes near coords style={font=\scriptsize},
     enlarge x limits=0.1,
     legend style={at={(0.99,0.62)},anchor=north east}]
     \addplot[fill=dslight,draw=dsblue,bar shift=0pt,area legend] coordinates {(1,135) (2,41.8) (3,27.9) (4,22.7)};
     \addplot[fill=dsblue,draw=dsblue,bar shift=0pt,area legend] coordinates {(5,15.1) (6,14.1)};
-    \draw[dsdark, densely dashed, line width=0.6pt] ({rel axis cs:0,0} |- {axis cs:1,109.4}) -- ({rel axis cs:1,0} |- {axis cs:1,109.4}) node[pos=0.97, above, font=\scriptsize, anchor=south east] {upstream llama.cpp: 109.4 s};
-    \legend{Engram page cache warm, {agent session's first turn, page cache dropped}}
+    \draw[dsdark, densely dashed, line width=0.6pt] ({rel axis cs:0,0} |- {axis cs:1,109.4}) -- ({rel axis cs:1,0} |- {axis cs:1,109.4}) node[pos=0.97, above, font=\scriptsize, anchor=south east] {#3};
+    \legend{{#4}, {#5}}
   \end{axis}
-\end{tikzpicture}
+\end{tikzpicture}}
+
+\begin{document}
+
+\decodechart{Decode speed (tok/s)}
+  {Baseline, Expert\\cache, Miss\\split, Session, Cache\\20.5 GB, Expert\\deferral, Split-K, Admit\\gate, Head\\split, DDR5\\6000, Cache\\21.1 GB}
+  {48K context, the same prompt a second time}
+  {96K context, append-only multi-turn session}
+\newpage
+
+\prefillchart{Prefill time (s)}
+  {Baseline, CED\\FFN, CED\\attn., Sparse\\indexer, 2-GPU\\pipeline, No host\\wait}
+  {upstream llama.cpp: 109.4 s}
+  {Engram page cache warm}
+  {agent session's first turn, page cache dropped}
+\newpage
+
+\decodechart{解码速度（tok/s）}
+  {原版, 专家\\缓存, 未命中\\分流, 多轮\\会话, 缓存\\20.5 GB, 专家\\延后, K 切分, 准入门, 输出层\\分两卡, 内存\\6000, 缓存\\21.1 GB}
+  {4.8 万上下文，同一提示词第二次生成}
+  {9.6 万上下文，只追加的多轮会话}
+\newpage
+
+\prefillchart{预填充时间（s）}
+  {原版, CED\\FFN, CED\\注意力, 稀疏\\索引器, 两卡\\流水线, 不再等}
+  {上游 llama.cpp：109.4 s}
+  {Engram 页缓存已热}
+  {智能体会话的首轮，页缓存清空}
 
 \end{document}
