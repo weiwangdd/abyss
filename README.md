@@ -2,7 +2,7 @@
 
 在一台双卡工作站上，以原生 MXFP4 精度运行 DeepSeek-V4.1-Flash（总参数 763B）：模型权重按访问热度分布在显存、内存和 NVMe 三层，用一组 [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) 补丁和调度逻辑，在单机上跑超出显存容量的大模型。
 
-**English summary.** Abyss runs DeepSeek-V4.1-Flash (763B parameters, native MXFP4 experts) on one workstation with two 96 GB GPUs, 192 GB of RAM and an NVMe drive, placing weights in VRAM, DRAM or NVMe by how often they are used. It is a series of 46 patches to mx-llama.cpp (a llama.cpp fork) plus conversion, evaluation and benchmark scripts. On this machine it decodes about 52 tok/s in an append-only conversation with 96K tokens of context and prefills a 48K-token prompt in about 14 s. The documentation is in Chinese; the technical report is [report/report.pdf](report/report.pdf).
+**English summary.** Abyss runs DeepSeek-V4.1-Flash (763B parameters, native MXFP4 experts) on one workstation with two 96 GB GPUs, 192 GB of RAM and an NVMe drive, placing weights in VRAM, DRAM or NVMe by how often they are used. It is a series of 46 patches to mx-llama.cpp (a llama.cpp fork) plus conversion, evaluation and benchmark scripts. On this machine it decodes about 52 tok/s in an append-only conversation with 96K tokens of context and prefills a 48K-token prompt in about 14 s. The documentation is in Chinese; the technical report is available in English as [report/report-en.pdf](report/report-en.pdf) (Chinese original: [report/report.pdf](report/report.pdf)).
 
 ## 做了什么
 
@@ -60,7 +60,7 @@ BIOS 里的 IOMMU 要关：开着时两卡之间的直接拷贝会返回成功�
 | [tools/eval/](tools/eval) | 对拍、测速和剖析脚本 |
 | [tools/restart-server.sh](tools/restart-server.sh) | 生产 server 的启动脚本，带全部开关 |
 | [benchmark/](benchmark/README.md) | 三个公开 benchmark 的运行脚本和结果 |
-| [report/](report/README.md) | 技术报告（`report.pdf`，中文）和它的 LaTeX 源文件 |
+| [report/](report/README.md) | 技术报告：中文版 `report.pdf`、英文版 `report-en.pdf`，以及它们的 LaTeX 源文件 |
 | [docs/](docs/scheduler.md) | 早期的调度器设计和架构图 |
 | [CLAUDE.md](CLAUDE.md) | 详细的实验记录：每项改动的数据、脚本、日期和这台机器的注意事项 |
 
