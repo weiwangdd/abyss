@@ -1,0 +1,74 @@
+% The two charts of the report's Figure 1 with English labels, for the top-level README: one chart per page.
+% Build: tectonic -X compile --only-cached readme-figures.tex, then render each page to a cropped PNG
+% (docs/images/decode.png and docs/images/prefill.png; see report/README.md).
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,landscape,margin=1cm]{geometry}
+\usepackage{fontspec}
+\setmainfont{Palatino}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\pagestyle{empty}
+
+\definecolor{dsblue}{HTML}{4D6BFE}
+\definecolor{dslight}{HTML}{C9D3FF}
+\definecolor{dsgray}{HTML}{B8BCC8}
+\definecolor{dsdark}{HTML}{1E2A5A}
+
+\pgfplotsset{
+  abyss/.style={
+    axis lines*=left,
+    ymajorgrids,
+    grid style={dsgray!40},
+    tick label style={font=\footnotesize},
+    label style={font=\footnotesize},
+    legend style={font=\footnotesize,draw=none,fill=white,fill opacity=0.9,text opacity=1},
+    legend cell align=left,
+    every axis plot/.append style={line width=0.6pt},
+  },
+}
+
+\begin{document}
+
+% (a) decode speed as the optimizations were added
+\begin{tikzpicture}
+  \begin{axis}[abyss,
+    width=17cm, height=6.2cm,
+    ybar, bar width=13pt, ymin=0, ymax=60,
+    ylabel={Decode speed (tok/s)},
+    xtick={1,2,3,4,5,6,7,8,9,10,11},
+    xticklabels={Unpatched, Expert\\cache, Miss\\split, Multi-turn\\session, Cache\\20.5 GB, Expert\\deferral, Split-K, Admission\\gate, Output\\head split, DDR5\\6000, Cache\\21.1 GB},
+    xticklabel style={font=\scriptsize,align=center,text width=1.45cm},
+    nodes near coords={\pgfmathprintnumber[fixed,fixed zerofill,precision=1]{\pgfplotspointmeta}},
+    nodes near coords style={font=\scriptsize},
+    enlarge x limits=0.05,
+    legend style={at={(0.01,0.99)},anchor=north west}]
+    \addplot[fill=dslight,draw=dsblue,bar shift=0pt,area legend] coordinates {(1,14.1) (2,25.2) (3,36.1)};
+    \addplot[fill=dsblue,draw=dsblue,bar shift=0pt,area legend] coordinates {(4,31.8) (5,38.6) (6,40.6) (7,43.9) (8,46.8) (9,48.5) (10,49.2) (11,52.0)};
+    \legend{{48K context, the same prompt a second time}, {96K context, append-only multi-turn session}}
+  \end{axis}
+\end{tikzpicture}
+
+\newpage
+
+% (b) prefill time of a 48K-token prompt
+\begin{tikzpicture}
+  \begin{axis}[abyss,
+    width=12cm, height=6.2cm,
+    ybar, bar width=16pt, ymin=0, ymax=150,
+    ylabel={Prefill time (s)},
+    xtick={1,2,3,4,5,6},
+    xticklabels={Unpatched, CED\\FFN, CED\\attention, Sparse\\indexer, Two-GPU\\pipeline, No host\\wait},
+    xticklabel style={font=\scriptsize,align=center,text width=1.4cm},
+    nodes near coords, nodes near coords style={font=\scriptsize},
+    enlarge x limits=0.1,
+    legend style={at={(0.99,0.62)},anchor=north east}]
+    \addplot[fill=dslight,draw=dsblue,bar shift=0pt,area legend] coordinates {(1,135) (2,41.8) (3,27.9) (4,22.7)};
+    \addplot[fill=dsblue,draw=dsblue,bar shift=0pt,area legend] coordinates {(5,15.1) (6,14.1)};
+    \draw[dsdark, densely dashed, line width=0.6pt] ({rel axis cs:0,0} |- {axis cs:1,109.4}) -- ({rel axis cs:1,0} |- {axis cs:1,109.4}) node[pos=0.97, above, font=\scriptsize, anchor=south east] {upstream llama.cpp: 109.4 s};
+    \legend{Engram page cache warm, {agent session's first turn, page cache dropped}}
+  \end{axis}
+\end{tikzpicture}
+
+\end{document}

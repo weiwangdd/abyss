@@ -17,6 +17,14 @@
 
 ## 结果
 
+![Single-stream decode speed as the optimizations were added](docs/images/decode.png)
+
+*Single-stream decode speed as the optimizations were added. Light bars: 48K context, the same prompt generated a second time, so expert-cache hits run high. Dark bars: 96K context, an append-only multi-turn session; each bar is the "after" side of that change's own A/B test. Upstream llama.cpp on the same session: 39.3 tok/s.*
+
+<img src="docs/images/prefill.png" alt="Prefill time of a 48K-token prompt as the optimizations were added" width="72%">
+
+*Prefill time of a 48K-token prompt. Light bars: Engram page cache warm. Dark bars: an agent session's first turn with the page cache dropped. Dashed line: upstream llama.cpp with the same weights and launch settings, page cache dropped. Both charts are Figure 1 of the [technical report](report/report.pdf).*
+
 在下面这台机器上（2026 年 11 月，数字取自技术报告）：
 
 - 解码：只追加的多轮会话里约 52 tok/s（9.6 万上下文），生产上按请求约 50 tok/s；最开始的 mx-llama.cpp 是 14.1 tok/s。
