@@ -87,7 +87,7 @@
 \begin{center}{\large\bfseries 摘要}\end{center}
 \vspace{-0.3em}
 \noindent
-长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。在保持原生 MXFP4 精度的前提下（每项改动对改动前的差别都在数值底线以内），我们围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器做了四十多个补丁。预填充方面，CED 感知预填充让解码器层只算后面还看得到的 token，加上官方稀疏索引器、Engram 预取、预填充大批次分流、末段一遍算完和长提示词的两卡流水线，4.8 万 token 提示词从 135 s 降到约 14 s（约 3,400 \tps{}），多轮智能体之后每轮的预填充从 5.7--7.2 s 降到约 2 s。解码方面，GPU 专家缓存、按热度准入并交给 CPU 的未命中、专家延后（CPU 算的专家晚一层加回残差）、缓存的准入门、小内核融合和输出层两卡各算一半等，把单流解码从 14.1 \tps{} 提到只追加的多轮会话里约 52 \tps{}（9.6 万上下文；生产上按请求约 50 \tps{}）；上下文从 12.8 万扩到 19.2 万，内存从 3600 提到 6000 MT/s。同一份权重、同样的启动参数下，上游 llama.cpp 的解码慢约 20\%，长提示词的预填充慢 5 倍以上；三个公开的智能体 benchmark（MLPerf Agentic Inference、InferenceX AgentX、TraceLab）结论一致，同样的工作量我们用时约为上游的一半，只有 TraceLab 的首 token 时间中位数因为一处检查点的取舍输给上游。服务侧，我们按官方 \code{encoding.py} 重写了对话模板，按官方 Recipe 的规则编码请求文字里的控制 token，让上一轮的回答不再每轮重算，并修复了真实 Codex 和 Hermes 负载暴露的多处缺陷；权重换成了 DeepSeek 10 月 17 日更新的 1017 版（自己转换，PPL 低 3.4\%）。我们同时记录了评估方法（两档数值底线、对官方实现的对拍、解码路径的 PPL、固定种子的测速）、两个让结论走偏的测法陷阱（同一提示词重复生成会让解码虚高，nsys 按节点跟踪会放大 CUDA graph 的启动），以及实现或测过、但没有采用的路：专家预取、DSpark 投机解码、每 token 少用一个专家、输出层 Q8\_0 和第 0--19 层的张量并行。
+长上下文智能体把推理的压力从算力推到了显存、内存和 PCIe 上。DeepSeek-V4.1-Flash 总参数 763B，原生权重约 474 GiB，超过一台双卡工作站（2 × RTX PRO 6000 Max-Q，显存合计 191 GiB；内存 192 GB）的全部容量。我们在 mx-llama.cpp 上实现了一个分层推理调度器 Abyss：编码器各层的专家常驻显存，解码器后 18 层的专家放在主机内存，由 GPU 上的专家缓存和 CPU 分担，Engram 大表留在 NVMe。在保持原生 MXFP4 精度的前提下（每项改动对改动前的差别都在数值底线以内），我们围绕这款模型的编码器-解码器结构（CED）、压缩注意力和稀疏索引器做了四十多个补丁。预填充方面，CED 感知预填充让解码器层只算后面还看得到的 token，加上官方稀疏索引器、Engram 预取、预填充大批次分流、末段一遍算完和长提示词的两卡流水线，4.8 万 token 提示词从 135 s 降到约 14 s（约 3,400 \tps{}），多轮智能体之后每轮的预填充从 5.7--7.2 s 降到约 2 s。解码方面，GPU 专家缓存、按热度准入并交给 CPU 的未命中、专家延后（CPU 算的专家晚一层加回残差）、缓存的准入门、小内核融合和输出层两卡各算一半等，把单流解码从 14.1 \tps{} 提到只追加的多轮会话里约 52 \tps{}（9.6 万上下文；生产上按请求约 50 \tps{}）；上下文从 12.8 万扩到 19.2 万，内存从 3600 提到 6000 MT/s。同一份权重、同样的启动参数下，上游 llama.cpp 的解码慢约 20\%，长提示词的预填充慢 5 倍以上；用三个公开智能体 benchmark（MLPerf Agentic Inference、InferenceX AgentX、TraceLab）的数据和客户端跑的子集结论一致（都不是官方结果），同样的工作量我们用时约为上游的一半，只有 TraceLab 的首 token 时间中位数因为一处检查点的取舍输给上游。服务侧，我们按官方 \code{encoding.py} 重写了对话模板，按官方 Recipe 的规则编码请求文字里的控制 token，让上一轮的回答不再每轮重算，并修复了真实 Codex 和 Hermes 负载暴露的多处缺陷；权重换成了 DeepSeek 10 月 17 日更新的 1017 版（自己转换，PPL 低 3.4\%）。我们同时记录了评估方法（两档数值底线、对官方实现的对拍、解码路径的 PPL、固定种子的测速）、两个让结论走偏的测法陷阱（同一提示词重复生成会让解码虚高，nsys 按节点跟踪会放大 CUDA graph 的启动），以及实现或测过、但没有采用的路：专家预取、DSpark 投机解码、每 token 少用一个专家、输出层 Q8\_0 和第 0--19 层的张量并行。
 
 \vspace{0.2em}
 \begin{figure}[!h]
@@ -154,7 +154,7 @@ DeepSeek-V4.1-Flash~\cite{v41} 是为这类负载设计的。它有 552B 主干�
 \begin{itemize}
   \item \textbf{解码}：GPU 专家缓存、解码注意力只取 top-k 行、按热度准入的未命中分流，使解码从 14.1 \tps{} 提升到只追加的多轮会话里约 30 \tps{}（内存 3600 MT/s）；把计算图和索引器腾出的显存、GPU0 的空余显存都给专家缓存后约 38 \tps{}。11 月按剖析逐项去掉串行段和零碎开销：CPU 算的专家晚一层加回残差（专家延后），专家统计不再切图，缓存加了准入门，小内核合并，输出层两卡各算一半，内存提到 6000 MT/s，会话里约 52 \tps{}（解码统计每 token 约 18.4 ms），生产上按请求约 50 \tps{}。
   \item \textbf{预填充}：CED 感知预填充让解码器层只计算后面还能看到的 token，加上 Engram 预取和官方稀疏索引器，4.8 万 token 提示词从 135 s 降到 22.7 s；再加上两卡流水线、去掉几处主机等待，降到约 14 s，9.6 万 token 约 27 s。大批次分流、末段一遍算完、大批次用缓存、上一轮回答不再重算，把多轮会话每轮的预填充从 5.7--7.2 s 降到约 2 s。
-  \item \textbf{和上游比}：同一份权重、同样的启动参数下，上游 llama.cpp 的解码慢约 20\%，长提示词的预填充慢 5 倍以上；三个公开的智能体 benchmark 里，同样的工作量我们用时约为上游的一半（\S\ref{sec:upstream}）。
+  \item \textbf{和上游比}：同一份权重、同样的启动参数下，上游 llama.cpp 的解码慢约 20\%，长提示词的预填充慢 5 倍以上；用三个公开智能体 benchmark 的子集测（不是官方结果），同样的工作量我们用时约为上游的一半（\S\ref{sec:upstream}）。
   \item \textbf{测法}：同一提示词第二次、一字不差的生成会让专家缓存命中偏高，解码速度虚高约 15--20\%；nsys 按节点跟踪会把 CUDA graph 的启动放大约 3 倍，让我们高估了张量并行的收益。我们改用只追加的多轮会话、固定种子和整图跟踪重新测量，并据此修正了此前的结论（\S\ref{sec:profiling}、\S\ref{sec:seeds}）；也给出了 llama-bench 和 AIPerf 的结果，并说明它们为什么和我们的测法不同（\S\ref{sec:stdbench}）。
   \item \textbf{正确性}：所有改动都有对拍。我们区分了两档数值底线，对稀疏索引器和解码注意力做了对官方 PyTorch 实现、对 float64 的逐层对拍，并用强制解码逐 token 比较解码路径的 PPL。唯一改变计算的近似是专家延后，PPL 的差别在误差以内（\S\ref{sec:forcedppl}）。
   \item \textbf{真实负载}：在 Codex 和 Hermes 的实际请求中发现了 prompt 缓存的选择问题、槽位被只共享开头的请求占用、请求文字里的控制 token 字样被当真、上一轮的回答每轮重算，以及三处只在特定提示词长度下出现的崩溃，均已修复。
@@ -1339,7 +1339,7 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
 \section{和上游 llama.cpp 对比}
 \label{sec:upstream}
 
-前面每一项都是和改动之前的自己比。这一章换个参照：同一份权重、同样的启动参数，上游 llama.cpp~\cite{llamacpp} 跑得怎么样；再用三个公开的智能体 benchmark 量一遍。
+前面每一项都是和改动之前的自己比。这一章换个参照：同一份权重、同样的启动参数，上游 llama.cpp~\cite{llamacpp} 跑得怎么样；再用三个公开智能体 benchmark 的子集量一遍。
 
 \subsection{代码}
 \label{sec:upstreamcode}
@@ -1397,15 +1397,15 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
 
 数值上，8 段语料各贪心生成 128 个 token，两边的相同前缀 0--54 个，top-20 KL 平均 1.05e-2、中位数 3.8e-3，分岔处都是近乎平局的候选；9.6 万 token 提示词前 7 个相同，KL 5.0e-3。这在「经过编码器层」那一档底线的上沿，符合两套独立实现的差别。PPL 用同一个程序、14 段各 1,024 token 的语料，算每段的后一半：批处理路径上游低 0.44\%（± 0.18\%），逐 token 的解码路径生产低 0.18\%（± 0.21\%），KLD 平均 0.009--0.010，top-1 一致 95.5--95.9\%。两边之间的差别和各自两条路径之间的差别同一量级（生产解码路径比批处理低 0.2\%，上游高 0.4\%），都看不出错误；PPL 只能说明这一点，说明不了哪边更接近官方实现。
 
-\subsection{三个标准 benchmark}
+\subsection{三个公开 benchmark 的子集}
 \label{sec:benchmarks}
 
-自己写的测试难免偏向自己的负载，所以我们又从公开的 benchmark 里挑了三个面向智能体推理的（表~\ref{tab:benchmarks}）。它们原本面向多卡集群和高并发，这里按本机的条件跑：一个槽位、并发 1、上下文 19.6 万 token，从官方数据里截一个子集，客户端和服务器在同一台机器上，每一档都新起服务器。所以跑出的数只能在这两个服务器之间比，不能和官方榜单比。
+自己写的测试难免偏向自己的负载，所以我们又从公开的 benchmark 里挑了三个面向智能体推理的（表~\ref{tab:benchmarks}）。它们原本面向多卡集群和高并发，这里按本机的条件跑：一个槽位、并发 1、上下文 19.6 万 token，从官方数据里截一个子集，客户端和服务器在同一台机器上，每一档都新起服务器。所以跑出的数只能在这两个服务器之间比，都不是官方结果，不能和官方结果比较。其中 MLPerf Agentic Inference 只用了它的数据和客户端：子集、并发和没跑 SWE-bench 那段都不符合 MLPerf 的规则，所以这里的数不是 MLPerf 结果，没有经过 MLCommons 验证（Result not verified by MLCommons Association），下文简称「MLPerf 子集」；AgentX 和 TraceLab 也不是有效提交。MLPerf 是 MLCommons Association 的商标。
 
 \begin{table}[h]
   \centering
   \small
-  \caption{用到的三个公开 benchmark。}
+  \caption{用到的三个公开 benchmark 的数据和客户端。这里跑的都是子集，不是官方结果。}
   \label{tab:benchmarks}
   \begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm} X X@{}}
     \toprule
@@ -1418,7 +1418,7 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
   \end{tabularx}
 \end{table}
 
-我们跑了三次：11-07 在生产和上游上跑 MLPerf 和 AgentX；11-09 加了 TraceLab，生产三个都跑，上游只跑 TraceLab（上游的编译和权重没变）；11-10 只跑生产，看 0046 的效果。AgentX 和 TraceLab 的窗口是固定的，快的一边会测到更多、更后面的请求，整体的百分位数不能直接比，所以只比两边都测到的那些请求（同一个种子，请求和输出长度完全相同）。图~\ref{fig:benchratio} 是生产对上游的比值。
+我们跑了三次：11-07 在生产和上游上跑 MLPerf 子集和 AgentX；11-09 加了 TraceLab，生产三个都跑，上游只跑 TraceLab（上游的编译和权重没变）；11-10 只跑生产，看 0046 的效果。AgentX 和 TraceLab 的窗口是固定的，快的一边会测到更多、更后面的请求，整体的百分位数不能直接比，所以只比两边都测到的那些请求（同一个种子，请求和输出长度完全相同）。图~\ref{fig:benchratio} 是生产对上游的比值。
 
 \begin{figure}[t]
   \centering
@@ -1428,6 +1428,7 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
       ybar=2pt, bar width=13pt, ymin=0, ymax=1.62,
       ytick={0,0.5,1,1.5},
       symbolic x coords={MLPerf,AgentX,TraceLab}, xtick=data,
+      xticklabels={MLPerf 子集, AgentX, TraceLab},
       enlarge x limits=0.22,
       ylabel={生产 / 上游},
       nodes near coords={\pgfmathprintnumber[fixed,fixed zerofill,precision=2]{\pgfplotspointmeta}},
@@ -1440,14 +1441,14 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
       \draw[dsdark, densely dashed, line width=0.6pt] ({rel axis cs:0,0} |- {axis cs:MLPerf,1}) -- ({rel axis cs:1,0} |- {axis cs:MLPerf,1});
     \end{axis}
   \end{tikzpicture}
-  \caption{三个 benchmark 里生产对上游的比值，低于 1 是生产更快（虚线是持平）。MLPerf 是 11-07 的 54 轮，每轮时间取平均；AgentX 是 11-07 两边都测到的 22 个请求，TraceLab 是 11-09 的 16 个，时间取合计。}
+  \caption{三个 benchmark 里生产对上游的比值，低于 1 是生产更快（虚线是持平）。都是自己跑的子集，不是官方结果；MLPerf 子集不是 MLPerf 结果，未经 MLCommons 验证。MLPerf 子集是 11-07 的 54 轮，每轮时间取平均；AgentX 是 11-07 两边都测到的 22 个请求，TraceLab 是 11-09 的 16 个，时间取合计。}
   \label{fig:benchratio}
 \end{figure}
 
 \begin{table}[h]
   \centering
   \small
-  \caption{MLPerf Agentic Inference 的三次运行（3 段对话 54 轮，输入逐轮相同；温度 1.0 采样，输出长度各不相同）。11-07 到 11-09 之间生产上了 0044、0045，11-09 到 11-10 之间上了 0046。}
+  \caption{MLPerf Agentic Inference 子集的三次运行（3 段对话 54 轮，输入逐轮相同；温度 1.0 采样，输出长度各不相同）。不是 MLPerf 结果，未经 MLCommons 验证（Result not verified by MLCommons Association）。11-07 到 11-09 之间生产上了 0044、0045，11-09 到 11-10 之间上了 0046。}
   \label{tab:mlperf}
   \begin{tabular}{@{}l r r r r@{}}
     \toprule
@@ -1463,16 +1464,16 @@ fork 自带整个模型的张量并行（\code{-sm tensor}）：一个跨两卡�
   \end{tabular}
 \end{table}
 
-MLPerf 的三次运行见表~\ref{tab:mlperf}，交互速度是输出 token 总数除以每轮时间之和，已经把输出长度不同算进去。官方对 V4.1 的准确率门槛是 0.5236，但这里只有 3 段对话，各次的差别在抽样波动以内。AgentX 的 22 个相同请求（提示词平均 9.7 万 token，88.5\% 来自缓存）：首 token 时间平均 4.61 对 16.73 s，输出 token 间隔 19.6 对 25.0 ms，请求时间合计 484 对 858 s；预热时冷算 65,756 token 的前缀，生产 30.0 s、上游 166.7 s，有了 0044 之后生产是 20.9 s（11-09）和 20.1 s（11-10）。
+MLPerf 子集的三次运行见表~\ref{tab:mlperf}，交互速度是输出 token 总数除以每轮时间之和，已经把输出长度不同算进去。内联准确率只用来确认输出没有出错：这里只有 3 段对话，各次的差别在抽样波动以内，也不能和 MLPerf 规定的准确率门槛比较。AgentX 的 22 个相同请求（提示词平均 9.7 万 token，88.5\% 来自缓存）：首 token 时间平均 4.61 对 16.73 s，输出 token 间隔 19.6 对 25.0 ms，请求时间合计 484 对 858 s；预热时冷算 65,756 token 的前缀，生产 30.0 s、上游 166.7 s，有了 0044 之后生产是 20.9 s（11-09）和 20.1 s（11-10）。
 
 TraceLab 有一处是生产输的。16 个相同请求（提示词平均 16.1 万 token）的首 token 时间平均 14.07 对 33.72 s、请求时间合计 440 对 820 s，仍是生产快，冷算 14.4 万 token 的前缀也是生产 45.5 s、上游 358.8 s；但首 token 时间的中位数是 10.98 对 7.92 s，缓存用上的比例 76\% 对 93\%。原因在这份数据合成前缀的方式和 \S\ref{sec:tailmerge} 的末段合并。它只有 token 数，读取器按 64 token 一块、按记录的缓存前缀长度合成共享部分，新请求只和上一个共享到最后一个整块，都断在上一条用户消息的最后一块里，离上一个提示词末尾 6--57 个 token。末段合并为了少拆一次调用，不在最后 2,700 个 token 里建检查点，最后一条用户消息的开头没有检查点，只能退回很远的那个，每轮重算 1.4--2.3 万 token；上游在最后一条用户消息开头和末尾前 2,052 处都切一刀，每轮只重算几百个。我们的客户端都在末尾追加，从槽位末尾接着算（\S\ref{sec:continue}），碰不到这种情况；可以做的是一段会话里出现过「新请求断在上一条用户消息里」之后，给这段会话保留那一刀，还没做。
 
-11-10 和 11-09 比，中间只上了 0046：MLPerf 的首 token 时间中位数 1.61 $\to$ 1.37 s，AgentX 30 个相同请求 3.67 $\to$ 3.22 s，TraceLab 33 个相同请求 9.67 $\to$ 9.26 s，正是 0046 省下的每轮预填充，输出 token 间隔不变。三个 benchmark 的结论和自己的对比一致：每个输出 token 的时间是上游的 0.78--0.80（约 20 对 25 ms），同样的工作量用时约一半，长提示词的冷预填充快 5--8 倍。
+11-10 和 11-09 比，中间只上了 0046：MLPerf 子集的首 token 时间中位数 1.61 $\to$ 1.37 s，AgentX 30 个相同请求 3.67 $\to$ 3.22 s，TraceLab 33 个相同请求 9.67 $\to$ 9.26 s，正是 0046 省下的每轮预填充，输出 token 间隔不变。三个 benchmark 的结论和自己的对比一致：每个输出 token 的时间是上游的 0.78--0.80（约 20 对 25 ms），同样的工作量用时约一半，长提示词的冷预填充快 5--8 倍。
 
 % ---------------------------------------------------------------- 12
 \section{结论、局限与未来方向}
 
-在一台双卡工作站上，Abyss 以原生 MXFP4 精度、19.2 万上下文运行 DeepSeek-V4.1-Flash（10-27 起为 1017 版）：只追加的多轮会话里单流解码约 52 \tps{}（9.6 万上下文，生产上按请求约 50 \tps{}）；4.8 万 token 提示词的预填充约 14 s，9.6 万约 27 s，多轮会话每轮约 2 s。同一份权重、同样的启动参数下，11-07 对比时上游 llama.cpp 的解码是 39.3 对 49.2 \tps{}，长提示词的预填充慢 5 倍以上；在三个公开的智能体 benchmark 里，同样的工作量我们用时约为上游的一半。收益来自六类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k）；按热度安排数据所在的层级（专家缓存、准入和准入门）；让 CPU、DMA 和两张 GPU 同时工作（未命中分流、专家延后、大批次分流和用缓存、两卡流水线）；减少重复的读取和计算（末段一遍算完、上一轮回答不再重算）；去掉不必要的同步和零碎开销（统计不切图、小内核融合、去掉主机的几处等待）；以及把每一块空出来的显存都给专家缓存。每一项都先剖析、后实现，并用分档的数值底线、对官方实现的对拍和解码路径的 PPL 确认正确性。剖析本身也会骗人：同一提示词重复生成和 nsys 按节点跟踪，都曾让我们高估了收益。
+在一台双卡工作站上，Abyss 以原生 MXFP4 精度、19.2 万上下文运行 DeepSeek-V4.1-Flash（10-27 起为 1017 版）：只追加的多轮会话里单流解码约 52 \tps{}（9.6 万上下文，生产上按请求约 50 \tps{}）；4.8 万 token 提示词的预填充约 14 s，9.6 万约 27 s，多轮会话每轮约 2 s。同一份权重、同样的启动参数下，11-07 对比时上游 llama.cpp 的解码是 39.3 对 49.2 \tps{}，长提示词的预填充慢 5 倍以上；在三个公开智能体 benchmark 的子集上（不是官方结果），同样的工作量我们用时约为上游的一半。收益来自六类工作：顺着模型结构减少计算（CED 感知预填充、稀疏索引器、解码注意力只取 top-k）；按热度安排数据所在的层级（专家缓存、准入和准入门）；让 CPU、DMA 和两张 GPU 同时工作（未命中分流、专家延后、大批次分流和用缓存、两卡流水线）；减少重复的读取和计算（末段一遍算完、上一轮回答不再重算）；去掉不必要的同步和零碎开销（统计不切图、小内核融合、去掉主机的几处等待）；以及把每一块空出来的显存都给专家缓存。每一项都先剖析、后实现，并用分档的数值底线、对官方实现的对拍和解码路径的 PPL 确认正确性。剖析本身也会骗人：同一提示词重复生成和 nsys 按节点跟踪，都曾让我们高估了收益。
 
 \paragraph{局限。} 解码的下限由内存带宽决定：第 22--38 层每层 CPU 算未命中的专家都比 GPU1 那一段长，就算把主机内存的流量全藏进 GPU 的计算里，每 token 也还要约 15 ms（\S\ref{sec:nowtime}）；预填充的大批次也已接近「每层专家读一遍」的下限。显存几乎用满：GPU0 峰值时空闲只剩约 0.6 GB（显示器因此不能再接在 GPU0 上），GPU1 约 1.4 GB，再加长上下文或开 DSpark 都得先把专家缓存减回去。唯一改变计算的近似是专家延后，解码路径的 PPL 差别在误差以内。GPU1 冷开机时链路偶尔降速（\S\ref{sec:incidents}），改 BIOS 后 IOMMU 曾被打开、让卡间拷贝静默出错（\S\ref{sec:ddr}），所以开机和改设置之后都要先验证链路和卡间拷贝。server 只有一个槽位，重启时只存它；会改写最后一条用户消息的客户端，会碰上末段合并去掉的那个检查点（\S\ref{sec:benchmarks}）。Engram 表从官方的 FP8 降到了 MXFP4（相对误差约 12\%，\S\ref{sec:formats}），我们没有直接测过它对任务分数的影响。请求文字里的控制 token 字样在输入侧已按官方规则编码，输出侧还没有处理：模型自己用普通 token 写出 \code{</think>} 或工具调用的标签时，解析器仍按文字识别。
 
@@ -1617,7 +1618,7 @@ llama-server -m DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
 \end{verbatim}
 \end{small}
 
-评估脚本在仓库的 \code{tools/eval/}，复制到机器上运行，运行前要先停 server，见表~\ref{tab:tools}。三个标准 benchmark 在仓库的 \code{benchmark/}。
+评估脚本在仓库的 \code{tools/eval/}，复制到机器上运行，运行前要先停 server，见表~\ref{tab:tools}。三个公开 benchmark 的运行脚本在仓库的 \code{benchmark/}。
 
 \begin{table}[tp]
   \centering
@@ -1672,7 +1673,7 @@ llama-server -m DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
     \code{tp-measure.sh}、\code{tp-proto.sh} & 两卡 all-reduce 的延迟；张量并行原型的对比 \\
     \code{gpu-bw.sh}、\code{gpu\_memtest.cu} & 开机或改 BIOS 后查链路、带宽和卡间拷贝 \\
     \code{precision\_audit.py} & GGUF 各类张量和官方 checkpoint 的逐类核对 \\
-    \code{benchmark/run.sh}、\code{compare-runs.sh} & 三个标准 benchmark；两次运行的对比 \\
+    \code{benchmark/run.sh}、\code{compare-runs.sh} & 三个公开 benchmark 的子集；两次运行的对比 \\
     \bottomrule
   \end{tabularx}
 \end{table}
@@ -1772,7 +1773,7 @@ llama-server -m DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf \
   \item[解码统计（0016）] server 日志里每 100 个解码 token 一行：每 token 的耗时、专家缓存命中率、每 token 命中、上传和交给 CPU 的专家数、磁盘缺页次数。它不含 \code{llama\_decode} 返回之后的收尾和采样，所以比按请求算的每 token 时间少约 1 ms。
   \item[强制解码的 PPL] 提示词之后逐个喂参考文本，记下解码路径上每个 token 的负对数似然，两个配置配对比较；比批处理的 PPL 更能反映单 token 解码的改动（\S\ref{sec:forcedppl}）。
   \item[固定种子] 温度 1.0 采样时固定随机种子，两档配置在同样的输入下生成同样的会话，缓存的命中率不再随采样起伏（\S\ref{sec:seeds}）。
-  \item[MLPerf Agentic、AgentX、TraceLab] 三个公开的智能体推理 benchmark，分别来自 MLCommons、SemiAnalysis 和华盛顿大学；本报告在单槽位、并发 1 下跑它们的子集，只用来比较生产和上游（\S\ref{sec:benchmarks}）。
+  \item[MLPerf Agentic、AgentX、TraceLab] 三个公开的智能体推理 benchmark，分别来自 MLCommons、SemiAnalysis 和华盛顿大学；本报告在单槽位、并发 1 下跑它们的子集，只用来比较生产和上游，都不是官方结果；MLPerf 那一项不是 MLPerf 结果，未经 MLCommons 验证（\S\ref{sec:benchmarks}）。
   \item[llama-bench、AIPerf] llama.cpp 自带的基准程序（pp 测预填充、tg 测生成）和 NVIDIA 的推理服务压测工具（测首 token 时间和每 token 时间），本报告用来给出标准口径（\S\ref{sec:stdbench}）。
   \item[stressapptest] Google 的内存压力测试工具，反复读写大块内存并校验，用来确认内存提频后没有错误。
 \end{description}

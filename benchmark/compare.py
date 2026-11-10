@@ -67,7 +67,8 @@ def main():
         results = {s: module(SUMMARY.get(bench, bench)).load(d) if os.path.isdir(d) else None for s, d in dirs.items()}
         if not any(results.values()):
             continue
-        print(f"\n### {bench}\n")
+        note = " (a subset, not an MLPerf result; not verified by MLCommons Association)" if bench == "mlperf" else ""
+        print(f"\n### {bench}{note}\n")
         ratio = len(servers) == 2 and all(results.values())
         print("| | " + " | ".join(servers) + (f" | {servers[0]} / {servers[1]} |" if ratio else " |"))
         print("|---|" + "---:|" * (len(servers) + ratio))
