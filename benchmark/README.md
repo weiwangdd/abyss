@@ -25,6 +25,8 @@
 ~/abyss-tools/benchmark/run.sh                    # 停生产，三个 benchmark 各在生产和上游上跑一遍，打印对比表，重启生产
 SKIP="mlperf-up agentx-up" ~/abyss-tools/benchmark/run.sh   # 跳过指定的「benchmark-服务器」组合，这里上游只跑 TraceLab
 SERVERS=tiny BENCHES=mlperf ~/abyss-tools/benchmark/run.sh   # CPU 上的小模型，不停生产，只为试流程
+SERVERS=fork ~/abyss-tools/benchmark/run.sh       # 只跑生产（上游没变时沿用上次的结果）
+~/abyss-tools/benchmark/compare-runs.sh ~/abyss-eval/bench-1109-0136 ~/abyss-eval/bench-1110-0002   # 两次运行的生产并排比
 ```
 
 - `servers.sh`：起停三种服务器（`fork` 生产、`up` 上游、`tiny` CPU 小模型），记加载时间和两卡显存峰值。
@@ -33,10 +35,30 @@ SERVERS=tiny BENCHES=mlperf ~/abyss-tools/benchmark/run.sh   # CPU 上的小模�
 - `mlperf/subset.py stats` 按客户端的拼法和官方对话模板数每段对话最长一次请求的 token 数：113 条编程轨迹里 25 条超过 196,608，85 条在 190,000 以内；客服对话 3.1–4.4 万。
 - `compare.py`：从两边的原始结果出对比表（TraceLab 用 AgentX 的汇总）。
 - `agentx/pairs.py`：两次 AgentX（或 TraceLab）运行只比两边都测到的请求。窗口是固定的，快的一边会多测到后面的请求，整体的百分位数不能直接比。
+- `compare-runs.sh OLD NEW [SERVER]`：两次 `run.sh` 里同一个服务器（默认 `fork`）的结果并排比：`compare.py` 的表，两列是两次运行；AgentX、TraceLab 再用 `pairs.py` 比两次都测到的请求。
 
 依赖（都在 blackwell 的 `~/abyss-tools/bench`）：MLPerf 客户端 `endpoints`（`uv sync`，520eb4d）和数据集（SHA-256 `1beb24c8…`），AgentX 客户端 `agx`（`pip install agentx-harness==1.0.13`），TraceLab 语料 `tracelab/syfi_coding_trace.jsonl.gz`（release v0.0.1，SHA-256 `9d265eae…`）和 `filter.py` 从它筛出的 `syfi_coding_trace-190k.jsonl.gz`，带官方对话模板的分词器 `dsv41-tokenizer`（`deepseek-ai/DeepSeek-V4.1-Flash` 的 tokenizer 文件）。客户端和服务器在同一台机器上，MLPerf 客户端原本会把自己绑到最快的 5 个核上，配置里关掉了。
 
 ## 结果
+
+### 2026-11-10：生产上了 0046
+
+00:02 到 00:54（`~/abyss-eval/bench-1110-0002`，生产停了 52 分钟）。只跑生产，和 11-09 的生产比（`compare-runs.sh`，对比表存成 `compare-vs-1109.md`）：这中间生产只上了大批次上传不再让主机等（`0046`，智能体每轮预填充约快 16%，解码不变）。加载 49–50 s，显存峰值 96,698 / 95,935 MiB。
+
+| | 这次 | 11-09 |
+|---|---:|---:|
+| MLPerf TTFT 中位数 / 平均 / p90 (s) | 1.37 / 2.21 / 4.08 | 1.61 / 2.50 / 4.57 |
+| MLPerf 每个输出 token，中位数 (ms) | 20.4 | 20.4 |
+| MLPerf 每轮延迟平均 (s) | 14.2 | 16.2 |
+| MLPerf 端到端交互速度 (tok/s) | 42.94 | 42.54 |
+| AgentX 30 个相同请求的 TTFT 中位数 / 平均 (s) | 3.22 / 19.9 | 3.67 / 20.8 |
+| AgentX 输出 token 间隔平均 (ms) | 19.4 | 19.2 |
+| AgentX 请求时间合计 (s) | 1,297 | 1,308 |
+| TraceLab 33 个相同请求的 TTFT 中位数 / 平均 (s) | 9.26 / 10.25 | 9.67 / 10.83 |
+| TraceLab 输出 token 间隔平均 (ms) | 20.0 | 20.0 |
+| TraceLab 请求时间合计 (s) | 729 | 748 |
+
+MLPerf 的输入逐轮相同，输出因采样不同：这次每轮平均 608 个 token，11-09 是 690，每轮延迟短了有一部分是因为这个；内联准确率 0.578 对 0.591（47 轮），在波动以内。AgentX、TraceLab 用同一个种子，两次测到的请求和输出长度完全相同，可以逐个比。首 token 中位数短了 0.4–0.5 s，正是 `0046` 省下的每轮预填充；解码不变。TraceLab 只快 4%：每轮重算 1.4–2.3 万 token 的原因（`0015` 的末段合并，见下面 11-09 的结果）还在。冷算前缀：AgentX 的 65,756 token 20.9 → 20.1 s，TraceLab 的 144,454 token 45.5 → 44.3 s。
 
 ### 2026-11-09：加 TraceLab，生产上了 0044、0045
 
