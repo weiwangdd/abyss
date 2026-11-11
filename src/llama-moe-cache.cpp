@@ -183,8 +183,11 @@ struct moe_cache_lru {
     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // returns false if the ids select more distinct experts than there are slots
+    // abyss: with gate > 0, a miss that would be cached is also left to the CPU when the slot it would take holds an
+    // expert that is at least as hot (its decayed CRF times gate against the CRF of the miss), as long as its tokens
+    // have a zero slot left
     template <typename F>
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu, float gate,
             std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit) {
         fills.clear();
         cpu.clear();
@@ -223,43 +226,52 @@ struct moe_cache_lru {
 
         // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
         // all misses are used at the same clock, so their CRF compare without decay
+        // leave miss e to the CPU: it reads a zero slot that none of its tokens reads yet, false if there is none
+        const auto to_cpu = [&](int32_t e) {
+            uint64_t used = 0;
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                for (int32_t k = 0; k < n_used; ++k) {
+                    if (ids[it*n_used + k] == e) {
+                        used |= token_zero[it];
+                    }
+                }
+            }
+            int32_t z = 0;
+            while (z < 64 && (used >> z & 1)) {
+                z++;
+            }
+            if (z >= n_zero) {
+                return false;
+            }
+            for (int64_t it = 0; it < n_tokens; ++it) {
+                for (int32_t k = 0; k < n_used; ++k) {
+                    if (ids[it*n_used + k] == e) {
+                        token_zero[it] |= 1ull << z;
+                    }
+                }
+            }
+            slots[e] = n_slots + z;
+            cpu.push_back({ e, n_slots + z });
+            return true;
+        };
+
         const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+        if (n_c > 0 || gate > 0.0f) {
+            GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
+            token_zero.assign(n_tokens, 0);
+        }
         if (n_c > 0) {
             std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
                 const float crf_a = crf[make_key(il, a)];
                 const float crf_b = crf[make_key(il, b)];
                 return crf_a != crf_b ? crf_a < crf_b : a < b;
             });
-            GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
-            token_zero.assign(n_tokens, 0);
             size_t n_keep = n_c;
             for (size_t i = 0; i < n_keep; ) {
-                const int32_t e = misses[i];
-                uint64_t used = 0;
-                for (int64_t it = 0; it < n_tokens; ++it) {
-                    for (int32_t k = 0; k < n_used; ++k) {
-                        if (ids[it*n_used + k] == e) {
-                            used |= token_zero[it];
-                        }
-                    }
-                }
-                int32_t z = 0;
-                while (z < 64 && (used >> z & 1)) {
-                    z++;
-                }
-                if (z >= n_zero) {
+                if (!to_cpu(misses[i])) {
                     std::swap(misses[i], misses[--n_keep]);
                     continue;
                 }
-                for (int64_t it = 0; it < n_tokens; ++it) {
-                    for (int32_t k = 0; k < n_used; ++k) {
-                        if (ids[it*n_used + k] == e) {
-                            token_zero[it] |= 1ull << z;
-                        }
-                    }
-                }
-                slots[e] = n_slots + z;
-                cpu.push_back({ e, n_slots + z });
                 i++;
             }
             misses.erase(misses.begin(), misses.begin() + n_keep);
@@ -270,6 +282,9 @@ struct moe_cache_lru {
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
             const int32_t s = victim(il);
+            if (gate > 0.0f && key_of[s] >= 0 && gate*decayed_crf(key_layer(key_of[s]), key_of[s]) >= crf[make_key(il, e)] && to_cpu(e)) {
+                continue;
+            }
             if (key_of[s] >= 0) {
                 slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
@@ -810,8 +825,13 @@ struct llama_moe_cache::impl {
             l.cpu_acc = acc & 0xffff;
             return (size_t) (acc >> 16);
         };
+        // abyss: ABYSS_MOE_ADMIT_GATE=1, see moe_cache_lru::plan(); a larger value keeps more misses out of the cache
+        static const float admit_gate = [] {
+            const char * e = getenv("ABYSS_MOE_ADMIT_GATE");
+            return e != nullptr ? std::max(0.0f, (float) atof(e)) : 0.0f;
+        }();
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit)) {
+        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, share_q > 0 ? admit_gate : 0.0f, fills, cpu, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
