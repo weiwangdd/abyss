@@ -2600,12 +2600,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    ggml_tensor * experts_cpu = nullptr; // abyss: the misses computed from the host experts, when the caller adds them later
     if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
         // the cached experts come first in the graph, so that they are computed while the misses are
         ggml_build_forward_expand(gf, experts);
-        experts = ggml_add(ctx0, experts, build_experts(cur, selected_experts, cache.cpu_ids, false));
-        cb(experts, "ffn_moe_down_merged", il);
+        if (moe_deferred != nullptr && down_exps_b == nullptr && post_exp_norm == nullptr && !weight_before_ffn) {
+            experts_cpu = build_experts(cur, selected_experts, cache.cpu_ids, false);
+            cb(experts_cpu, "ffn_moe_down_deferred", il);
+        } else {
+            experts = ggml_add(ctx0, experts, build_experts(cur, selected_experts, cache.cpu_ids, false));
+            cb(experts, "ffn_moe_down_merged", il);
+        }
     }
 
     if (down_exps_s) {
@@ -2658,6 +2664,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (experts_cpu != nullptr) {
+        // abyss: weighted and summed like the cached experts, and left out of the graph for the caller to place
+        experts_cpu = ggml_mul(ctx0, experts_cpu, weights);
+        ggml_tensor * sum = nullptr;
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            ggml_tensor * e = ggml_view_2d(ctx0, experts_cpu, n_embd, n_tokens, experts_cpu->nb[2], i*experts_cpu->nb[1]);
+            sum = sum ? ggml_add(ctx0, sum, e) : e;
+        }
+        if (n_expert_used_il == 1) {
+            sum = ggml_cont(ctx0, sum);
+        }
+        cb(sum, "ffn_moe_deferred", il);
+        *moe_deferred = sum;
     }
 
     cb(moe_out, "ffn_moe_out", il);

@@ -888,6 +888,31 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
 
+    // abyss: expert deferral, ABYSS_MOE_DEFER=1. In single-token decoding, the experts that the MoE cache leaves to the
+    // CPU are not merged into the FFN output of their layer. Their weighted sum D enters the residual one sublayer
+    // later, before the post-mix of the next layer's attention, as residual + post ⊗ D with the post-mix of their own
+    // FFN: the hidden state is exact from there on, and only the next layer's attention (and the mixes computed from
+    // its input) did not see D. The GPU computes the cached experts and that attention while the CPU computes the
+    // misses, instead of waiting for them. ABYSS_MOE_DEFER=2 adds D right after its own FFN, which is the undeferred
+    // result with another order of operations, to check the plumbing.
+    static const int moe_defer = [] {
+        const char * e = getenv("ABYSS_MOE_DEFER");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    const bool defer_ok = moe_defer > 0 && moe_cache != nullptr && n_tokens == 1 && ced_n_sub.empty() &&
+        std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool tap) { return tap; });
+    ggml_tensor * defer_sum  = nullptr; // D of the previous layer, [n_embd, n_tokens]
+    ggml_tensor * defer_post = nullptr; // the post-mix of its FFN
+
+    // residual + post ⊗ x
+    const auto hc_add = [&](ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post) {
+        if (cparams.fused_dsv4_hc_post) {
+            return ggml_dsv4_hc_post(ctx0, x, residual, post, nullptr);
+        }
+        ggml_tensor * d = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, x, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        return ggml_add(ctx0, residual, ggml_mul(ctx0, d, ggml_reshape_3d(ctx0, post, 1, hc, n_tokens)));
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -916,6 +941,18 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
 
         cur = build_attention41(model, inp_dsv4, cur, inp_pos, cand_pin, il);
 
+        if (defer_sum != nullptr) {
+            // abyss: everything up to here goes into the graph before the misses of the previous layer, so that the
+            // scheduler runs it on the GPU while the CPU computes them
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, attn_mix.post);
+            ggml_build_forward_expand(gf, attn_mix.comb);
+            residual = hc_add(defer_sum, residual, defer_post);
+            cb(residual, "hc_deferred", il);
+            defer_sum  = nullptr;
+            defer_post = nullptr;
+        }
+
         inpL = build_hc_post(cur, residual, attn_mix.post, attn_mix.comb, il);
         cb(inpL, "hc_attn_post", il);
 
@@ -929,6 +966,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         GGML_ASSERT(n_ffn >= 0 && n_ffn <= n_tokens);
 
         ggml_tensor * attn_out = cur;
+        ggml_tensor * deferred = nullptr; // abyss: the misses of this layer's FFN that the CPU computes, see moe_defer
 
         if (n_ffn > 0) {
             cur = build_hc_pre(inpL, attn_mix.pre, il);
@@ -961,6 +999,10 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
                 exp_probs_b = layer.ffn_exp_probs_b_vl;
             }
 
+            if (defer_ok && il + 1 < n_layer) {
+                moe_deferred = &deferred;
+            }
+
             // the reference normalizes only when it routes to more than one expert
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
@@ -973,6 +1015,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il, logits);
+            moe_deferred = nullptr;
             cb(moe_out, "ffn_moe_out", il);
 
             ggml_tensor * ffn_shexp = build_ffn(cur,
@@ -992,6 +1035,14 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         }
 
         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
+        if (deferred != nullptr) {
+            if (moe_defer == 2) {
+                inpL = hc_add(deferred, inpL, ffn_mix.post);
+            } else {
+                defer_sum  = deferred;
+                defer_post = ffn_mix.post;
+            }
+        }
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
     }

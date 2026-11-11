@@ -1103,6 +1103,11 @@ struct llm_graph_context {
 
     const std::vector<int32_t> ced_n_sub; // abyss: see llm_graph_params
 
+    // abyss: expert deferral. While this is set, build_moe_ffn() leaves the misses of the MoE cache that the CPU computes
+    // out of its result and stores their weighted sum here, [n_embd, n_tokens], not yet in the graph: the caller adds
+    // it where the CPU has had time to compute it (see llama_model_deepseek41::graph). Stays nullptr without such misses
+    mutable ggml_tensor ** moe_deferred = nullptr;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
