@@ -297,6 +297,9 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // abyss: plans the CED-aware prefill of a batch into ced_last_layer, returns false when every token runs every layer
+    bool ced_plan(const llama_batch & batch);
+
     // parameters defining the backend scheduler instance
     struct sched_params {
         size_t max_nodes  = 0;
@@ -363,6 +366,9 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    // abyss: per token of the batch being decoded, the last layer whose FFN it needs; empty outside a planned decode()
+    std::vector<int8_t> ced_last_layer;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

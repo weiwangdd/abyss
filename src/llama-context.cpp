@@ -2318,6 +2318,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // abyss: planned after the graph reservation so reserve graphs never see it, and dropped on every exit
+    struct ced_reset {
+        std::vector<int8_t> & plan;
+        ~ced_reset() { plan.clear(); }
+    } ced_guard { ced_last_layer };
+    if (!output_all && n_tokens_all > 1 && !has_embd_row && !has_state_row) {
+        ced_plan(balloc->get_batch());
+    }
+
     // ordering for the layer input device buffer
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
     ggml_backend_t  inject_backend = nullptr;
@@ -3084,6 +3093,50 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // abyss: under the CED-aware prefill, the tokens of the ubatch each layer still computes, see ced_plan(). The plan
+    // never decreases along the batch, so they are the last tokens of the ubatch as long as it keeps the batch order
+    std::vector<int32_t> ced_n_sub;
+    if (!ced_last_layer.empty() && gtype == LLM_GRAPH_TYPE_DEFAULT && ubatch.n_seqs_unq == 1 &&
+            ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens) {
+        const int32_t n_layer = (int32_t) model.hparams.n_layer();
+        const auto & batch_idxs = ubatch.data->batch_idxs;
+
+        bool ordered = true;
+        for (uint32_t i = 0; i < ubatch.n_tokens && ordered; ++i) {
+            ordered = batch_idxs[i] >= 0 && (size_t) batch_idxs[i] < ced_last_layer.size() &&
+                    (i == 0 || batch_idxs[i] > batch_idxs[i - 1]);
+        }
+
+        if (ordered) {
+            ced_n_sub.assign(n_layer, 0);
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const int32_t last = std::min<int32_t>(ced_last_layer[batch_idxs[i]], n_layer - 1);
+                for (int32_t il = 0; il <= last; ++il) {
+                    ced_n_sub[il]++;
+                }
+            }
+            if (ced_n_sub[n_layer - 1] == (int32_t) ubatch.n_tokens) {
+                ced_n_sub.clear();
+            }
+        }
+
+        // ABYSS_CED_DEBUG=1 prints the tokens each trimmed layer keeps, one line per ubatch
+        static const bool debug = [] {
+            const char * e = getenv("ABYSS_CED_DEBUG");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (debug) {
+            std::string counts;
+            for (int32_t il = 0; il < (int32_t) ced_n_sub.size(); ++il) {
+                if (ced_n_sub[il] < (int32_t) ubatch.n_tokens) {
+                    counts += " " + std::to_string(il) + ":" + std::to_string(ced_n_sub[il]);
+                }
+            }
+            LLAMA_LOG_INFO("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
+                    ordered ? (counts.empty() ? " all" : counts.c_str()) : " (not in batch order, all)");
+        }
+    }
+
     return {
         /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
@@ -3107,7 +3160,98 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.ced_n_sub   =*/ std::move(ced_n_sub),
     };
+}
+
+// abyss: CED-aware prefill (DeepSeek V4.1), ABYSS_CED_PREFILL=1.
+// The decoder layers read their long-range context from the compressed KV that the first decoder layer builds from the
+// encoder output, and see the other tokens' own hidden states only through sliding windows of n_swa positions, each
+// reaching n_swa - 1 positions back. So a decoder layer needs a token's queries and FFN only where an output token
+// reaches it through the windows of the layers above, or where the next decode step does: the last positions of the
+// sequence stay valid up to the second-to-last layer, n_rs_seq of them on top of the window (ABYSS_CED_MARGIN overrides
+// it), so the short rollbacks the cache allows still find correct sliding-window KV (without n_rs_seq the cache rolls
+// back only to a checkpoint). Tokens out of reach still write their KV in every layer: their wrong hidden states only
+// feed KV entries no later token reads.
+// Each llama_decode() call is planned on its own end, so a prompt split across calls stays correct and only saves less.
+// The plan covers a batch of one sequence in a context of one sequence, and never decreases along the batch, so the
+// tokens a layer still computes are the last ones of every ubatch.
+bool llama_context::ced_plan(const llama_batch & batch) {
+    static const bool enabled = [] {
+        const char * e = getenv("ABYSS_CED_PREFILL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const int32_t margin_env = [] {
+        const char * e = getenv("ABYSS_CED_MARGIN");
+        return e != nullptr ? std::max(0, atoi(e)) : -1;
+    }();
+    const int32_t margin = margin_env >= 0 ? margin_env : (int32_t) cparams.n_rs_seq;
+
+    ced_last_layer.clear();
+
+    const auto & hparams = model.hparams;
+    const int32_t n_layer = (int32_t) hparams.n_layer();
+
+    if (!enabled || model.arch != LLM_ARCH_DEEPSEEK41 || hparams.n_swa < 2 || n_layer < 2 || n_layer > INT8_MAX ||
+            cparams.n_seq_max != 1 || cparams.embeddings_nextn || cparams.embeddings_nextn_masked ||
+            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool tap) { return tap; })) {
+        return false;
+    }
+
+    // the first decoder layer is the kv source of the last layer
+    const int32_t first_dec = hparams.dsv41_kv_src[n_layer - 1];
+    if (first_dec <= 0 || batch.pos == nullptr || batch.logits == nullptr || batch.token == nullptr || batch.embd != nullptr ||
+            batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+
+    const int32_t step = (int32_t) hparams.n_swa - 1;
+    const int32_t n    = batch.n_tokens;
+
+    // one sequence, with increasing positions
+    for (int32_t i = 0; i < n; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != batch.seq_id[0][0] || (i > 0 && batch.pos[i] <= batch.pos[i - 1])) {
+            return false;
+        }
+    }
+    const llama_pos pos_end = batch.pos[n - 1];
+
+    // window steps needed to reach a token d positions back
+    const auto steps = [step](int32_t d) { return (d + step - 1)/step; };
+
+    ced_last_layer.assign(n, (int8_t) (n_layer - 1));
+
+    llama_pos next_out = -1; // the next output position at or after the token
+    for (int32_t i = n - 1; i >= 0; --i) {
+        const llama_pos p = batch.pos[i];
+        if (batch.logits[i]) {
+            next_out = p;
+        }
+
+        int32_t last = first_dec - 1;
+        if (next_out >= 0) {
+            last = std::max(last, n_layer - 1 - steps(next_out - p));
+        }
+        last = std::max(last, n_layer - 2 - steps(std::max(0, pos_end - p - (margin + step - 1))));
+        last = std::min(last, n_layer - 1);
+
+        ced_last_layer[i] = (int8_t) last;
+    }
+
+    // an output in the middle of the batch raises the tokens before it above the ones after it: level those up
+    bool trimmed = false;
+    for (int32_t i = 0; i < n; ++i) {
+        if (i > 0 && ced_last_layer[i] < ced_last_layer[i - 1]) {
+            ced_last_layer[i] = ced_last_layer[i - 1];
+        }
+        trimmed |= ced_last_layer[i] < n_layer - 1;
+    }
+
+    if (!trimmed) {
+        ced_last_layer.clear();
+    }
+
+    return trimmed;
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {

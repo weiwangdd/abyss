@@ -837,6 +837,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // abyss: CED-aware prefill (DeepSeek V4.1), see llama_context::ced_plan(): per layer, how many of the last tokens of
+    // the ubatch still need the layer's queries and FFN; empty when every layer runs every token
+    std::vector<int32_t> ced_n_sub;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -875,6 +879,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (ced_n_sub != other.ced_n_sub) {
             return false;
         }
 
@@ -1092,6 +1100,8 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_src;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::vector<int32_t> ced_n_sub; // abyss: see llm_graph_params
 
     const llm_graph_cb & cb_func;
 

@@ -442,20 +442,46 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         return ggml_rope_set_offset(t, n_nope);
     };
 
-    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-    cb(qr, "qr_norm", il);
+    const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
+    const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
+    const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
 
-    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
-    q = rope(q, inp_pos, n_embd_head_nope);
-    cb(q, "q", il);
+    // abyss: under the CED-aware prefill a layer attends only for the last nq tokens of the ubatch, see
+    // llama_context::ced_plan(). Every token still writes its KV. The window-only path keeps every query
+    const int64_t nq = !ced_n_sub.empty() && ratio != 0 && ci.kq_mask ? ced_n_sub[il] : nt;
+    GGML_ASSERT(nq >= 0 && nq <= nt);
+
+    const bool sub = nq < nt;
+
+    // the last nq rows of t [ne0, rows, 1, 1], or t itself where every token attends. A view of a graph input stays on
+    // the host, and the scheduler uploads only these rows to the device that reads them
+    const auto tail = [&](ggml_tensor * t) {
+        if (!sub) {
+            return t;
+        }
+        GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1 && nq > 0 && nq <= t->ne[1]);
+        return nq == t->ne[1] ? t :
+            ggml_view_4d(ctx0, t, t->ne[0], nq, 1, 1, t->nb[1], nq*t->nb[1], nq*t->nb[1], (t->ne[1] - nq)*t->nb[1]);
+    };
+
+    ggml_tensor * cur_q = nq > 0 ? tail(cur) : nullptr;
+    ggml_tensor * pos_q = sub && nq > 0 ? ggml_view_1d(ctx0, inp_pos, nq, (nt - nq)*inp_pos->nb[0]) : inp_pos;
+
+    // with no queries they stay out of the graph: expanded, they would be computed and kept to the end of the graph
+    ggml_tensor * qr = nullptr;
+    ggml_tensor * q  = nullptr;
+    if (nq > 0) {
+        qr = build_norm(build_lora_mm(layer.wq_a, cur_q), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        cb(qr, "qr_norm", il);
+
+        q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nq);
+        q = rope(q, pos_q, n_embd_head_nope);
+        cb(q, "q", il);
+    }
 
     ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
     cb(kv, "kv", il);
-
-    const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
-    const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
-    const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
 
     const int32_t rd = inp_dsv4->mctx->get_comp_read_layer(il);
 
@@ -528,7 +554,29 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
         const int64_t n_stream = comp_all->ne[3];
 
+        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
+        ggml_tensor * k_rot = inp_attn->self_k_rot[il];
+
+        if (nq == 0) {
+            // abyss: no token attends here, the layer only writes its window KV
+            if (k_rot) {
+                kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+            }
+            ggml_build_forward_expand(gf, kv);
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+
+            return ggml_fill(ctx0, cur, 0.0f);
+        }
+
+        // abyss: the plan covers one sequence, so a layer that attends for part of the ubatch has one stream
+        GGML_ASSERT(!sub || n_stream == 1);
+        ggml_tensor * comp_mask = tail(ci.kq_mask);
+
+        // the top-k and the candidate blocks of a source layer cover its own queries, which include this layer's
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
+        if (top_k) {
+            top_k = tail(top_k);
+        }
         if (hparams.dsv41_topk_src[il] == il) {
             ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
                     comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
@@ -540,16 +588,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ik = ggml_cont(ctx0, ik);
             }
 
-            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
-            iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
-            iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nt/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nt/n_stream), 0);
+            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nq);
+            iq = rope(iq, pos_q, n_idx_embd - n_embd_head_rope);
+            iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nq/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nq/n_stream), 0);
 
-            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
-            iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
+            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur_q), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
+            iw = ggml_view_4d(ctx0, iw, iw->ne[0], nq/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nq/n_stream), iw->nb[1]*(nq/n_stream), 0);
 
             // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
-            const int64_t n_tok = nt/n_stream;
-            GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
+            const int64_t n_tok = nq/n_stream;
+            GGML_ASSERT(comp_mask->ne[1] == n_tok);
             const int64_t chunk = fused_idx ? n_tok :
                 std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
 
@@ -561,6 +609,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
 
+            // abyss: the pins and the candidate blocks of this layer's queries
+            ggml_tensor * pin_q = pick_blk ? tail(cand_pin) : nullptr;
+            ggml_tensor * sel_q = use_blk  ? tail(cand_sel) : nullptr;
+
             ggml_tensor * ik_p = fused_idx ? nullptr : ggml_permute(ctx0, ik, 0, 2, 1, 3);
             std::vector<ggml_tensor *> parts_top_k;
             std::vector<ggml_tensor *> parts_sel;
@@ -571,7 +623,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 };
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
@@ -579,7 +631,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
-                    ggml_tensor * mask  = rows(ci.kq_mask);
+                    ggml_tensor * mask  = rows(comp_mask);
                     score = ggml_add(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)),
                             mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
                 }
@@ -592,12 +644,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                         s2 = ggml_concat(ctx0, s2, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blk*bs - n_comp, nc*n_stream), -INFINITY), 0);
                     }
                     ggml_tensor * bmax = ggml_pool_1d(ctx0, s2, GGML_OP_POOL_MAX, bs, bs, 0);
-                    bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(cand_pin));
+                    bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(pin_q));
                     cb(bmax, "cand_block_score", il);
                     parts_sel.push_back(ggml_top_k(ctx0, bmax, std::min<int64_t>(hparams.dsv41_cand_topk_blocks, n_blk)));
                 } else if (use_blk) {
                     // own scores, restricted to the source's candidate blocks: 0 inside them, -inf elsewhere
-                    ggml_tensor * bsel = ggml_cont(ctx0, rows(cand_sel));
+                    ggml_tensor * bsel = ggml_cont(ctx0, rows(sel_q));
                     const int64_t k_b = bsel->ne[0];
                     ggml_tensor * bm    = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blk, nc*n_stream, 1), -INFINITY);
                     ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, k_b, nc*n_stream, 1), 0.0f);
@@ -631,8 +683,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         }
         GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
 
-        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
-        ggml_tensor * k_rot = inp_attn->self_k_rot[il];
         if (k_rot) {
             q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
             kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
@@ -642,14 +692,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
-        ggml_tensor * raw_mask = inp_attn->self_attn_mask.raw;
+        ggml_tensor * raw_mask = tail(inp_attn->self_attn_mask.raw);
 
         const int32_t topk_src = hparams.dsv41_topk_src[il];
         const int64_t k_sel    = top_k->ne[0];
         const int64_t n_raw    = raw_k->ne[2];
 
         // few queries per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as dense, different key order
-        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
+        // abyss: the gathered rows are shared by the layers of a top-k source, so a layer with its own subset of queries attends densely
+        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 && !sub &&
                 ((n_stream == 1 && nt <= 32) || nt == n_stream);
 
         if (gather) {
@@ -734,7 +785,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             cb(comp_k, "comp_k", il);
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
-            ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
+            ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
             ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
             cb(kq_mask, "comp_kq_mask", il);
 
@@ -748,19 +799,26 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         cb(out, "attn_comp", il);
     }
 
-    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
-    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+    // abyss: the queries keep only their own rows through the output projection
+    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nq);
+    out = ggml_rope_ext_back(ctx0, out, pos_q, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
     out = ggml_rope_set_offset(out, n_embd_head_nope);
     cb(out, "attn_derope", il);
 
-    out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nt), 0, 2, 1, 3);
+    out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nq), 0, 2, 1, 3);
     ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
     cb(oa, "attn_wo_a", il);
-    oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nt);
+    oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nq);
 
     out = build_lora_mm(layer.wo_b, oa);
     cb(out, "attn_out", il);
+
+    if (sub) {
+        // the tokens that do not attend get a zero attention output
+        out = ggml_pad_ext(ctx0, out, 0, 0, (int) (nt - nq), 0, 0, 0, 0, 0);
+        cb(out, "attn_out_ced", il);
+    }
 
     return out;
 }
@@ -865,50 +923,73 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
         pre_prev = ffn_mix.pre;
 
-        cur = build_hc_pre(inpL, attn_mix.pre, il);
-        cb(cur, "hc_ffn_pre", il);
+        // abyss: under the CED-aware prefill this layer runs its FFN on the last n_ffn tokens of the ubatch only, the
+        // tokens that nothing reads anymore get a zero FFN output, see llama_context::ced_plan()
+        const int64_t n_ffn = ced_n_sub.empty() ? n_tokens : ced_n_sub[il];
+        GGML_ASSERT(n_ffn >= 0 && n_ffn <= n_tokens);
+
+        ggml_tensor * attn_out = cur;
+
+        if (n_ffn > 0) {
+            cur = build_hc_pre(inpL, attn_mix.pre, il);
+            cb(cur, "hc_ffn_pre", il);
+        }
 
         ggml_build_forward_expand(gf, residual);
         ggml_build_forward_expand(gf, ffn_mix.post);
         ggml_build_forward_expand(gf, ffn_mix.comb);
 
-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        if (n_ffn == 0) {
+            cur = ggml_fill(ctx0, attn_out, 0.0f);
+            cb(cur, "ffn_out_ced", il);
+        } else {
+            if (n_ffn < n_tokens) {
+                cur = ggml_view_2d(ctx0, cur, n_embd, n_ffn, cur->nb[1], (n_tokens - n_ffn)*cur->nb[1]);
+            }
 
-        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
-        ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
-        cb(logits, "ffn_moe_logits", il);
+            cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
 
-        // image (embedding) tokens use the vision router bias, as DeepSeek-V4
-        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
-            exp_probs_b = layer.ffn_exp_probs_b_vl;
+            // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
+            ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
+            ggml_prec_set_acc(logits, GGML_PREC_F32);
+            cb(logits, "ffn_moe_logits", il);
+
+            // image (embedding) tokens use the vision router bias, as DeepSeek-V4
+            ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+            if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+                exp_probs_b = layer.ffn_exp_probs_b_vl;
+            }
+
+            // the reference normalizes only when it routes to more than one expert
+            ggml_tensor * moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    exp_probs_b,
+                    n_expert, hparams.n_expert_used(),
+                    LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il, logits);
+            cb(moe_out, "ffn_moe_out", il);
+
+            ggml_tensor * ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+
+            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+            cb(cur, "ffn_out", il);
+
+            if (n_ffn < n_tokens) {
+                cur = ggml_pad_ext(ctx0, cur, 0, 0, (int) (n_tokens - n_ffn), 0, 0, 0, 0, 0);
+                cb(cur, "ffn_out_ced", il);
+            }
         }
-
-        // the reference normalizes only when it routes to more than one expert
-        ggml_tensor * moe_out = build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                exp_probs_b,
-                n_expert, hparams.n_expert_used(),
-                LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
-        cb(moe_out, "ffn_moe_out", il);
-
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
 
         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
         inpL = build_cvec(inpL, il);

@@ -1525,6 +1525,27 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     do {
         balloc.split_reset();
 
+        // abyss: ABYSS_CED_ALIGN=1 puts the remainder in the first ubatch instead of the last, so the last ubatch is full.
+        // The CED-aware prefill runs the decoder layers only on the tail of a call, and every ubatch that holds part of
+        // that tail reads the host-resident experts of those layers once; a full last ubatch leaves the earlier one only
+        // the first few decoder layers.
+        static const bool ced_align = [] {
+            const char * e = getenv("ABYSS_CED_ALIGN");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        uint32_t n_first = 0;
+        if (ced_align && !has_coupled && !raw_per_seq && !comp_per_seq && balloc.get_n_tokens() > n_ubatch) {
+            // one sequence only, or the equal split would not hand out the tokens in batch order
+            const llama_batch & batch = balloc.get_batch();
+            bool one_seq = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
+            for (int32_t i = 0; one_seq && i < batch.n_tokens; ++i) {
+                one_seq = batch.n_seq_id[i] == 1 && batch.seq_id[i][0] == batch.seq_id[0][0];
+            }
+            if (one_seq) {
+                n_first = balloc.get_n_tokens() % n_ubatch;
+            }
+        }
+
         std::vector<llama_ubatch> ubatches;
         while (true) {
             llama_ubatch ubatch;
@@ -1533,7 +1554,8 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             } else {
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_first > 0 ? n_first : n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                n_first = 0;
             }
 
             if (ubatch.n_tokens == 0) {

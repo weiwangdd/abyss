@@ -1592,6 +1592,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
     samplers         (params.samplers),
+    ced_n_sub        (params.ced_n_sub),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
