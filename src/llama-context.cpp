@@ -3197,7 +3197,8 @@ llm_graph_params llama_context::graph_params(
                     counts += " " + std::to_string(il) + ":" + std::to_string(ced_n_sub[il]);
                 }
             }
-            LLAMA_LOG_INFO("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
+            // not an info log: a server does not show those of the library
+            LLAMA_LOG("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
                     ordered ? (counts.empty() ? " all" : counts.c_str()) : " (not in batch order, all)");
         }
     }
