@@ -1,5 +1,7 @@
 # Abyss 调度器设计
 
+> 这是 2026-10 的早期设计文档，写到 10-25 为止，留作记录，不再更新。文中的预期和数字早已被后来的实现超过（现在解码约 52 tok/s，4.8 万 token 预填充约 14 s），最新的做法和结果见[技术报告](../report/report.pdf)（[English](../report/report-en.pdf)）和 [CLAUDE.md](../CLAUDE.md)。
+
 在 mx-llama.cpp（`c4d12e2`）上加三个组件：专家缓存、CED 感知预填充、Engram 异步预取。预计把方案 B 的解码从 16.5 tok/s 提到约 25–35 tok/s，预填充从约 300 tok/s 提到 1,000 tok/s 以上。另外要补上 V4.1 的稀疏索引器，这是一处正确性问题。
 
 数据和结论截至 2026-10-20，硬件和实测见 [CLAUDE.md](../CLAUDE.md)。

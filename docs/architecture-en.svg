@@ -257,7 +257,7 @@
 <rect x="40" y="1544" width="760" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
 <text x="54" y="1566" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">Final RMSNorm → output head 5,120 × 129,280 (BF16) → logits for the next token</text>
 <rect x="40" y="1598" width="760" height="40" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="5 4"/>
-<text x="54" y="1620" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">DSpark draft model: 3 layers × 128 experts (MXFP4, 7.4 GiB) for speculative decoding; not yet in mx-llama.cpp for V4.1</text>
+<text x="54" y="1620" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">DSpark draft model: 3 layers × 128 experts (MXFP4, 7.4 GiB) for speculative decoding; tried here, not adopted</text>
 <text x="840" y="122" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">Inside one layer (a decoder layer as an example)</text>
 <rect x="840" y="136" width="620" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
 <text x="854" y="158" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">4 residual streams · hyper-connections mix 4 into 1; weights Sinkhorn-normalized (20 iterations)</text>
@@ -707,15 +707,15 @@
 <text x="840" y="1056" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">Plan B storage layout (this machine)</text>
 <rect x="840" y="1070" width="620" height="58" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
 <text x="854" y="1091" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start">GPU0 · RTX PRO 6000 Max-Q, 95.6 GiB</text>
-<text x="854" y="1112" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Layers 0–11 in full: experts 80.6 GiB + dense part</text>
+<text x="854" y="1112" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Layers 0–11 in full (experts 80.6 GiB + dense), layer 12 gate/up experts, first half of the head</text>
 <rect x="840" y="1138" width="620" height="78" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.2"/>
 <text x="854" y="1159" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start">GPU1 · RTX PRO 6000 Max-Q, 95.6 GiB</text>
-<text x="854" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Dense part of layers 12–39; experts of layers 12–21, 67.2 GiB</text>
-<text x="854" y="1200" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Expert cache 14 GiB: hot experts of layers 22–39, ~780 slots</text>
+<text x="854" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Dense part of layers 12–39; experts of layers 12–21 (L12: down only); second half of the head</text>
+<text x="854" y="1200" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Expert cache 21.1 GB: hot experts of layers 22–39, ~1,170 slots</text>
 <rect x="840" y="1226" width="620" height="78" rx="8" fill="#ffedd5" stroke="#ea580c" stroke-width="1.2"/>
 <text x="854" y="1247" font-size="13.5" fill="#ea580c" font-weight="bold" text-anchor="start">Host memory · 192 GiB DDR5 (pinned)</text>
 <text x="854" y="1268" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Experts of layers 22–39, 121 GiB</text>
-<text x="854" y="1288" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Cache misses during decode: half uploaded into the cache, half computed directly by the CPU</text>
+<text x="854" y="1288" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Decode cache misses: hot ones uploaded into the cache, the rest on the CPU, added a layer later</text>
 <rect x="840" y="1314" width="620" height="58" rx="8" fill="#e7e5e4" stroke="#57534e" stroke-width="1.2"/>
 <text x="854" y="1335" font-size="13.5" fill="#57534e" font-weight="bold" text-anchor="start">NVMe · Samsung 9100 PRO</text>
 <text x="854" y="1356" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">Two Engram tables, ~97 GiB (MXFP4), read via the page cache; whole batch prefetched before prefill</text>
@@ -730,5 +730,5 @@
 <text x="1252.1" y="1396" font-size="11" fill="#b45309" font-weight="bold" text-anchor="middle">Blocks</text>
 <rect x="1289.1" y="1383" width="56" height="18" rx="9" fill="#e7e5e4" stroke="#57534e" stroke-width="1"/>
 <text x="1317.1" y="1396" font-size="11" fill="#57534e" font-weight="bold" text-anchor="middle">Engram</text>
-<text x="40" y="1672" font-size="12" fill="#94a3b8" font-weight="normal" text-anchor="start">Sources: GGUF metadata (mxxm-t/DeepSeek-V4.1-Flash-GGUF), the official inference/model.py; layout and measurements on this machine: see CLAUDE.md and docs/scheduler.md (2026-10-25)</text>
+<text x="40" y="1672" font-size="12" fill="#94a3b8" font-weight="normal" text-anchor="start">Sources: GGUF metadata (mxxm-t/DeepSeek-V4.1-Flash-GGUF), the official inference/model.py; layout and measurements on this machine: see the technical report and CLAUDE.md (2026-11-11)</text>
 </svg>

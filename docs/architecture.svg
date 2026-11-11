@@ -257,7 +257,7 @@
 <rect x="40" y="1544" width="760" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
 <text x="54" y="1566" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">最终 RMSNorm → 输出头 5,120 × 129,280（BF16）→ 下一个 token 的 logits</text>
 <rect x="40" y="1598" width="760" height="40" rx="6" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="5 4"/>
-<text x="54" y="1620" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">DSpark 草稿模型：3 层，每层 128 个专家（MXFP4，7.4 GiB），用于投机解码；mx-llama.cpp 在 V4.1 上暂不支持</text>
+<text x="54" y="1620" font-size="13" fill="#475569" font-weight="normal" text-anchor="start">DSpark 草稿模型：3 层，每层 128 个专家（MXFP4，7.4 GiB），用于投机解码；本机测过，没有采用</text>
 <text x="840" y="122" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">单层内部（以解码器层为例）</text>
 <rect x="840" y="136" width="620" height="40" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
 <text x="854" y="158" font-size="13" fill="#0f172a" font-weight="normal" text-anchor="start">4 路残差流 · 超连接混合：4 路加权合成 1 路，权重经 Sinkhorn 归一化（20 次迭代）</text>
@@ -707,15 +707,15 @@
 <text x="840" y="1056" font-size="17" fill="#0f172a" font-weight="bold" text-anchor="start">方案 B 的存储布局（本机）</text>
 <rect x="840" y="1070" width="620" height="58" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
 <text x="854" y="1091" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start">GPU0 · RTX PRO 6000 Max-Q，95.6 GiB</text>
-<text x="854" y="1112" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 0–11 层整层：专家 80.6 GiB + 稠密部分</text>
+<text x="854" y="1112" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 0–11 层整层（专家 80.6 GiB + 稠密部分），第 12 层的 gate、up 专家，输出层的前一半</text>
 <rect x="840" y="1138" width="620" height="78" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.2"/>
 <text x="854" y="1159" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start">GPU1 · RTX PRO 6000 Max-Q，95.6 GiB</text>
-<text x="854" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 12–39 层的稠密部分，第 12–21 层的专家 67.2 GiB</text>
-<text x="854" y="1200" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">专家缓存 14 GiB：第 22–39 层的热专家，约 780 个槽位</text>
+<text x="854" y="1180" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 12–39 层的稠密部分，第 12–21 层的专家（第 12 层只有 down），输出层的后一半</text>
+<text x="854" y="1200" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">专家缓存 21.1 GB：第 22–39 层的热专家，约 1,170 个槽位</text>
 <rect x="840" y="1226" width="620" height="78" rx="8" fill="#ffedd5" stroke="#ea580c" stroke-width="1.2"/>
 <text x="854" y="1247" font-size="13.5" fill="#ea580c" font-weight="bold" text-anchor="start">主机内存 · 192 GiB DDR5（锁页）</text>
 <text x="854" y="1268" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">第 22–39 层的专家 121 GiB</text>
-<text x="854" y="1288" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">解码时缓存未命中的专家：一半上传进缓存，一半由 CPU 直接算</text>
+<text x="854" y="1288" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">解码时缓存未命中的专家：够热的上传进缓存，其余由 CPU 直接算、晚一层加回</text>
 <rect x="840" y="1314" width="620" height="58" rx="8" fill="#e7e5e4" stroke="#57534e" stroke-width="1.2"/>
 <text x="854" y="1335" font-size="13.5" fill="#57534e" font-weight="bold" text-anchor="start">NVMe · Samsung 9100 PRO</text>
 <text x="854" y="1356" font-size="12.5" fill="#0f172a" font-weight="normal" text-anchor="start">两张 Engram 表约 97 GiB（MXFP4），经页缓存读取，预填充前整批预取</text>
@@ -730,5 +730,5 @@
 <text x="1170.84" y="1396" font-size="11" fill="#b45309" font-weight="bold" text-anchor="middle">候选块</text>
 <rect x="1207.84" y="1383" width="56" height="18" rx="9" fill="#e7e5e4" stroke="#57534e" stroke-width="1"/>
 <text x="1235.84" y="1396" font-size="11" fill="#57534e" font-weight="bold" text-anchor="middle">Engram</text>
-<text x="40" y="1672" font-size="12" fill="#94a3b8" font-weight="normal" text-anchor="start">来源：GGUF 元数据（mxxm-t/DeepSeek-V4.1-Flash-GGUF）、官方 inference/model.py；本机布局和实测见 CLAUDE.md 与 docs/scheduler.md（2026-10-25）</text>
+<text x="40" y="1672" font-size="12" fill="#94a3b8" font-weight="normal" text-anchor="start">来源：GGUF 元数据（mxxm-t/DeepSeek-V4.1-Flash-GGUF）、官方 inference/model.py；本机布局和实测见技术报告与 CLAUDE.md（2026-11-11）</text>
 </svg>
