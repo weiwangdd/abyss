@@ -1918,7 +1918,7 @@ private:
                 if (slot_save_lost > 0 && !update_cache && prompt_cache && window >= 0 && !ret->prompt.checkpoints.empty()) {
                     int64_t held = 0;
                     for (const auto & ckpt : ret->prompt.checkpoints) {
-                        held = std::max(held, ckpt.n_tokens);
+                        held = std::max(held, ckpt->n_tokens);
                     }
                     const int usable = server_prompt_cache::n_usable(ret->prompt, task.tokens, window);
                     if (held - usable >= slot_save_lost) {
@@ -2892,7 +2892,7 @@ private:
             const char * e = getenv("ABYSS_GEN_CKPT_KEEP");
             return (size_t) (e != nullptr ? std::max<int64_t>(2, atoll(e)) : 8);
         }();
-        if (every <= 0 || params_base.n_ctx_checkpoints <= 0 || !prompt_checkpoint_storage_lossless ||
+        if (every <= 0 || params_base.n_ctx_checkpoints <= 0 ||
                 slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.can_speculate() ||
                 (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS)) {
             return;
@@ -2917,11 +2917,11 @@ private:
         };
         size_t n_have = 0;
         for (const auto & cur : slot.prompt.checkpoints) {
-            n_have += in_answer(cur);
+            n_have += in_answer(*cur);
         }
         if (n_have >= keep) {
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (in_answer(*it) && ((it->n_tokens - n_prompt) / slot.gen_ckpt_step) % 2 == 1) {
+                if (in_answer(**it) && (((*it)->n_tokens - n_prompt) / slot.gen_ckpt_step) % 2 == 1) {
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -4668,7 +4668,7 @@ private:
                     const int32_t n_batch_start = slot.prompt.n_tokens();
                     const bool ckpt_at_start = ckpt_count_start && do_checkpoint && spans.is_user_start(n_batch_start) && (
                             slot.prompt.checkpoints.empty() || n_batch_start == last_user_pos ||
-                            n_batch_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_batch_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4820,7 +4820,7 @@ private:
                     if (n_tokens_cur > 0) {
                         slot.prompt_calls.push_back(n_tokens_cur);
                     }
-                    if (do_checkpoint && prompt_checkpoint_storage_lossless) {
+                    if (do_checkpoint) {
                         slot.prompt_ckpts.push_back(n_tokens_start);
                     }
                 }

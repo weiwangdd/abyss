@@ -1875,9 +1875,9 @@ int server_prompt_cache::n_usable(const server_prompt & prompt, const server_tok
     // tokens before the prefix ends (server_context: pos_min_thold)
     int64_t res = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        const bool whole_state = ckpt.pos_min == ckpt.pos_max;
-        if (ckpt.n_tokens <= lcp && (whole_state || ckpt.pos_min == 0 || ckpt.n_tokens + window <= lcp)) {
-            res = std::max(res, ckpt.n_tokens);
+        const bool whole_state = ckpt->pos_min == ckpt->pos_max;
+        if (ckpt->n_tokens <= lcp && (whole_state || ckpt->pos_min == 0 || ckpt->n_tokens + window <= lcp)) {
+            res = std::max(res, ckpt->n_tokens);
         }
     }
     return (int) res;
