@@ -55,6 +55,15 @@ GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 // returns false if the buffer allocation failed
 // ggml_gallocr_resrve_n_size writes the buffer sizes per galloc buffer that would be allocated by ggml_gallocr_reserve_n to sizes
 GGML_API bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+// abyss: as ggml_gallocr_reserve_n, and calls before_realloc once, before the first buffer is freed to be allocated again;
+// when the buffers are large enough for the graph they stay where they are and it is not called
+GGML_API bool ggml_gallocr_reserve_n_lazy(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids,
+    void (*before_realloc)(void * user_data),
+    void * user_data);
 GGML_API void ggml_gallocr_reserve_n_size(
     ggml_gallocr_t galloc,
     struct ggml_cgraph * graph,

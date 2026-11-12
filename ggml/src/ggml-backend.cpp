@@ -2026,6 +2026,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// abyss: ABYSS_OVERLAP=1 removes two places where the host waits for every device between the ubatches of a long prompt,
+// so that a GPU can start on the next ubatch while another one still computes the previous one:
+// - a graph with other tensor sizes gets a new layout in the compute buffers; the devices are stopped for it only when
+//   a buffer has to grow. Work that is queued already keeps the addresses it was launched with, and everything the next
+//   graph writes into a device's buffer comes after it: its kernels on the device's own queue, and its inputs after the
+//   wait for that device in ggml_backend_sched_copy_input
+// - an input of zero bytes, like the output rows of a ubatch without outputs, is not copied, and not waited for
+static bool ggml_backend_sched_overlap(void) {
+    static int overlap = -1;
+    if (overlap < 0) {
+        const char * e = getenv("ABYSS_OVERLAP");
+        overlap = e != NULL && atoi(e) != 0;
+    }
+    return overlap;
+}
+
+static void ggml_backend_sched_synchronize_backends(void * user_data) {
+    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -2071,11 +2094,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        bool reserved;
+        if (ggml_backend_sched_overlap() && !backend_ids_changed) {
+            reserved = ggml_gallocr_reserve_n_lazy(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids,
+                    ggml_backend_sched_synchronize_backends, sched);
+        } else {
+            ggml_backend_sched_synchronize_backends(sched);
+            reserved = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         }
-
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        if (!reserved) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
@@ -2099,6 +2126,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+    if (ggml_backend_sched_overlap() && ggml_nbytes(input) == 0) {
+        return;
+    }
 
     // read before the previous split, wait for the copy only
     if (split == &sched->splits[sched->prefetch_split]) {
