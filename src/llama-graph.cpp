@@ -2672,7 +2672,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ids = ggml_reshape_1d(ctx0, ids, big_n);
         big_plan = moe_cache->build_big_plan(ctx0, il, ids);
         ggml_format_name(big_plan, "ffn_moe_big_plan-%d", il);
-        big_mask = moe_cache->build_big_mask(ctx0, big_plan, n_expert_used, n_tokens);
+        big_mask = moe_cache->build_big_mask(ctx0, il, big_plan, n_expert_used, n_tokens);
         ggml_format_name(big_mask, "ffn_moe_big_mask-%d", il);
         ggml_backend_sched_set_tensor_backend(sched, big_plan, backend_cpu);
         ggml_backend_sched_set_tensor_backend(sched, big_mask, backend_cpu);
@@ -2691,6 +2691,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // these are uploaded
         experts = build_experts(cur, selected_experts, dev_ids, false);
         ggml_build_forward_expand(gf, experts);
+
+        // abyss: ABYSS_MOE_BIG_CACHE. The pairs of the experts the cache holds, from their slots on its device; the
+        // other pairs read a zero slot there. Second in the graph: computed while the first device uploads, and
+        // launched before the CPU starts on its share
+        ggml_tensor * experts_cached = nullptr;
+        if (moe_cache->big_cache()) {
+            ggml_tensor * slot_ids = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, big_plan, big_n, (big_n + 3*big_m)*es), n_expert_used, n_tokens);
+            experts_cached = build_experts(cur, selected_experts, slot_ids, true);
+            cb(experts_cached, "ffn_moe_down_cached", il);
+            ggml_build_forward_expand(gf, experts_cached);
+        }
 
         // the CPU's pairs: the rows of their tokens, each through one expert. Pinned to the CPU: a device would take a
         // batch of this size from host weights, and upload them
@@ -2715,6 +2726,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * rows  = ggml_set_rows(ctx0, zeros, ggml_reshape_2d(ctx0, down_c, n_embd, big_m), big_dst);
         experts = ggml_add(ctx0, ggml_mul(ctx0, experts, big_mask),
                 ggml_view_3d(ctx0, rows, n_embd, n_expert_used, n_tokens, rows->nb[1], n_expert_used*rows->nb[1], 0));
+        if (experts_cached != nullptr) {
+            experts = ggml_add(ctx0, experts, experts_cached);
+        }
         cb(experts, "ffn_moe_down_big", il);
     } else {
         experts = build_experts(cur, selected_experts, cache.slots, true);

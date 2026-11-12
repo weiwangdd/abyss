@@ -45,9 +45,13 @@ public:
     //   then m each:  the token of each pair of the CPU, its expert (-1 for padding), and its index among the n pairs
     //                 (n for padding)
     ggml_tensor * build_big_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
-    // F32 [1, n_expert_used, n_tokens]: 1 for the pairs the device computes, 0 for the CPU's
-    ggml_tensor * build_big_mask(ggml_context * ctx, ggml_tensor * plan, int64_t n_expert_used, int64_t n_tokens) const;
+    // F32 [1, n_expert_used, n_tokens]: 1 for the pairs the device computes, 0 for the CPU's and the cache's
+    ggml_tensor * build_big_mask(ggml_context * ctx, int32_t il, ggml_tensor * plan, int64_t n_expert_used, int64_t n_tokens) const;
     int64_t big_cpu_rows() const;
+    // abyss: ABYSS_MOE_BIG_CACHE=1, with the split. The experts of the layer that the cache holds are computed from
+    // their slots on the cache's device, at the same time; the uploads and the CPU share the others. The plan then
+    // ends with n more entries: the slot of each pair, a zero slot for a pair of an expert the cache does not hold
+    bool big_cache() const;
     // for the copy of host weight w that follows a plan of its layer: the experts the device computes
     bool big_used(const ggml_tensor * w, std::vector<bool> & used) const;
 
