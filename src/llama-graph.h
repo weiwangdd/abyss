@@ -602,8 +602,14 @@ public:
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
+    // abyss: the window's K of a layer, [n_embd_head, 1, n_kv, 1]: as it is, or its rows of self_attn_mask.rows when
+    // the mask is over that list (ABYSS_DSV41_WINDOW_ROWS)
+    ggml_tensor * window_k(ggml_context * ctx, ggml_tensor * k) const;
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
+    // abyss: with ABYSS_DSV41_WINDOW_ROWS a single token has rows, the list of the cells of its window, and a mask over
+    // that list instead of the whole window cache
     llm_attn_mask self_attn_mask;
 
     std::vector<ggml_tensor *> self_k_rot;

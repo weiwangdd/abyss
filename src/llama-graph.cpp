@@ -955,6 +955,28 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
     return res;
 }
 
+// abyss: ABYSS_DSV41_WINDOW_ROWS=1. The window cache of DeepSeek V4.1 holds n_swa + n_ubatch rows and hands them all to
+// the attention, nearly all of them masked for a single token. With the switch a single token gets the list of the
+// cells of its window instead (llama_kv_cache::get_n_kv_rows: at most n_swa cells, padded like n_kv) and a mask over
+// that list, as the caches read with fused_kv_rows do, and the graph reads the window's K through the list. Returns the
+// length of the list, 0 when there is none
+static uint32_t dsv4_window_rows(
+        const llama_kv_cache_dsv4_raw_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        llm_arch arch,
+        int64_t n_stream) {
+    static const bool on = [] {
+        const char * e = getenv("ABYSS_DSV41_WINDOW_ROWS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!on || arch != LLM_ARCH_DEEPSEEK41 || !cparams.flash_attn || ubatch.n_tokens != 1 || n_stream != 1) {
+        return 0;
+    }
+    const uint32_t n_rows = mctx->get_n_kv_rows(ubatch);
+    return n_rows > 0 && n_rows < mctx->get_n_kv() ? n_rows : 0;
+}
+
 static bool dsv4_can_reuse_raw_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_dsv4_raw_context * mctx,
@@ -1121,6 +1143,32 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    // abyss: the list is padded with -1, which the mask drops; the graph reads the rows with get_rows, so the padding
+    // points at a row that exists
+    if (self_attn_mask.rows && self_attn_mask.rows->buffer) {
+        int32_t * rows = (int32_t *) self_attn_mask.rows->data;
+        for (int64_t i = 0; i < ggml_nelements(self_attn_mask.rows); ++i) {
+            if (rows[i] < 0) {
+                rows[i] = 0;
+            }
+        }
+    }
+}
+
+ggml_tensor * llm_graph_input_dsv4_raw::window_k(ggml_context * ctx, ggml_tensor * k) const {
+    ggml_tensor * rows = self_attn_mask.rows;
+    if (rows == nullptr) {
+        return k;
+    }
+    GGML_ASSERT(k->ne[1] == 1 && k->ne[3] == 1 && rows->ne[1] == 1);
+    ggml_tensor * k_rows = ggml_view_2d(ctx, k, k->ne[0], k->ne[2], k->nb[2], 0);
+    // get_rows gives F32, the cast back is exact for a cache of F16 or BF16
+    ggml_tensor * res = ggml_get_rows(ctx, k_rows, ggml_reshape_1d(ctx, rows, rows->ne[0]));
+    if (res->type != k->type) {
+        res = ggml_cast(ctx, res, k->type);
+    }
+    return ggml_reshape_4d(ctx, res, k->ne[0], 1, rows->ne[0], 1);
 }
 
 void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
@@ -1157,7 +1205,16 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
     }
     if (inp_raw->self_attn_mask.raw && inp_raw->self_attn_mask.raw->buffer) {
-        res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_attn_mask.raw, raw_ctx, params.ubatch, n_stream);
+        // abyss: the list of the window's rows has to be in use as before, with the same length over the same cache rows
+        const uint32_t n_win = dsv4_window_rows(raw_ctx, params.ubatch, params.cparams, params.model->arch, n_stream);
+        const llm_attn_mask & mask = inp_raw->self_attn_mask;
+        if ((n_win > 0) != (mask.rows != nullptr)) {
+            res = false;
+        } else if (mask.rows != nullptr) {
+            res &= mask.rows->ne[0] == n_win && mask.raw->ne[0] == n_win && mask.n_kv == raw_ctx->get_n_kv();
+        } else {
+            res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_attn_mask.raw, raw_ctx, params.ubatch, n_stream);
+        }
     }
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
@@ -4109,7 +4166,19 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
     inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
-    inp_raw->self_attn_mask.raw = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    if (const uint32_t n_win = dsv4_window_rows(raw_ctx, ubatch, cparams, model.arch, n_stream); n_win > 0) {
+        // abyss: the cells of the token's window and the mask over them, see dsv4_window_rows
+        llm_attn_mask & mask = inp_raw->self_attn_mask;
+        mask.n_kv = raw_ctx->get_n_kv();
+        mask.rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_win, 1);
+        ggml_set_input(mask.rows);
+        ggml_set_name(mask.rows, "attn_inp_kv_rows");
+        mask.raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_win, 1, 1, 1);
+        ggml_set_input(mask.raw);
+        ggml_set_name(mask.raw, "attn_inp_kq_mask");
+    } else {
+        inp_raw->self_attn_mask.raw = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    }
 
     inp_raw->self_k_rot = raw_ctx->get_k_rot();
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);

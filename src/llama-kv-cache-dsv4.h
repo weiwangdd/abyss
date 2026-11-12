@@ -224,6 +224,9 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
 
+    // abyss: the length of the list of the window's rows for the ubatch, see llama_kv_cache::get_n_kv_rows
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 

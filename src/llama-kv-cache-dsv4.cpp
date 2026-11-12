@@ -2055,6 +2055,10 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv_rows(const llama_ubatch & ubatch) const {
+    return kv_swa->get_n_kv_rows(ubatch);
+}
+
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     if (ubatches_write.empty()) {
         return 0;

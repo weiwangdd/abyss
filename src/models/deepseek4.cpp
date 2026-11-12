@@ -853,7 +853,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
 
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    // abyss: only the rows of the window when the mask is over their list (DeepSeek V4.1, ABYSS_DSV41_WINDOW_ROWS)
+    ggml_tensor * k = inp_attn->window_k(ctx0, mctx_cur->get_k(ctx0, il));
 
     ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {

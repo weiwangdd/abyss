@@ -757,7 +757,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_build_forward_expand(gf, kv);
         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
 
-        ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
+        // abyss: only the rows of the window when the mask is over their list (ABYSS_DSV41_WINDOW_ROWS)
+        ggml_tensor * raw_k    = inp_attn->window_k(ctx0, inp_attn->mctx->get_k(ctx0, il));
         ggml_tensor * raw_mask = inp_attn->self_attn_mask.raw;
 
         const int32_t topk_src = hparams.dsv41_topk_src[il];
