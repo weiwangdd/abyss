@@ -13446,6 +13446,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // abyss: the matrix-vector products of a DeepSeek V4.1 Flash decode step, the routed experts MXFP4 (gate and up
+    // 2304 x 5120, down 5120 x 2304), the attention and the shared experts Q8_0; 32 experts used of 32 and 8 batches
+    // of the dense ones, so that a run reads more than the L2 cache holds
+    for (auto [m, k] : {std::pair<int64_t, int64_t>{2304, 5120}, {5120, 2304}}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, false, m, 1, k));
+    }
+    for (auto [m, k] : {std::pair<int64_t, int64_t>{32768, 1280}, {8192, 4096}, {5120, 8192}, {1280, 5120}, {512, 5120},
+                        {2304, 5120}, {5120, 2304}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {8, 1}, {1, 1}));
+    }
+
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }

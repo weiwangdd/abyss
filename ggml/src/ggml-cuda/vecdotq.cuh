@@ -328,6 +328,45 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
+// abyss: the two ints from i32 on of x at any alignment, from the two or three aligned words that hold them; the
+// 17-byte blocks of MXFP4 put qs at any alignment, and get_int_b1 loads every byte on its own. A third word is read
+// only when it holds bytes of the second int, so no load goes past the bytes asked for by more than the rest of their
+// aligned word
+static __device__ __forceinline__ int2 get_int2_b1_aligned(const void * x, const int & i32) {
+    const uintptr_t  a  = (uintptr_t) x + 4*i32;
+    const uint32_t * w  = (const uint32_t *) (a & ~(uintptr_t) 3);
+    const uint32_t   sh = (uint32_t) (a & 3) * 8;
+    const uint32_t   w0 = w[0];
+    const uint32_t   w1 = w[1];
+    const uint32_t   w2 = sh ? w[2] : 0;
+    return make_int2((int) __funnelshift_r(w0, w1, sh), (int) __funnelshift_r(w1, w2, sh));
+}
+
+// abyss: vec_dot_mxfp4_q8_1 with the quants of the two ints from aligned words (get_int2_b1_aligned), the same
+// result; faster when each thread works on several rows (small_k), slower for one
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_aligned(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    static_assert(VDR_MXFP4_Q8_1_MMVQ == 2, "the loads below read two ints");
+    const int2 aux = get_int2_b1_aligned(bq4->qs, iqs);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int2 v = get_int_from_table_16(l == 0 ? aux.x : aux.y, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 

@@ -598,6 +598,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         switch (ncols_dst) {
             case 1:
                 if (small_k) {
+                    // abyss: twice the rows for MXFP4 and Q8_0 on the generic table, more bytes in flight per thread;
+                    // each row keeps the threads and the order of its sums
+                    if (table_id == MMVQ_PARAMETERS_GENERIC && (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q8_0)) {
+                        return 2*nwarps;
+                    }
                     return nwarps;
                 }
                 if (table_id == MMVQ_PARAMETERS_GB10) {
@@ -641,7 +646,9 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    // abyss: the aligned loads of MXFP4 when each thread works on several rows
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda =
+        small_k && type == GGML_TYPE_MXFP4 ? vec_dot_mxfp4_q8_1_aligned : get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -1145,6 +1152,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+
+        // abyss: ABYSS_MMVQ_TAIL=1 also takes the several rows per block of small_k when the K loop of the whole block
+        // would span a quarter more quant blocks than the loop of a single warp, i.e. leave many of its threads idle in
+        // its last iteration (72 MXFP4 blocks span 128 for the block, 80 for a warp): more bytes in flight per thread,
+        // the same sums per row. With less to gain (160 MXFP4 blocks: 192 against 160) the grid of fewer, longer
+        // blocks lost more than it won when only six experts were read
+        static const bool tail = [] {
+            const char * e = getenv("ABYSS_MMVQ_TAIL");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (tail && !use && nwarps > 1) {
+            const int per_block  = nwarps * blocks_per_iter_1warp;
+            const int span_block = (blocks_per_row_x + per_block - 1) / per_block * per_block;
+            const int span_warp  = (blocks_per_row_x + blocks_per_iter_1warp - 1) / blocks_per_iter_1warp * blocks_per_iter_1warp;
+            use = 4*span_block >= 5*span_warp;
+        }
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
