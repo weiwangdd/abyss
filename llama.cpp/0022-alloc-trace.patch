@@ -1,0 +1,79 @@
+From 894fa7fe3428a45429e3b23fa100a1ef4b324dfc Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Thu, 12 Nov 2026 02:06:02 +0100
+Subject: [PATCH] abyss: GGML_ALLOC_TRACE=1 prints the graph allocator's
+ allocations, frees and buffer sizes (from 239be88)
+
+---
+ ggml/src/ggml-alloc.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b0c067b..9f16877 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -18,6 +18,17 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// abyss: GGML_ALLOC_TRACE=1 prints every allocation and free of a graph's tensors to stderr with the buffer, chunk,
++// offset and size, so the tensors live at a buffer's peak can be worked out afterwards (tools/eval/alloc_peak.py)
++static bool ggml_alloc_trace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_ALLOC_TRACE");
++        on = e != NULL && atoi(e) != 0;
++    }
++    return on;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -685,6 +696,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+         hn->buffer_id = buffer_id;
+         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
++        if (ggml_alloc_trace()) {
++            fprintf(stderr, "galloc: alloc %d %d %zu %zu %s\n", buffer_id, hn->addr.chunk, hn->addr.offset, size, node->name);
++        }
+     }
+ }
+ 
+@@ -706,6 +720,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
+ #ifdef GGML_ALLOCATOR_DEBUG
+     remove_allocated_tensor(alloc, hn->addr, node);
+ #endif
++    if (ggml_alloc_trace()) {
++        fprintf(stderr, "galloc: free %d %d %zu %zu %s\n", buffer_id, hn->addr.chunk, hn->addr.offset, size, node->name);
++    }
+ 
+     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
+     hn->allocated = false;
+@@ -845,7 +862,23 @@ static bool ggml_gallocr_reserve_n_impl(
+     }
+ 
+     // allocate in hash table
++    if (ggml_alloc_trace()) {
++        fprintf(stderr, "galloc: reserve %d nodes %d leafs:", graph->n_nodes, graph->n_leafs);
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            fprintf(stderr, " %d=%s", i, ggml_backend_buft_name(galloc->bufts[i]));
++        }
++        fprintf(stderr, "\n");
++    }
+     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
++    if (ggml_alloc_trace()) {
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            size_t sz = 0;
++            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
++                sz += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
++            }
++            fprintf(stderr, "galloc: buffer %d %s max %zu\n", i, ggml_backend_buft_name(galloc->bufts[i]), sz);
++        }
++    }
+ 
+     // set the node_allocs from the hash table
+     if (galloc->n_nodes < graph->n_nodes) {
+-- 
+2.43.0
+
