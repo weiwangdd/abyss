@@ -61,8 +61,14 @@ cd ~/abyss-stats
 mkdir -p slots
 pids=$(pgrep -x llama-server || true)
 if [ -n "$pids" ]; then
+  # the port to upstream llama.cpp (restart-port.sh) writes another slot format: its slot goes to a file of its own,
+  # and slot0.bin stays the one this server wrote last and reads back below
+  slot=slot0.bin
+  for pid in $pids; do
+    case $(readlink "/proc/$pid/exe" 2>/dev/null) in "$HOME/src/llama.cpp-abyss"/*) slot=slot0-port.bin ;; esac
+  done
   curl -s -m 120 -X POST "http://127.0.0.1:8080/slots/0?action=save" -H "Content-Type: application/json" \
-    -d '{"filename": "slot0.bin"}' || echo "slot save failed"
+    -d "{\"filename\": \"$slot\"}" || echo "slot save failed"
   echo
   # every server goes, a test server left behind too; the cleanup can hang past a minute, a second signal ends it at
   # once (the slot is saved already), and a server that still holds on is killed
