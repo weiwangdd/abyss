@@ -49,8 +49,10 @@
 | `0033-mmvq-tail.patch` | 0036 的矩阵乘部分 | 单列的量化矩阵乘在整块的 K 循环比单个 warp 多跨 25% 以上时也用每块多行的 `small_k`（`ABYSS_MMVQ_TAIL=1`）；`small_k` 下 MXFP4、Q8_0 每块行数加倍，MXFP4 从对齐的 32 位字取。`test-backend-ops` 加本模型解码的矩阵乘形状作性能用例 |
 | `0034-dsv41-window-rows.patch` | 0032 里注意力拼装的那部分，做法不同 | 单个 token 的注意力只读滑窗里的行（`ABYSS_DSV41_WINDOW_ROWS=1`）：上游的滑窗缓存有 n_swa + n_ubatch 行（128 + 2,048），解码时整块交给注意力、靠掩码挡掉，每层对 2,816 行算；改成给一份滑窗的行号表和对应的掩码，图里按表取行，每层 768 行 |
 | `0035-hc-gate-fuse.patch` | mx-llama.cpp 自带的融合 | 超连接的门 sigmoid(x·s + b)·scale + bias 由四个逐元素内核合成一个（`ABYSS_HC_GATE_FUSE=1`），数值逐位相同；每 token 少约 480 个内核 |
+| **预填充的大批次用缓存** | | |
+| `0036-moe-big-cache.patch` | 0023 重写 | 预填充的大批次里，缓存里已有的专家用槽位在缓存所在的卡上直接算（`ABYSS_MOE_BIG_CACHE=1`，配 `ABYSS_MOE_BIG_SPLIT=1`），只有缓存里没有的才上传或交给 CPU；不在缓存里的（token, 专家）对在那张卡上读全零槽位 |
 
-mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0022（大批次统计）、0023（大批次用缓存）、0033（server 计时）。
+mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0022（大批次统计）、0033（server 计时）。
 
 ## 安装
 
@@ -90,7 +92,8 @@ git am <abyss>/llama.cpp/0001-sched-reserve-size-reset.patch \
   <abyss>/llama.cpp/0032-head-split-only.patch \
   <abyss>/llama.cpp/0033-mmvq-tail.patch \
   <abyss>/llama.cpp/0034-dsv41-window-rows.patch \
-  <abyss>/llama.cpp/0035-hc-gate-fuse.patch
+  <abyss>/llama.cpp/0035-hc-gate-fuse.patch \
+  <abyss>/llama.cpp/0036-moe-big-cache.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target test-llama-archs llama-fit-params   # tools/eval/ced-tiny.sh、fit-print.sh 用，可选
@@ -108,7 +111,7 @@ GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \
   ABYSS_FUSED_SIBLING=1 ABYSS_MOE_DEFER=1 ABYSS_MOE_ADMIT_GATE=1 ABYSS_DECODE_STATS=100 ABYSS_DSV41_CHUNK=512 \
   ABYSS_MOE_BIG_SPLIT=1 ABYSS_WEIGHT_NOWAIT=1 ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x \
   ABYSS_PLAIN_INPUT=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_MMVQ_TAIL=1 \
-  ABYSS_DSV41_WINDOW_ROWS=1 ABYSS_HC_GATE_FUSE=1 \
+  ABYSS_DSV41_WINDOW_ROWS=1 ABYSS_HC_GATE_FUSE=1 ABYSS_MOE_BIG_CACHE=1 \
   llama-server -m <上游布局的 GGUF> -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
   -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20900 --moe-cache-cpu-share 0.7 --checkpoint-min-step 32768 \
