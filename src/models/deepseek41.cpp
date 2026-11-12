@@ -144,7 +144,9 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+    // abyss: ABYSS_HEAD_SPLIT_ONLY leaves the head out of the load, llama_model_base::load_tensors reads its two parts
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+            llama_abyss_head_split_only() ? TENSOR_SKIP : 0);
 
     // all Engram tables in one lazily read tensor, like the qwen4exp n-gram table
     if (hparams.ple_n_heads > 0) {
@@ -1146,8 +1148,9 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     // abyss: ABYSS_HEAD_SPLIT (llama_model::output_split): a single output's logits are computed on two GPUs at once,
     // the first rows from the copy on the other GPU and the rest on the head's own, and joined on the other GPU (the
     // context's graph callback puts the concat there, so that neither GPU waits for the other before its own rows);
-    // each row is the same dot product as before
-    if (model.output_split != nullptr && n_outputs == 1) {
+    // each row is the same dot product as before; without the whole head (ABYSS_HEAD_SPLIT_ONLY) every batch goes this
+    // way, at most one output per sequence (llama_context limits n_outputs_max)
+    if (model.output_split != nullptr && (n_outputs == 1 || model.output == nullptr)) {
         ggml_tensor * rows_split = ggml_mul_mat(ctx0, model.output_split, cur);
         ggml_tensor * rows_rest  = ggml_mul_mat(ctx0, model.output_rest, cur);
         cur = ggml_concat(ctx0, rows_split, rows_rest, 0);

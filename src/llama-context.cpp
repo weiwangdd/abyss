@@ -355,6 +355,16 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+    // abyss: without the whole head (ABYSS_HEAD_SPLIT_ONLY) the logits of every output are joined on the GPU of the
+    // head's first rows, which has room for a few only: a batch carries at most one output per sequence, and the
+    // compute buffers are reserved for that
+    if (model.output == nullptr && model.output_split != nullptr) {
+        const uint32_t n_max = std::max<uint32_t>(1, cparams.n_seq_max);
+        if (cparams.n_outputs_max > n_max) {
+            fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT_ONLY, at most %u output(s) per batch (was %u)\n", n_max, cparams.n_outputs_max);
+            cparams.n_outputs_max = n_max;
+        }
+    }
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 

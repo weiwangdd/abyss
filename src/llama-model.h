@@ -800,7 +800,9 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     // abyss: ABYSS_HEAD_SPLIT, a copy of the head's first rows on another GPU and a view of the other rows, bound to the
-    // head's buffer so that the scheduler keeps their product on the head's GPU (llama_model_base::load_tensors)
+    // head's buffer so that the scheduler keeps their product on the head's GPU (llama_model_base::load_tensors); with
+    // ABYSS_HEAD_SPLIT_ONLY the two parts are the only copy of the head, output stays null and both are tensors of
+    // their own
     struct ggml_tensor * output_split    = nullptr;
     struct ggml_tensor * output_rest     = nullptr;
     struct ggml_tensor * output_b        = nullptr;
@@ -1028,6 +1030,10 @@ protected:
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);
+
+// abyss: ABYSS_HEAD_SPLIT_ONLY=1 with ABYSS_HEAD_SPLIT=F: the output head is not loaded whole; F of its rows are read
+// from the file onto another GPU and the rest onto the head's own (deepseek41)
+bool llama_abyss_head_split_only();
 
 // model must inherit from this
 struct llama_model_base : public llama_model {

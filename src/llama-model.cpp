@@ -2129,6 +2129,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // abyss: ABYSS_HEAD_SPLIT_ONLY=1 with ABYSS_HEAD_SPLIT=F: the head was skipped (deepseek41); its first F of rows go to
+    // the first other GPU and the rest to the head's own, read from the file straight onto them, or as dummy buffers in
+    // the pass that only sizes the model (which returns below), so that its graphs place them too
+    if (const char * e = getenv("ABYSS_HEAD_SPLIT"); e != nullptr && output == nullptr && llama_abyss_head_split_only()) {
+        const auto it = ml.weights_map.find(LLM_TN(arch)(LLM_TENSOR_OUTPUT, "weight").str());
+        if (it == ml.weights_map.end()) {
+            throw std::runtime_error("ABYSS_HEAD_SPLIT_ONLY: the model has no output head");
+        }
+        const ggml_tensor * meta = it->second.tensor;
+        ggml_backend_dev_t dev_out   = pimpl->dev_output.dev;
+        ggml_backend_dev_t dev_split = nullptr;
+        for (const auto & d : devices) {
+            if (!d.is_meta && d.dev != dev_out && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                dev_split = d.dev;
+                break;
+            }
+        }
+        const int64_t n_rows  = meta->ne[1];
+        const int64_t n_split = std::clamp<int64_t>(llround(atof(e) * n_rows), 0, n_rows);
+        if (dev_out == nullptr || ggml_backend_dev_type(dev_out) != GGML_BACKEND_DEVICE_TYPE_GPU || dev_split == nullptr ||
+                n_split <= 0 || n_split >= n_rows) {
+            throw std::runtime_error("ABYSS_HEAD_SPLIT_ONLY needs the head on a GPU, another GPU and a share of rows in (0, 1)");
+        }
+        const size_t row_bytes = ggml_row_size(meta->type, meta->ne[0]);
+        llama_file * file = ml.files.at(it->second.idx).get();
+        std::vector<uint8_t> chunk(64u << 20);
+        auto load_part = [&](ggml_backend_dev_t dev, const char * name, int64_t row0, int64_t rows) {
+            ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(ip));
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), meta->type, meta->ne[0], rows);
+            ggml_set_name(t, name);
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+            if (ml.no_alloc) {
+                // the pass that only sizes the model: a dummy buffer tells the scheduler where the part lives, and the
+                // memory breakdown counts its size
+                ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, 0));
+                t->buffer = buf.get();
+                std::vector<ggml_backend_buffer_ptr> bufs;
+                bufs.emplace_back(std::move(buf));
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+                return t;
+            }
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                throw std::runtime_error(format("ABYSS_HEAD_SPLIT_ONLY: could not allocate %.1f MiB on %s",
+                        ggml_nbytes(t) / 1048576.0, ggml_backend_dev_name(dev)));
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            const size_t n = ggml_nbytes(t);
+            for (size_t done = 0; done < n; ) {
+                const size_t len = std::min(chunk.size(), n - done);
+                file->seek(it->second.offs + (size_t) row0*row_bytes + done, SEEK_SET);
+                file->read_raw(chunk.data(), len);
+                ggml_backend_tensor_set(t, chunk.data(), done, len);
+                done += len;
+            }
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(std::move(buf));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+            return t;
+        };
+        output_split = load_part(dev_split, "output_split.weight", 0, n_split);
+        output_rest  = load_part(dev_out, "output_rest.weight", n_split, n_rows - n_split);
+        if (!ml.no_alloc) {
+            fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT=%s ABYSS_HEAD_SPLIT_ONLY=1, rows 0-%lld of %lld of the output head (%.1f MiB) "
+                "on %s and the other %lld (%.1f MiB) on %s, the head not loaded whole\n", e, (long long) n_split - 1,
+                (long long) n_rows, ggml_nbytes(output_split) / 1048576.0, ggml_backend_dev_name(dev_split),
+                (long long) (n_rows - n_split), ggml_nbytes(output_rest) / 1048576.0, ggml_backend_dev_name(dev_out));
+        }
+    }
+
     if (ml.no_alloc) {
         return true;
     }
@@ -2851,6 +2922,14 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
 
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
+}
+
+bool llama_abyss_head_split_only() {
+    static const bool on = [] {
+        const char * e = getenv("ABYSS_HEAD_SPLIT_ONLY");
+        return e != nullptr && atoi(e) != 0 && getenv("ABYSS_HEAD_SPLIT") != nullptr;
+    }();
+    return on;
 }
 
 template<typename F>
