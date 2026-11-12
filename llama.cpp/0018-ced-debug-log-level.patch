@@ -1,0 +1,27 @@
+From 725108bc758212d852c1927b482f8eb111b142a7 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Thu, 12 Nov 2026 00:47:47 +0100
+Subject: [PATCH] abyss: the ABYSS_CED_DEBUG lines are logged at a level a
+ server shows
+
+---
+ src/llama-context.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6e53404..0784e89 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3197,7 +3197,8 @@ llm_graph_params llama_context::graph_params(
+                     counts += " " + std::to_string(il) + ":" + std::to_string(ced_n_sub[il]);
+                 }
+             }
+-            LLAMA_LOG_INFO("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
++            // not an info log: a server does not show those of the library
++            LLAMA_LOG("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
+                     ordered ? (counts.empty() ? " all" : counts.c_str()) : " (not in batch order, all)");
+         }
+     }
+-- 
+2.43.0
+

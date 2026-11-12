@@ -22,8 +22,15 @@
 | **第 2 步：CED 预填充** | | |
 | `0013-ced-prefill.patch` | 0003、0005、0015、0019 重写 | CED 感知预填充：解码器层只对后面还看得到的 token 算查询和 FFN（`ABYSS_CED_PREFILL=1`），一次调用的余数放进第一个 ubatch（`ABYSS_CED_ALIGN=1`），`ABYSS_CED_DEBUG=1` 打印每个 ubatch 各层留几个 token。每层保留的总是每个 ubatch 末尾的 token，图里直接取视图；只支持单序列 |
 | `0014-ced-test-fixture.patch` |  | `tests/test-llama-archs` 加一个适合测 CED 的 V4.1 小模型配置（`ABYSS_TEST_DSV41_CED=1`，`-o <目录>` 写出），`tools/eval/ced-tiny.sh` 用它 |
+| **第 3 步：专家延后、准入门、解码统计** | | |
+| `0015-fused-op-sibling-gpu.patch` |  | 层分到两张卡时，下一张卡第一层的 HC pre 被调度器放在上一张卡，上游因此把 HC pre 的内核融合对整个模型关掉；同类设备、支持这个算子就接受（mx-llama.cpp 里原有的判定） |
+| `0016-moe-defer.patch` | 0025 重写 | 专家延后：单 token 解码时 CPU 算的专家晚一层加回残差（`ABYSS_MOE_DEFER=1`）；靠计算图的顺序和上游调度器已有的提前取回，不改调度器。`=2` 在本层就加回，用来检查接线 |
+| `0017-decode-stats.patch` | 0016 | 解码统计行（`ABYSS_DECODE_STATS=N`），计数接上游专家缓存的统计 |
+| `0018-ced-debug-log-level.patch` |  | `ABYSS_CED_DEBUG` 的行用 server 默认会显示的日志级别 |
+| `0019-moe-admit-gate.patch` | 0030 的准入门 | 专家缓存的准入门：要挤掉的专家不比未命中的冷，就把未命中交给 CPU（`ABYSS_MOE_ADMIT_GATE=1`，值是比较时的系数），接在上游的 ClassLRU 上 |
+| `0020-fused-op-sibling-switch.patch` |  | 0015 的判定加开关（`ABYSS_FUSED_SIBLING=1`） |
 
-mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0014（大批次分流）、0016（解码统计）、0018（请求文字里的控制 token）、0019、0020（计算图显存和查询分块）、0022（大批次统计）、0023（大批次用缓存）、0025（专家延后）、0030（准入门）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）、0044（两卡流水线）、0046（主机权重不先等）。
+mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0014（大批次分流）、0018（请求文字里的控制 token）、0019、0020（计算图显存和查询分块）、0022（大批次统计）、0023（大批次用缓存）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）、0044（两卡流水线）、0046（主机权重不先等）。
 
 ## 安装
 
@@ -42,7 +49,13 @@ git am <abyss>/llama.cpp/0001-sched-reserve-size-reset.patch \
   <abyss>/llama.cpp/0011-hc-ksplit.patch \
   <abyss>/llama.cpp/0012-shared-ptr-checkpoints.patch \
   <abyss>/llama.cpp/0013-ced-prefill.patch \
-  <abyss>/llama.cpp/0014-ced-test-fixture.patch
+  <abyss>/llama.cpp/0014-ced-test-fixture.patch \
+  <abyss>/llama.cpp/0015-fused-op-sibling-gpu.patch \
+  <abyss>/llama.cpp/0016-moe-defer.patch \
+  <abyss>/llama.cpp/0017-decode-stats.patch \
+  <abyss>/llama.cpp/0018-ced-debug-log-level.patch \
+  <abyss>/llama.cpp/0019-moe-admit-gate.patch \
+  <abyss>/llama.cpp/0020-fused-op-sibling-switch.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target test-llama-archs   # tools/eval/ced-tiny.sh 用，可选
@@ -57,6 +70,7 @@ GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \
   ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CKPT_COUNT_START=1 ABYSS_GEN_CKPT=256 ABYSS_CKPT_THIN_STEP=8192 \
   ABYSS_SAMPLE_FAST=1 ABYSS_DIST_VEC=1 ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_KEEPALIVE_MS=4 \
   ABYSS_CED_PREFILL=1 ABYSS_CED_ALIGN=1 \
+  ABYSS_FUSED_SIBLING=1 ABYSS_MOE_DEFER=1 ABYSS_MOE_ADMIT_GATE=1 ABYSS_DECODE_STATS=100 \
   llama-server -m <上游布局的 GGUF> -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
   -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 16000 --moe-cache-cpu-share 0.7 --checkpoint-min-step 32768 \
