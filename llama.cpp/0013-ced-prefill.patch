@@ -1,0 +1,653 @@
+From ae600ae4c4f2001eb0a9f36f7ce796e2aa1533e2 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Wed, 11 Nov 2026 23:38:45 +0100
+Subject: [PATCH] abyss: CED-aware prefill for DeepSeek V4.1
+ (ABYSS_CED_PREFILL=1, ABYSS_CED_ALIGN=1)
+
+A decoder layer needs a token's queries and FFN only where an output token, or the next decode step, still reaches
+it through the sliding windows of the layers above. llama_context::ced_plan() works that out for each llama_decode()
+call, and the V4.1 graph computes the queries, the index scores, the top-k masks and the FFN of each decoder layer
+only for those tokens; every token still writes its KV.
+
+The plan covers one sequence and never decreases along the batch, so the tokens a layer keeps are the last ones of
+each ubatch: the graph takes them as views, and the scheduler uploads only those rows of the masks. A layer that
+keeps no token computes no queries and no FFN. ABYSS_CED_ALIGN=1 puts the remainder of a call in its first ubatch,
+so the last ubatch, which holds the tail the decoder layers run on, is full. ABYSS_CED_DEBUG=1 prints what each
+ubatch keeps.
+---
+ src/llama-context.cpp       | 144 ++++++++++++++++++++++++
+ src/llama-context.h         |   6 +
+ src/llama-graph.cpp         |   1 +
+ src/llama-graph.h           |  10 ++
+ src/llama-kv-cache-dsv4.cpp |  24 +++-
+ src/models/deepseek41.cpp   | 217 +++++++++++++++++++++++++-----------
+ 6 files changed, 333 insertions(+), 69 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 12db206..24526c0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2318,6 +2318,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // abyss: planned after the graph reservation so reserve graphs never see it, and dropped on every exit
++    struct ced_reset {
++        std::vector<int8_t> & plan;
++        ~ced_reset() { plan.clear(); }
++    } ced_guard { ced_last_layer };
++    if (!output_all && n_tokens_all > 1 && !has_embd_row && !has_state_row) {
++        ced_plan(balloc->get_batch());
++    }
++
+     // ordering for the layer input device buffer
+     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
+     ggml_backend_t  inject_backend = nullptr;
+@@ -3084,6 +3093,50 @@ llm_graph_params llama_context::graph_params(
+                       const llama_ubatch & ubatch,
+             const llama_memory_context_i * mctx,
+                           llm_graph_type   gtype) const {
++    // abyss: under the CED-aware prefill, the tokens of the ubatch each layer still computes, see ced_plan(). The plan
++    // never decreases along the batch, so they are the last tokens of the ubatch as long as it keeps the batch order
++    std::vector<int32_t> ced_n_sub;
++    if (!ced_last_layer.empty() && gtype == LLM_GRAPH_TYPE_DEFAULT && ubatch.n_seqs_unq == 1 &&
++            ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens) {
++        const int32_t n_layer = (int32_t) model.hparams.n_layer();
++        const auto & batch_idxs = ubatch.data->batch_idxs;
++
++        bool ordered = true;
++        for (uint32_t i = 0; i < ubatch.n_tokens && ordered; ++i) {
++            ordered = batch_idxs[i] >= 0 && (size_t) batch_idxs[i] < ced_last_layer.size() &&
++                    (i == 0 || batch_idxs[i] > batch_idxs[i - 1]);
++        }
++
++        if (ordered) {
++            ced_n_sub.assign(n_layer, 0);
++            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++                const int32_t last = std::min<int32_t>(ced_last_layer[batch_idxs[i]], n_layer - 1);
++                for (int32_t il = 0; il <= last; ++il) {
++                    ced_n_sub[il]++;
++                }
++            }
++            if (ced_n_sub[n_layer - 1] == (int32_t) ubatch.n_tokens) {
++                ced_n_sub.clear();
++            }
++        }
++
++        // ABYSS_CED_DEBUG=1 prints the tokens each trimmed layer keeps, one line per ubatch
++        static const bool debug = [] {
++            const char * e = getenv("ABYSS_CED_DEBUG");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (debug) {
++            std::string counts;
++            for (int32_t il = 0; il < (int32_t) ced_n_sub.size(); ++il) {
++                if (ced_n_sub[il] < (int32_t) ubatch.n_tokens) {
++                    counts += " " + std::to_string(il) + ":" + std::to_string(ced_n_sub[il]);
++                }
++            }
++            LLAMA_LOG_INFO("abyss: ced: ubatch of %u tokens at %d, layer:tokens%s\n", ubatch.n_tokens, (int) ubatch.pos[0],
++                    ordered ? (counts.empty() ? " all" : counts.c_str()) : " (not in batch order, all)");
++        }
++    }
++
+     return {
+         /*.model       =*/ &model,
+         /*.hparams     =*/ model.hparams,
+@@ -3107,9 +3160,100 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.ced_n_sub   =*/ std::move(ced_n_sub),
+     };
+ }
+ 
++// abyss: CED-aware prefill (DeepSeek V4.1), ABYSS_CED_PREFILL=1.
++// The decoder layers read their long-range context from the compressed KV that the first decoder layer builds from the
++// encoder output, and see the other tokens' own hidden states only through sliding windows of n_swa positions, each
++// reaching n_swa - 1 positions back. So a decoder layer needs a token's queries and FFN only where an output token
++// reaches it through the windows of the layers above, or where the next decode step does: the last positions of the
++// sequence stay valid up to the second-to-last layer, n_rs_seq of them on top of the window (ABYSS_CED_MARGIN overrides
++// it), so the short rollbacks the cache allows still find correct sliding-window KV (without n_rs_seq the cache rolls
++// back only to a checkpoint). Tokens out of reach still write their KV in every layer: their wrong hidden states only
++// feed KV entries no later token reads.
++// Each llama_decode() call is planned on its own end, so a prompt split across calls stays correct and only saves less.
++// The plan covers a batch of one sequence in a context of one sequence, and never decreases along the batch, so the
++// tokens a layer still computes are the last ones of every ubatch.
++bool llama_context::ced_plan(const llama_batch & batch) {
++    static const bool enabled = [] {
++        const char * e = getenv("ABYSS_CED_PREFILL");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    static const int32_t margin_env = [] {
++        const char * e = getenv("ABYSS_CED_MARGIN");
++        return e != nullptr ? std::max(0, atoi(e)) : -1;
++    }();
++    const int32_t margin = margin_env >= 0 ? margin_env : (int32_t) cparams.n_rs_seq;
++
++    ced_last_layer.clear();
++
++    const auto & hparams = model.hparams;
++    const int32_t n_layer = (int32_t) hparams.n_layer();
++
++    if (!enabled || model.arch != LLM_ARCH_DEEPSEEK41 || hparams.n_swa < 2 || n_layer < 2 || n_layer > INT8_MAX ||
++            cparams.n_seq_max != 1 || cparams.embeddings_nextn || cparams.embeddings_nextn_masked ||
++            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool tap) { return tap; })) {
++        return false;
++    }
++
++    // the first decoder layer is the kv source of the last layer
++    const int32_t first_dec = hparams.dsv41_kv_src[n_layer - 1];
++    if (first_dec <= 0 || batch.pos == nullptr || batch.logits == nullptr || batch.token == nullptr || batch.embd != nullptr ||
++            batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
++        return false;
++    }
++
++    const int32_t step = (int32_t) hparams.n_swa - 1;
++    const int32_t n    = batch.n_tokens;
++
++    // one sequence, with increasing positions
++    for (int32_t i = 0; i < n; ++i) {
++        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != batch.seq_id[0][0] || (i > 0 && batch.pos[i] <= batch.pos[i - 1])) {
++            return false;
++        }
++    }
++    const llama_pos pos_end = batch.pos[n - 1];
++
++    // window steps needed to reach a token d positions back
++    const auto steps = [step](int32_t d) { return (d + step - 1)/step; };
++
++    ced_last_layer.assign(n, (int8_t) (n_layer - 1));
++
++    llama_pos next_out = -1; // the next output position at or after the token
++    for (int32_t i = n - 1; i >= 0; --i) {
++        const llama_pos p = batch.pos[i];
++        if (batch.logits[i]) {
++            next_out = p;
++        }
++
++        int32_t last = first_dec - 1;
++        if (next_out >= 0) {
++            last = std::max(last, n_layer - 1 - steps(next_out - p));
++        }
++        last = std::max(last, n_layer - 2 - steps(std::max(0, pos_end - p - (margin + step - 1))));
++        last = std::min(last, n_layer - 1);
++
++        ced_last_layer[i] = (int8_t) last;
++    }
++
++    // an output in the middle of the batch raises the tokens before it above the ones after it: level those up
++    bool trimmed = false;
++    for (int32_t i = 0; i < n; ++i) {
++        if (i > 0 && ced_last_layer[i] < ced_last_layer[i - 1]) {
++            ced_last_layer[i] = ced_last_layer[i - 1];
++        }
++        trimmed |= ced_last_layer[i] < n_layer - 1;
++    }
++
++    if (!trimmed) {
++        ced_last_layer.clear();
++    }
++
++    return trimmed;
++}
++
+ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
+     if (backend_ids_changed) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index d7f1123..8ff9de2 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -297,6 +297,9 @@ private:
+ 
+     llm_graph_cb graph_get_cb() const;
+ 
++    // abyss: plans the CED-aware prefill of a batch into ced_last_layer, returns false when every token runs every layer
++    bool ced_plan(const llama_batch & batch);
++
+     // parameters defining the backend scheduler instance
+     struct sched_params {
+         size_t max_nodes  = 0;
+@@ -364,6 +367,9 @@ private:
+     std::vector<buffer_view<float>> embd_layer_inp;
+     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+ 
++    // abyss: per token of the batch being decoded, the last layer whose FFN it needs; empty outside a planned decode()
++    std::vector<int8_t> ced_last_layer;
++
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1174909..fec465f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1592,6 +1592,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     h_nextn_dev      (params.h_nextn_dev),
+     h_nextn_src      (params.h_nextn_src),
+     samplers         (params.samplers),
++    ced_n_sub        (params.ced_n_sub),
+     cb_func          (params.cb),
+     res              (params.res),
+     ctx0             (res->get_ctx()),
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 89370a9..bad0ce6 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -837,6 +837,10 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    // abyss: CED-aware prefill (DeepSeek V4.1), see llama_context::ced_plan(): per layer, how many of the last tokens of
++    // the ubatch still need the layer's queries and FFN; empty when every layer runs every token
++    std::vector<int32_t> ced_n_sub;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -878,6 +882,10 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        if (ced_n_sub != other.ced_n_sub) {
++            return false;
++        }
++
+         if (!samplers_equal(samplers, other.samplers)) {
+             return false;
+         }
+@@ -1093,6 +1101,8 @@ struct llm_graph_context {
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
++    const std::vector<int32_t> ced_n_sub; // abyss: see llm_graph_params
++
+     const llm_graph_cb & cb_func;
+ 
+     llm_graph_result * res;
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index ef1be94..78202b7 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -1525,6 +1525,27 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
+     do {
+         balloc.split_reset();
+ 
++        // abyss: ABYSS_CED_ALIGN=1 puts the remainder in the first ubatch instead of the last, so the last ubatch is full.
++        // The CED-aware prefill runs the decoder layers only on the tail of a call, and every ubatch that holds part of
++        // that tail reads the host-resident experts of those layers once; a full last ubatch leaves the earlier one only
++        // the first few decoder layers.
++        static const bool ced_align = [] {
++            const char * e = getenv("ABYSS_CED_ALIGN");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        uint32_t n_first = 0;
++        if (ced_align && !has_coupled && !raw_per_seq && !comp_per_seq && balloc.get_n_tokens() > n_ubatch) {
++            // one sequence only, or the equal split would not hand out the tokens in batch order
++            const llama_batch & batch = balloc.get_batch();
++            bool one_seq = batch.n_seq_id != nullptr && batch.seq_id != nullptr;
++            for (int32_t i = 0; one_seq && i < batch.n_tokens; ++i) {
++                one_seq = batch.n_seq_id[i] == 1 && batch.seq_id[i][0] == batch.seq_id[0][0];
++            }
++            if (one_seq) {
++                n_first = balloc.get_n_tokens() % n_ubatch;
++            }
++        }
++
+         std::vector<llama_ubatch> ubatches;
+         while (true) {
+             llama_ubatch ubatch;
+@@ -1533,7 +1554,8 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
+             } else {
+                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
++                ubatch = balloc.split_equal(n_first > 0 ? n_first : n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
++                n_first = 0;
+             }
+ 
+             if (ubatch.n_tokens == 0) {
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 96de904..0b3826f 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -442,21 +442,47 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+         return ggml_rope_set_offset(t, n_nope);
+     };
+ 
+-    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+-    cb(qr, "qr_norm", il);
++    const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
++    const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
++    const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
+ 
+-    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
+-    q = rope(q, inp_pos, n_embd_head_nope);
+-    cb(q, "q", il);
++    // abyss: under the CED-aware prefill a layer attends only for the last nq tokens of the ubatch, see
++    // llama_context::ced_plan(). Every token still writes its KV. The window-only path keeps every query
++    const int64_t nq = !ced_n_sub.empty() && ratio != 0 && ci.kq_mask ? ced_n_sub[il] : nt;
++    GGML_ASSERT(nq >= 0 && nq <= nt);
++
++    const bool sub = nq < nt;
++
++    // the last nq rows of t [ne0, rows, 1, 1], or t itself where every token attends. A view of a graph input stays on
++    // the host, and the scheduler uploads only these rows to the device that reads them
++    const auto tail = [&](ggml_tensor * t) {
++        if (!sub) {
++            return t;
++        }
++        GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1 && nq > 0 && nq <= t->ne[1]);
++        return nq == t->ne[1] ? t :
++            ggml_view_4d(ctx0, t, t->ne[0], nq, 1, 1, t->nb[1], nq*t->nb[1], nq*t->nb[1], (t->ne[1] - nq)*t->nb[1]);
++    };
++
++    ggml_tensor * cur_q = nq > 0 ? tail(cur) : nullptr;
++    ggml_tensor * pos_q = sub && nq > 0 ? ggml_view_1d(ctx0, inp_pos, nq, (nt - nq)*inp_pos->nb[0]) : inp_pos;
++
++    // with no queries they stay out of the graph: expanded, they would be computed and kept to the end of the graph
++    ggml_tensor * qr = nullptr;
++    ggml_tensor * q  = nullptr;
++    if (nq > 0) {
++        qr = build_norm(build_lora_mm(layer.wq_a, cur_q), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++        cb(qr, "qr_norm", il);
++
++        q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nq);
++        q = rope(q, pos_q, n_embd_head_nope);
++        cb(q, "q", il);
++    }
+ 
+     ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
+     cb(kv, "kv", il);
+ 
+-    const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
+-    const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
+-    const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
+-
+     const int32_t rd = inp_dsv4->mctx->get_comp_read_layer(il);
+ 
+     if (ratio != 0) {
+@@ -528,7 +554,29 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
+         const int64_t n_stream = comp_all->ne[3];
+ 
++        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
++        ggml_tensor * k_rot = inp_attn->self_k_rot[il];
++
++        if (nq == 0) {
++            // abyss: no token attends here, the layer only writes its window KV
++            if (k_rot) {
++                kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
++            }
++            ggml_build_forward_expand(gf, kv);
++            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
++
++            return ggml_fill(ctx0, cur, 0.0f);
++        }
++
++        // abyss: the plan covers one sequence, so a layer that attends for part of the ubatch has one stream
++        GGML_ASSERT(!sub || n_stream == 1);
++        ggml_tensor * comp_mask = tail(ci.kq_mask);
++
++        // the top-k and the candidate blocks of a source layer cover its own queries, which include this layer's
+         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
++        if (top_k) {
++            top_k = tail(top_k);
++        }
+         if (hparams.dsv41_topk_src[il] == il) {
+             ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
+                     comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
+@@ -540,16 +588,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+                 ik = ggml_cont(ctx0, ik);
+             }
+ 
+-            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
+-            iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
+-            iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nt/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nt/n_stream), 0);
++            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nq);
++            iq = rope(iq, pos_q, n_idx_embd - n_embd_head_rope);
++            iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nq/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nq/n_stream), 0);
+ 
+-            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
+-            iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
++            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur_q), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
++            iw = ggml_view_4d(ctx0, iw, iw->ne[0], nq/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nq/n_stream), iw->nb[1]*(nq/n_stream), 0);
+ 
+             // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
+-            const int64_t n_tok = nt/n_stream;
+-            GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
++            const int64_t n_tok = nq/n_stream;
++            GGML_ASSERT(comp_mask->ne[1] == n_tok);
+             const int64_t chunk = fused_idx ? n_tok :
+                 std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
+ 
+@@ -561,6 +609,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
+             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
+ 
++            // abyss: the pins and the candidate blocks of this layer's queries
++            ggml_tensor * pin_q = pick_blk ? tail(cand_pin) : nullptr;
++            ggml_tensor * sel_q = use_blk  ? tail(cand_sel) : nullptr;
++
+             ggml_tensor * ik_p = fused_idx ? nullptr : ggml_permute(ctx0, ik, 0, 2, 1, 3);
+             std::vector<ggml_tensor *> parts_top_k;
+             std::vector<ggml_tensor *> parts_sel;
+@@ -571,7 +623,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+                 };
+                 ggml_tensor * score = nullptr;
+                 if (fused_idx) {
+-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
++                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
+                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+                 } else {
+                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
+@@ -579,7 +631,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
+                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
+-                    ggml_tensor * mask  = rows(ci.kq_mask);
++                    ggml_tensor * mask  = rows(comp_mask);
+                     score = ggml_add(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)),
+                             mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
+                 }
+@@ -592,12 +644,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+                         s2 = ggml_concat(ctx0, s2, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blk*bs - n_comp, nc*n_stream), -INFINITY), 0);
+                     }
+                     ggml_tensor * bmax = ggml_pool_1d(ctx0, s2, GGML_OP_POOL_MAX, bs, bs, 0);
+-                    bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(cand_pin));
++                    bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(pin_q));
+                     cb(bmax, "cand_block_score", il);
+                     parts_sel.push_back(ggml_top_k(ctx0, bmax, std::min<int64_t>(hparams.dsv41_cand_topk_blocks, n_blk)));
+                 } else if (use_blk) {
+                     // own scores, restricted to the source's candidate blocks: 0 inside them, -inf elsewhere
+-                    ggml_tensor * bsel = ggml_cont(ctx0, rows(cand_sel));
++                    ggml_tensor * bsel = ggml_cont(ctx0, rows(sel_q));
+                     const int64_t k_b = bsel->ne[0];
+                     ggml_tensor * bm    = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blk, nc*n_stream, 1), -INFINITY);
+                     ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, k_b, nc*n_stream, 1), 0.0f);
+@@ -631,8 +683,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+         }
+         GGML_ASSERT(top_k && "DeepSeek-V4.1: top-k source layer produced no top-k");
+ 
+-        // a quantized K cache stores the window Hadamard-rotated (as build_raw_attention)
+-        ggml_tensor * k_rot = inp_attn->self_k_rot[il];
+         if (k_rot) {
+             q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
+             kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+@@ -642,14 +692,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+         ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+ 
+         ggml_tensor * raw_k    = inp_attn->mctx->get_k(ctx0, il);
+-        ggml_tensor * raw_mask = inp_attn->self_attn_mask.raw;
++        ggml_tensor * raw_mask = tail(inp_attn->self_attn_mask.raw);
+ 
+         const int32_t topk_src = hparams.dsv41_topk_src[il];
+         const int64_t k_sel    = top_k->ne[0];
+         const int64_t n_raw    = raw_k->ne[2];
+ 
+         // few queries per stream: attend over [window | top-k rows of the query], one FA stream per query; same keys and mask as dense, different key order
+-        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 &&
++        // abyss: the gathered rows are shared by the layers of a top-k source, so a layer with its own subset of queries attends densely
++        const bool gather = sparse && cparams.flash_attn && raw_mask->type == GGML_TYPE_F16 && ci.kq_mask->type == GGML_TYPE_F16 && !sub &&
+                 ((n_stream == 1 && nt <= 32) || nt == n_stream);
+ 
+         if (gather) {
+@@ -734,7 +785,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+             cb(comp_k, "comp_k", il);
+             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+ 
+-            ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
++            ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
+             ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+             cb(kq_mask, "comp_kq_mask", il);
+ 
+@@ -748,20 +799,27 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
+         cb(out, "attn_comp", il);
+     }
+ 
+-    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+-    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++    // abyss: the queries keep only their own rows through the output projection
++    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nq);
++    out = ggml_rope_ext_back(ctx0, out, pos_q, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+     out = ggml_rope_set_offset(out, n_embd_head_nope);
+     cb(out, "attn_derope", il);
+ 
+-    out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nt), 0, 2, 1, 3);
++    out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nq), 0, 2, 1, 3);
+     ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+     cb(oa, "attn_wo_a", il);
+-    oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nt);
++    oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nq);
+ 
+     out = build_lora_mm(layer.wo_b, oa);
+     cb(out, "attn_out", il);
+ 
++    if (sub) {
++        // the tokens that do not attend get a zero attention output
++        out = ggml_pad_ext(ctx0, out, 0, 0, (int) (nt - nq), 0, 0, 0, 0, 0);
++        cb(out, "attn_out_ced", il);
++    }
++
+     return out;
+ }
+ 
+@@ -865,50 +923,73 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
+         const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
+         pre_prev = ffn_mix.pre;
+ 
+-        cur = build_hc_pre(inpL, attn_mix.pre, il);
+-        cb(cur, "hc_ffn_pre", il);
++        // abyss: under the CED-aware prefill this layer runs its FFN on the last n_ffn tokens of the ubatch only, the
++        // tokens that nothing reads anymore get a zero FFN output, see llama_context::ced_plan()
++        const int64_t n_ffn = ced_n_sub.empty() ? n_tokens : ced_n_sub[il];
++        GGML_ASSERT(n_ffn >= 0 && n_ffn <= n_tokens);
++
++        ggml_tensor * attn_out = cur;
++
++        if (n_ffn > 0) {
++            cur = build_hc_pre(inpL, attn_mix.pre, il);
++            cb(cur, "hc_ffn_pre", il);
++        }
+ 
+         ggml_build_forward_expand(gf, residual);
+         ggml_build_forward_expand(gf, ffn_mix.post);
+         ggml_build_forward_expand(gf, ffn_mix.comb);
+ 
+-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+-        cb(cur, "ffn_norm", il);
+-
+-        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
+-        ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
+-        ggml_prec_set_acc(logits, GGML_PREC_F32);
+-        cb(logits, "ffn_moe_logits", il);
+-
+-        // image (embedding) tokens use the vision router bias, as DeepSeek-V4
+-        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+-            exp_probs_b = layer.ffn_exp_probs_b_vl;
+-        }
+-
+-        // the reference normalizes only when it routes to more than one expert
+-        ggml_tensor * moe_out = build_moe_ffn(cur,
+-                layer.ffn_gate_inp,
+-                layer.ffn_up_exps,
+-                layer.ffn_gate_exps,
+-                layer.ffn_down_exps,
+-                exp_probs_b,
+-                n_expert, hparams.n_expert_used(),
+-                LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
+-                hparams.expert_weights_scale,
+-                (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                il, logits);
+-        cb(moe_out, "ffn_moe_out", il);
+-
+-        ggml_tensor * ffn_shexp = build_ffn(cur,
+-                layer.ffn_up_shexp, nullptr, nullptr,
+-                layer.ffn_gate_shexp, nullptr, nullptr,
+-                layer.ffn_down_shexp, nullptr, nullptr,
+-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-        cb(ffn_shexp, "ffn_shexp", il);
+-
+-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+-        cb(cur, "ffn_out", il);
++        if (n_ffn == 0) {
++            cur = ggml_fill(ctx0, attn_out, 0.0f);
++            cb(cur, "ffn_out_ced", il);
++        } else {
++            if (n_ffn < n_tokens) {
++                cur = ggml_view_2d(ctx0, cur, n_embd, n_ffn, cur->nb[1], (n_tokens - n_ffn)*cur->nb[1]);
++            }
++
++            cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++            cb(cur, "ffn_norm", il);
++
++            // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
++            ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
++            ggml_prec_set_acc(logits, GGML_PREC_F32);
++            cb(logits, "ffn_moe_logits", il);
++
++            // image (embedding) tokens use the vision router bias, as DeepSeek-V4
++            ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
++            if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
++                exp_probs_b = layer.ffn_exp_probs_b_vl;
++            }
++
++            // the reference normalizes only when it routes to more than one expert
++            ggml_tensor * moe_out = build_moe_ffn(cur,
++                    layer.ffn_gate_inp,
++                    layer.ffn_up_exps,
++                    layer.ffn_gate_exps,
++                    layer.ffn_down_exps,
++                    exp_probs_b,
++                    n_expert, hparams.n_expert_used(),
++                    LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
++                    hparams.expert_weights_scale,
++                    (llama_expert_gating_func_type) hparams.expert_gating_func,
++                    il, logits);
++            cb(moe_out, "ffn_moe_out", il);
++
++            ggml_tensor * ffn_shexp = build_ffn(cur,
++                    layer.ffn_up_shexp, nullptr, nullptr,
++                    layer.ffn_gate_shexp, nullptr, nullptr,
++                    layer.ffn_down_shexp, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++
++            cur = ggml_add(ctx0, moe_out, ffn_shexp);
++            cb(cur, "ffn_out", il);
++
++            if (n_ffn < n_tokens) {
++                cur = ggml_pad_ext(ctx0, cur, 0, 0, (int) (n_tokens - n_ffn), 0, 0, 0, 0, 0);
++                cb(cur, "ffn_out_ced", il);
++            }
++        }
+ 
+         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
+         inpL = build_cvec(inpL, il);
+-- 
+2.43.0
+

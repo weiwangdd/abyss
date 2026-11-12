@@ -19,8 +19,11 @@
 | `0010-ckpt-count-start.patch` | 0045 | 按检查点步长拆调用时把这次调用开头的检查点算进去，不再多出几百 token 的小调用（`ABYSS_CKPT_COUNT_START=1`）；每个请求打印调用和检查点 |
 | `0011-hc-ksplit.patch` | 0027 | 超连接混合系数的 K 切分（`ABYSS_HC_KSPLIT=1`） |
 | `0012-shared-ptr-checkpoints.patch` |  | 上面几个补丁在上游上的修正：检查点列表在上游是 `shared_ptr`，也没有 fork 的无损存储标志 |
+| **第 2 步：CED 预填充** | | |
+| `0013-ced-prefill.patch` | 0003、0005、0015、0019 重写 | CED 感知预填充：解码器层只对后面还看得到的 token 算查询和 FFN（`ABYSS_CED_PREFILL=1`），一次调用的余数放进第一个 ubatch（`ABYSS_CED_ALIGN=1`），`ABYSS_CED_DEBUG=1` 打印每个 ubatch 各层留几个 token。每层保留的总是每个 ubatch 末尾的 token，图里直接取视图；只支持单序列 |
+| `0014-ced-test-fixture.patch` |  | `tests/test-llama-archs` 加一个适合测 CED 的 V4.1 小模型配置（`ABYSS_TEST_DSV41_CED=1`，`-o <目录>` 写出），`tools/eval/ced-tiny.sh` 用它 |
 
-mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0003、0005（CED 预填充）、0007（`llama-abyss-dump`）、0014（大批次分流）、0016（解码统计）、0018（请求文字里的控制 token）、0019、0020（计算图显存和查询分块）、0022（大批次统计）、0023（大批次用缓存）、0025（专家延后）、0030（准入门）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）、0044（两卡流水线）、0046（主机权重不先等）。
+mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0014（大批次分流）、0016（解码统计）、0018（请求文字里的控制 token）、0019、0020（计算图显存和查询分块）、0022（大批次统计）、0023（大批次用缓存）、0025（专家延后）、0030（准入门）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）、0044（两卡流水线）、0046（主机权重不先等）。
 
 ## 安装
 
@@ -37,9 +40,12 @@ git am <abyss>/llama.cpp/0001-sched-reserve-size-reset.patch \
   <abyss>/llama.cpp/0009-prefill-tail-one-pass-server.patch \
   <abyss>/llama.cpp/0010-ckpt-count-start.patch \
   <abyss>/llama.cpp/0011-hc-ksplit.patch \
-  <abyss>/llama.cpp/0012-shared-ptr-checkpoints.patch
+  <abyss>/llama.cpp/0012-shared-ptr-checkpoints.patch \
+  <abyss>/llama.cpp/0013-ced-prefill.patch \
+  <abyss>/llama.cpp/0014-ced-test-fixture.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
+cmake --build build -j --target test-llama-archs   # tools/eval/ced-tiny.sh 用，可选
 ```
 
 ## 使用
@@ -50,6 +56,7 @@ cmake --build build -j --target llama-server
 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \
   ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CKPT_COUNT_START=1 ABYSS_GEN_CKPT=256 ABYSS_CKPT_THIN_STEP=8192 \
   ABYSS_SAMPLE_FAST=1 ABYSS_DIST_VEC=1 ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_KEEPALIVE_MS=4 \
+  ABYSS_CED_PREFILL=1 ABYSS_CED_ALIGN=1 \
   llama-server -m <上游布局的 GGUF> -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
   -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 16000 --moe-cache-cpu-share 0.7 --checkpoint-min-step 32768 \
