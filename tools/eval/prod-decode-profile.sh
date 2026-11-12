@@ -8,7 +8,10 @@
 # BUILD picks the binaries (default build-m2), EXTRA_ENV adds settings ("VAR=VALUE VAR=VALUE", e.g. a switch of a test
 # build), SEED fixes the sampled turns' seeds (decode_modes.py --seed), so two profiles decode the same tokens. Waits
 # for the production server to go idle, saves its slot and stops it, and restarts it at the end (~/abyss-stats/
-# restart.sh restores the slot).
+# restart.sh restores the slot; RESTART=1 starts it also when it was not running, after upstream-bench.sh RESTART=0).
+# KIND=up profiles the port to upstream llama.cpp instead: ~/src/llama.cpp-abyss/build, the GGUF in upstream's layout
+# and the settings of llama.cpp/README.md (UP_CACHE and UP_SHARE set its MoE cache), read with nsys_graphs.py and
+# nsys_kernels.py only, the other readers go by the fork's graph.
 set -u
 E=$(cd "$(dirname "$0")" && pwd)
 O=${OUT:-$HOME/abyss-eval}/prod-profile-$(date +%m%d-%H%M)
@@ -43,7 +46,26 @@ gpus_free
 
 # in a subshell, so restart.sh below does not inherit the settings
 (
-  export OUT=$O PORT=8090 BUILD=${BUILD:-$HOME/src/mx-llama.cpp/build-m2/bin}
+  export OUT=$O PORT=8090
+  if [ "${KIND:-fork}" = up ]; then
+    # the template with the V4.1 tag literal upstream detects, as in upstream-bench.sh
+    { printf '{#- ｜DSML｜ calls> -#}'; cat "$HOME/abyss-stats/tmpl/v41.jinja"; } > "$O/v41-upstream.jinja"
+    export BUILD=${BUILD:-$HOME/src/llama.cpp-abyss/build/bin}
+    export MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF-upstream/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf}
+    export GOMP_SPINCOUNT=100000000 ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1 ABYSS_DECODE_STATS=100
+    export ABYSS_CKPT_COUNT_START=1 ABYSS_GEN_CKPT=256 ABYSS_SAMPLE_FAST=1 ABYSS_DIST_VEC=1 ABYSS_HC_KSPLIT=1
+    export ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_FUSED_SIBLING=1 ABYSS_DSV41_CHUNK=512 ABYSS_MOE_DEFER=1
+    export ABYSS_MOE_ADMIT_GATE=1 ABYSS_WEIGHT_NOWAIT=1 ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x
+    export ABYSS_HEAD_SPLIT=0.5 ABYSS_HEAD_SPLIT_ONLY=1 ABYSS_MMVQ_TAIL=1 ABYSS_HC_GATE_FUSE=1 ABYSS_DSV41_WINDOW_ROWS=1
+    export ABYSS_MOE_BIG_CACHE=1
+    for kv in ${EXTRA_ENV:-}; do
+      export "$kv"
+    done
+    export EXTRA="-c 196608 --moe-cache-mib ${UP_CACHE:-20900} --moe-cache-cpu-share ${UP_SHARE:-0.7}
+      -ot blk\\.12\\.ffn_(gate|up)_exps\\.=CUDA0 --checkpoint-min-step 32768 --chat-template-file $O/v41-upstream.jinja
+      --no-reasoning-preserve --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0"
+  else
+  export BUILD=${BUILD:-$HOME/src/mx-llama.cpp/build-m2/bin}
   export MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf}
   export GOMP_SPINCOUNT=100000000 ABYSS_DSV41_IDX_CHUNK=512 ABYSS_CKPT_THIN_STEP=8192 ABYSS_PLAIN_INPUT=1
   export ABYSS_DECODE_STATS=100 ABYSS_MOE_ADMIT=0.3 ABYSS_MOE_BIG_CACHE=1 ABYSS_MOE_DEFER=1 ABYSS_HC_KSPLIT=1
@@ -57,13 +79,14 @@ gpus_free
   done
   export EXTRA='-c 196608 --moe-cache-mib 21100 -ot blk\.12\.ffn_(gate|up)_exps\.=CUDA0 --checkpoint-min-step 32768
     --no-reasoning-preserve --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0'
+  fi
   echo "### decode turn $(date +%T)"
   CAPTURE=1 REPEAT=${REPEAT:-6} ROUNDS=1 MAX_TOKENS=${MAX_TOKENS:-256} "$E/decode_modes.sh" > "$O/decode.txt" 2>&1
   sed -n '/decode window/,$p' "$O/decode.txt" | head -24
 )
 gpus_free
 
-if [ -n "$pid" ]; then
+if [ -n "$pid" ] || [ "${RESTART:-}" = 1 ]; then
   echo "### restarting production $(date +%T)"
   ~/abyss-stats/restart.sh 2>&1 | tail -3
   curl -s -m 10 http://127.0.0.1:8080/slots | grep -q '"id":0' && echo "### production answers on 8080" ||
@@ -74,7 +97,10 @@ S=$O/decode-modes.sqlite
 echo "### graph launches (nsys_graphs.py)"
 python3 -I "$E/nsys_graphs.py" "$S" "${MAX_TOKENS:-256}"
 # the per-kernel reads need the nodes of the graphs, which only node tracing records
-if [ "${NSYS_GRAPH_TRACE:-node}" = node ]; then
+if [ "${NSYS_GRAPH_TRACE:-node}" = node ] && [ "${KIND:-fork}" = up ]; then
+  echo "### kernels (nsys_kernels.py)"
+  python3 -I "$E/nsys_kernels.py" "$S" 40
+elif [ "${NSYS_GRAPH_TRACE:-node}" = node ]; then
   echo "### cached layers (nsys_layers.py)"
   python3 -I "$E/nsys_layers.py" "$S"
   echo "### where both GPUs wait (nsys_layer.py)"
