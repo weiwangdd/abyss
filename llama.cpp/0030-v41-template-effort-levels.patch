@@ -1,0 +1,29 @@
+From df00dfd2f8d1e7b4ed854a47e308af37c99deaf1 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Thu, 12 Nov 2026 18:03:47 +0100
+Subject: [PATCH] abyss: DeepSeek V4.1: a template that names the reasoning
+ effort levels itself gets minimal, medium and xhigh unchanged
+
+---
+ common/parsers/deepseek.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/common/parsers/deepseek.cpp b/common/parsers/deepseek.cpp
+index eda9611..241ee4a 100644
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -109,7 +109,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+         additional_context = json{ { "response_format", inputs.json_schema } };
+     }
+     // V4.1 raises on anything but low/high/max or 1-100: map minimal -> low, xhigh -> max, medium -> default
+-    if (is_v41 && inputs.extra_context.is_object() && inputs.extra_context.contains("reasoning_effort") &&
++    // abyss: a template that names these levels itself (deepseek-v4.1.jinja takes minimal, medium and xhigh as 25, 62
++    // and 88) gets them unchanged
++    const bool tmpl_names_efforts = tmpl.source().find("'medium'") != std::string::npos;
++    if (is_v41 && !tmpl_names_efforts && inputs.extra_context.is_object() && inputs.extra_context.contains("reasoning_effort") &&
+         inputs.extra_context.at("reasoning_effort").is_string()) {
+         const std::string effort = inputs.extra_context.at("reasoning_effort").get<std::string>();
+         json mapped;
+-- 
+2.43.0
+
