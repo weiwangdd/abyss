@@ -1,5 +1,6 @@
-# GitHub language statistics: the technical report is documentation, and the patches to mx-llama.cpp are changes to
-# its C++ and CUDA sources (GitHub would otherwise count .patch and .diff files as Diff and leave them out).
+# GitHub language statistics: the technical report is documentation, and the patches to mx-llama.cpp and to llama.cpp are
+# changes to their C++ and CUDA sources (GitHub would otherwise count .patch and .diff files as Diff and leave them out).
 report/*.tex linguist-documentation
 mx-llama.cpp/*.patch linguist-language=C++
+llama.cpp/*.patch linguist-language=C++
 mx-llama.cpp/experiments/*.diff linguist-language=C++

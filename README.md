@@ -56,6 +56,7 @@ The IOMMU must be disabled in the BIOS: with it on, direct copies between the tw
 | Path | Contents |
 |---|---|
 | [mx-llama.cpp/](mx-llama.cpp/README.md) | 46 patches (`0001`–`0046`), the V4.1 chat template and two small tools; its README lists what each patch does, its switch, and the commands to apply them |
+| [llama.cpp/](llama.cpp/README.md) | The same changes being ported to upstream llama.cpp (in progress): patches on upstream commit `2cbe0ec`; production still runs on mx-llama.cpp |
 | [tools/convert/](tools/convert) | Converting the official weights to GGUF (`v41convert.py`), changing one tensor's type, and converting to upstream llama.cpp's layout |
 | [tools/eval/](tools/eval) | Scripts for cross-checks, benchmarks and profiling |
 | [tools/restart-server.sh](tools/restart-server.sh) | The production server's launch script, with every switch |

@@ -1,0 +1,36 @@
+From e3f480250ced3e2727545780768624ed0210d0ec Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Sun, 25 Oct 2026 13:03:46 +0100
+Subject: [PATCH] abyss: ggml_backend_sched_reserve_size resets after the
+ split, keeping the backends the graph builder assigned
+
+(cherry picked from commit f79f4583e0eeefa8095284d9c89b66fa71dca928)
+---
+ ggml/src/ggml-backend.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 961990f..2a8fa80 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2413,13 +2413,15 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
+     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+     GGML_ASSERT(sizes);
+ 
+-    ggml_backend_sched_reset(sched);
+-
+     ggml_backend_sched_synchronize(sched);
+ 
++    // abyss: reset after the split like ggml_backend_sched_reserve, a reset before it dropped the backends the graph
++    // builder assigned and sized the buffers for a different split
+     ggml_backend_sched_split_graph(sched, measure_graph);
+ 
+     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
++
++    ggml_backend_sched_reset(sched);
+ }
+ 
+ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
+-- 
+2.43.0
+
