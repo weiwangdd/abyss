@@ -9,6 +9,9 @@
 #                                  layout (tools/convert/to_upstream.py), the same command line, the MoE cache at
 #                                  UP_CACHE (16000) MiB with --moe-cache-cpu-share UP_SHARE (0.7), GGML_CUDA_MMQ_PREC=q8,
 #                                  the template with the V4.1 tag literal upstream detects
+#                            port  the port of the patches to upstream llama.cpp (~/src/llama.cpp-abyss, branch
+#                                  abyss-port) with the settings of llama.cpp/README.md, on the weights in upstream's
+#                                  layout, the MoE cache at PORT_CACHE (20900) MiB with --moe-cache-cpu-share 0.7
 #                            tiny  stories260K on the CPU, no GPU: for trying a benchmark's harness end to end
 # bench_stop_server        stops it, prints the load time and both GPUs' memory peak
 # bench_restart_production restarts production (~/abyss-stats/restart.sh restores the slot) and checks 8080
@@ -17,6 +20,7 @@
 PORT=${PORT:-8090}
 FORK_BIN=${FORK_BIN:-$HOME/src/mx-llama.cpp/build-m2/bin}
 UP_BIN=${UP_BIN:-$HOME/src/llama.cpp-upstream/build/bin}
+PORT_BIN=${PORT_BIN:-$HOME/src/llama.cpp-abyss/build/bin}
 FORK_MODEL=${FORK_MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf}
 UP_MODEL=${UP_MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF-upstream/DeepSeek-V4.1-Flash-1017-MXFP4-00001-of-00012.gguf}
 TINY_MODEL=${TINY_MODEL:-$HOME/abyss-eval/tmpl-test/stories260K.gguf}
@@ -83,6 +87,17 @@ bench_start() {
       env_list=(GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000)
       args=("$UP_BIN/llama-server" -m "$UP_MODEL" "${gpu[@]}" --moe-cache-mib "${UP_CACHE:-16000}"
         --moe-cache-cpu-share "${UP_SHARE:-0.7}" --chat-template-file "$dir/v41-upstream.jinja" "${args[@]}")
+      ;;
+    port)
+      { printf '{#- ｜DSML｜ calls> -#}'; cat "$TMPL"; } > "$dir/v41-upstream.jinja"
+      env_list=(GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 ABYSS_CKPT_TAIL_MERGE=2700 ABYSS_CKPT_COUNT_START=1
+        ABYSS_GEN_CKPT=256 ABYSS_CKPT_THIN_STEP=8192 ABYSS_SAMPLE_FAST=1 ABYSS_DIST_VEC=1 ABYSS_HC_KSPLIT=1
+        ABYSS_ENGRAM_KEEPALIVE_MS=4 ABYSS_CED_PREFILL=1 ABYSS_CED_ALIGN=1 ABYSS_FUSED_SIBLING=1 ABYSS_MOE_DEFER=1
+        ABYSS_MOE_ADMIT_GATE=1 ABYSS_DECODE_STATS=100 ABYSS_DSV41_CHUNK=512 ABYSS_MOE_BIG_SPLIT=1 ABYSS_WEIGHT_NOWAIT=1
+        ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x ABYSS_PLAIN_INPUT=1 ABYSS_HEAD_SPLIT=0.5 ABYSS_HEAD_SPLIT_ONLY=1
+        ABYSS_MMVQ_TAIL=1 ABYSS_DSV41_WINDOW_ROWS=1 ABYSS_HC_GATE_FUSE=1 ABYSS_MOE_BIG_CACHE=1)
+      args=("$PORT_BIN/llama-server" -m "$UP_MODEL" "${gpu[@]}" --moe-cache-mib "${PORT_CACHE:-20900}"
+        --moe-cache-cpu-share 0.7 --chat-template-file "$dir/v41-upstream.jinja" "${args[@]}")
       ;;
     tiny)
       env_list=(CUDA_VISIBLE_DEVICES=)

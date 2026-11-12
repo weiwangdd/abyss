@@ -16,7 +16,7 @@ mkdir -p "$O"
 if nvidia-smi --query-gpu=index,pcie.link.gen.max --format=csv,noheader | awk -F', ' '$2 < 5 { bad = 1 } END { exit bad }'; then :; else
   echo "warning: a GPU link is below PCIe Gen5 (nvidia-smi -q | grep -A6 'GPU Link Info'), speeds will be off" >&2
 fi
-case " $SERVERS " in *" fork "*|*" up "*) bench_stop_production ;; esac
+case " $SERVERS " in *" fork "*|*" up "*|*" port "*) bench_stop_production ;; esac
 
 for bench in $BENCHES; do
   for server in $SERVERS; do

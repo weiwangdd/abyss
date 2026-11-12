@@ -26,20 +26,42 @@
 SKIP="mlperf-up agentx-up" ~/abyss-tools/benchmark/run.sh   # 跳过指定的「benchmark-服务器」组合，这里上游只跑 TraceLab
 SERVERS=tiny BENCHES=mlperf ~/abyss-tools/benchmark/run.sh   # CPU 上的小模型，不停生产，只为试流程
 SERVERS=fork ~/abyss-tools/benchmark/run.sh       # 只跑生产（上游没变时沿用上次的结果）
+SERVERS=port ~/abyss-tools/benchmark/run.sh       # 只跑移植到上游 llama.cpp 的那个分支（llama.cpp/README.md 的设置）
 ~/abyss-tools/benchmark/compare-runs.sh ~/abyss-eval/bench-1109-0136 ~/abyss-eval/bench-1110-0002   # 两次运行的生产并排比
+~/abyss-tools/benchmark/compare-runs.sh ~/abyss-eval/bench-1110-0002 ~/abyss-eval/bench-1112-2206 fork port   # 旧运行的生产对新运行的移植分支
 ```
 
-- `servers.sh`：起停三种服务器（`fork` 生产、`up` 上游、`tiny` CPU 小模型），记加载时间和两卡显存峰值。
+- `servers.sh`：起停四种服务器（`fork` 生产、`up` 上游、`port` 移植到上游的分支、`tiny` CPU 小模型），记加载时间和两卡显存峰值。
 - `mlperf/run.sh`、`agentx/run.sh`、`tracelab/run.sh`：对一个 URL 跑一个 benchmark；`MLPERF_IDS` 换对话，`AGENTX_DURATION`、`AGENTX_SEED`（TraceLab 是 `TRACELAB_DURATION`、`TRACELAB_SEED`，`TRACELAB_DATA` 换数据文件）换窗口和种子。
 - `tracelab/filter.py IN OUT --max N`：用读取器自己的步骤（按会话分组、子代理挂到父会话、每棵树的峰值）写出峰值不超过 N 的树，要用 agx 环境的 python。
 - `mlperf/subset.py stats` 按客户端的拼法和官方对话模板数每段对话最长一次请求的 token 数：113 条编程轨迹里 25 条超过 196,608，85 条在 190,000 以内；客服对话 3.1–4.4 万。
 - `compare.py`：从两边的原始结果出对比表（TraceLab 用 AgentX 的汇总）。
 - `agentx/pairs.py`：两次 AgentX（或 TraceLab）运行只比两边都测到的请求。窗口是固定的，快的一边会多测到后面的请求，整体的百分位数不能直接比。
-- `compare-runs.sh OLD NEW [SERVER]`：两次 `run.sh` 里同一个服务器（默认 `fork`）的结果并排比：`compare.py` 的表，两列是两次运行；AgentX、TraceLab 再用 `pairs.py` 比两次都测到的请求。
+- `compare-runs.sh OLD NEW [SERVER [NEW_SERVER]]`：两次 `run.sh` 里同一个服务器（默认 `fork`；给了 `NEW_SERVER` 就是旧运行的 `SERVER` 对新运行的 `NEW_SERVER`）的结果并排比：`compare.py` 的表，两列是两次运行；AgentX、TraceLab 再用 `pairs.py` 比两次都测到的请求。
 
 依赖（都在 blackwell 的 `~/abyss-tools/bench`）：MLPerf 客户端 `endpoints`（`uv sync`，520eb4d）和数据集（SHA-256 `1beb24c8…`），AgentX 客户端 `agx`（`pip install agentx-harness==1.0.13`），TraceLab 语料 `tracelab/syfi_coding_trace.jsonl.gz`（release v0.0.1，SHA-256 `9d265eae…`）和 `filter.py` 从它筛出的 `syfi_coding_trace-190k.jsonl.gz`，带官方对话模板的分词器 `dsv41-tokenizer`（`deepseek-ai/DeepSeek-V4.1-Flash` 的 tokenizer 文件）。客户端和服务器在同一台机器上，MLPerf 客户端原本会把自己绑到最快的 5 个核上，配置里关掉了。
 
 ## 结果
+
+### 2026-11-12：移植到上游 llama.cpp 的分支
+
+22:06 到 22:57（`~/abyss-eval/bench-1112-2206`，生产停了 51 分钟）。只跑移植分支（`SERVERS=port`：`~/src/llama.cpp-abyss` 的 `abyss-port`，补丁和设置见 [llama.cpp/README.md](../llama.cpp/README.md)，专家缓存 20900 MiB），和 11-10 的生产比（`compare-runs.sh … fork port`，对比表存成 `compare-vs-1110-fork.md`）；生产从 11-10 起没有变。三个都没有失败的请求，加载 48 s，显存峰值 96,069 / 95,271 MiB（生产 96,698 / 95,935）。
+
+| | 移植分支 | 生产（11-10） |
+|---|---:|---:|
+| MLPerf 子集 TTFT 中位数 / 平均 / p90 (s) | 1.38 / 2.23 / 3.96 | 1.37 / 2.21 / 4.08 |
+| MLPerf 子集每个输出 token，中位数 (ms) | 19.9 | 20.4 |
+| MLPerf 子集每轮延迟平均 (s) | 14.8 | 14.2 |
+| MLPerf 子集端到端交互速度 (tok/s) | 43.15 | 42.94 |
+| MLPerf 子集内联准确率 | 0.58 | 0.58 |
+| AgentX 30 个相同请求的 TTFT 中位数 / 平均 (s) | 3.19 / 19.5 | 3.22 / 19.9 |
+| AgentX 输出 token 间隔平均 (ms) | 18.7 | 19.4 |
+| AgentX 请求时间合计 (s) | 1,247 | 1,297 |
+| TraceLab 33 个相同请求的 TTFT 中位数 / 平均 (s) | 9.50 / 10.68 | 9.26 / 10.25 |
+| TraceLab 输出 token 间隔平均 (ms) | 18.8 | 20.0 |
+| TraceLab 请求时间合计 (s) | 721 | 729 |
+
+输出 token 的间隔三个都短 3–6%（解码快），首 token 时间 MLPerf 和 AgentX 持平。TraceLab 的首 token 慢 0.24 s（中位数）：它每轮要重算 1.4–2.3 万 token（见 11-09），这种中长的重算上移植分支比生产慢约 3%，和单独测的长提示词一致（9.6 万 27.6 对 26.8 s）；预热时冷算 14.4 万 token 的前缀 45.1 对 44.3 s，AgentX 的 6.6 万 21.2 对 20.1 s。MLPerf 每轮延迟高 4% 是这次模型每轮多写了 5% 的 token（温度 1.0，两次输出不同）。
 
 ### 2026-11-10：生产上了 0046
 
