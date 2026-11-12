@@ -690,7 +690,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // op, is not a missing-support fallback. It happens when every input of the node was produced on the previous
             // layer's device, as with the hyper-connection pre-mix of DeepSeek V4.1 at the first layer of the next GPU;
             // the unfused chain would sit there too
-            const bool sibling_ok = device_fused != nullptr && device_layer != nullptr && device_fused != device_layer &&
+            // (ABYSS_FUSED_SIBLING=1)
+            static const bool sibling_on = [] {
+                const char * e = getenv("ABYSS_FUSED_SIBLING");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            const bool sibling_ok = sibling_on && device_fused != nullptr && device_layer != nullptr && device_fused != device_layer &&
                 ggml_backend_dev_type(device_fused) == ggml_backend_dev_type(device_layer) &&
                 ggml_backend_dev_supports_op(device_fused, node.tensor);
             if (sibling_ok) {
