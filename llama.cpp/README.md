@@ -1,107 +1,84 @@
-# 上游 llama.cpp 补丁（移植中）
+# 移植到上游 llama.cpp
 
-把 [mx-llama.cpp/](../mx-llama.cpp/README.md) 里的改动移到上游 [llama.cpp](https://github.com/ggml-org/llama.cpp) 上，基于提交 `2cbe0ec`（2026-11-11）。mx-llama.cpp 从 2026-10-15 起基本没有再更新，上游这段时间自己加了 DeepSeek V4.1、稀疏注意力索引器、专家缓存的 CPU 分担等，所以这里只搬上游没有的部分；每一步在真模型上和生产（mx-llama.cpp 上的那一套）对比过再往下走，做法和数据见 [CLAUDE.md](../CLAUDE.md) 的「移植到上游 llama.cpp」。生产仍在 mx-llama.cpp 上。
+把 [mx-llama.cpp/](../mx-llama.cpp/README.md) 里的改动移到上游 [llama.cpp](https://github.com/ggml-org/llama.cpp) 上，基于提交 `2cbe0ec`（2026-11-11）。mx-llama.cpp 从 2026-10-15 起基本没有再更新，上游这段时间自己加了 DeepSeek V4.1、稀疏注意力索引器、专家缓存的 CPU 分担等，所以这里只搬上游没有的部分；每一步在真模型上和 mx-llama.cpp 上的那一套对比过再往下走，做法和数据见 [CLAUDE.md](../CLAUDE.md) 的「移植到上游 llama.cpp」。2026-11-12 起生产在它上面试运行。
+
+## 代码在 `llama-cpp` 分支
+
+代码不放在这个目录里，在本仓库的 `llama-cpp` 分支：根提交 `acf7981` 是上游 `2cbe0ec` 的文件树（不带上游的历史），上面每项改动一个提交，共 36 个，和 main 没有共同祖先。提交说明按上游的格式写（`<模块> : 标题`、正文、`Assisted-by:`）。
+
+这个分支由 [mirror.sh](mirror.sh) 从 blackwell 上的移植分支（`~/src/llama.cpp-abyss` 的 `abyss-port`，带上游的完整历史）生成：在那边跑，打成 bundle，这边 `git fetch <bundle> llama-cpp-mirror:llama-cpp`。每个提交的内容都取自移植分支，重跑得到同样的提交。本页的表由 [update.py](update.py) 从分支生成。
 
 「对应」一栏是 mx-llama.cpp 那边的补丁号；写「重写」的是做法按上游的结构重新写的，空着的是上游这边才需要的。
 
-| 文件 | 对应 | 作用 |
-|---|---|---|
-| **第 1 步：能直接搬的** | | |
-| `0001-sched-reserve-size-reset.patch` | 0013 | 修 `ggml_backend_sched_reserve_size`：它在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端 |
-| `0002-bench-moe-cache.patch` | 0021 | `llama-bench` 从环境变量 `LLAMA_ARG_MOE_CACHE_MIB` 读专家缓存大小 |
-| `0003-dist-vec.patch` | 0029 | CPU 采样向量化（`ABYSS_DIST_VEC=1`） |
-| `0004-sample-fast.patch` | 0035 | 采样快路径：采样链只剩 dist 或贪心时直接在 logits 上抽（`ABYSS_SAMPLE_FAST=1`） |
-| `0005-engram-keepalive.patch` | 0039 | 解码时每隔几毫秒读一次 Engram 表所在的盘，不让它进省电状态（`ABYSS_ENGRAM_KEEPALIVE_MS=N`） |
-| `0006-prompt-cache-usable-tokens.patch` | 0012 | server 的 prompt 缓存按「能直接用上的 token 数」在槽位和内存缓存之间挑 |
-| `0007-slot-save-thin-checkpoints.patch` | 0017 | 槽位被只共享开头一段的请求占用前先存进内存缓存（`ABYSS_SLOT_SAVE_LOST`）；检查点列表满时的删减间距（`ABYSS_CKPT_THIN_STEP`） |
-| `0008-continue-slot-end-gen-checkpoints.patch` | 0041 | 生成过程中每 N 个 token 存一个检查点，回答被重新分词后还能从中间接着算（`ABYSS_GEN_CKPT=N`）；每个请求打印从哪里接着算。上游已经让 V4.1 从槽位末尾接着算，`ABYSS_CKPT_CONTINUE` 不再起作用 |
-| `0009-prefill-tail-one-pass-server.patch` | 0015 的 server 部分 | 提示词最后 T 个 token 里不再拆调用（`ABYSS_CKPT_TAIL_MERGE=T`） |
-| `0010-ckpt-count-start.patch` | 0045 | 按检查点步长拆调用时把这次调用开头的检查点算进去，不再多出几百 token 的小调用（`ABYSS_CKPT_COUNT_START=1`）；每个请求打印调用和检查点 |
-| `0011-hc-ksplit.patch` | 0027 | 超连接混合系数的 K 切分（`ABYSS_HC_KSPLIT=1`） |
-| `0012-shared-ptr-checkpoints.patch` |  | 上面几个补丁在上游上的修正：检查点列表在上游是 `shared_ptr`，也没有 fork 的无损存储标志 |
-| **第 2 步：CED 预填充** | | |
-| `0013-ced-prefill.patch` | 0003、0005、0015、0019 重写 | CED 感知预填充：解码器层只对后面还看得到的 token 算查询和 FFN（`ABYSS_CED_PREFILL=1`），一次调用的余数放进第一个 ubatch（`ABYSS_CED_ALIGN=1`），`ABYSS_CED_DEBUG=1` 打印每个 ubatch 各层留几个 token。每层保留的总是每个 ubatch 末尾的 token，图里直接取视图；只支持单序列 |
-| `0014-ced-test-fixture.patch` |  | `tests/test-llama-archs` 加一个适合测 CED 的 V4.1 小模型配置（`ABYSS_TEST_DSV41_CED=1`，`-o <目录>` 写出），`tools/eval/ced-tiny.sh` 用它 |
-| **第 3 步：专家延后、准入门、解码统计** | | |
-| `0015-fused-op-sibling-gpu.patch` |  | 层分到两张卡时，下一张卡第一层的 HC pre 被调度器放在上一张卡，上游因此把 HC pre 的内核融合对整个模型关掉；同类设备、支持这个算子就接受（mx-llama.cpp 里原有的判定） |
-| `0016-moe-defer.patch` | 0025 重写 | 专家延后：单 token 解码时 CPU 算的专家晚一层加回残差（`ABYSS_MOE_DEFER=1`）；靠计算图的顺序和上游调度器已有的提前取回，不改调度器。`=2` 在本层就加回，用来检查接线 |
-| `0017-decode-stats.patch` | 0016 | 解码统计行（`ABYSS_DECODE_STATS=N`），计数接上游专家缓存的统计 |
-| `0018-ced-debug-log-level.patch` |  | `ABYSS_CED_DEBUG` 的行用 server 默认会显示的日志级别 |
-| `0019-moe-admit-gate.patch` | 0030 的准入门 | 专家缓存的准入门：要挤掉的专家不比未命中的冷，就把未命中交给 CPU（`ABYSS_MOE_ADMIT_GATE=1`，值是比较时的系数），接在上游的 ClassLRU 上 |
-| `0020-fused-op-sibling-switch.patch` |  | 0015 的判定加开关（`ABYSS_FUSED_SIBLING=1`） |
-| **第 3 步：计算缓冲区** | | |
-| `0021-query-chunks.patch` | 0020 重写 | 一层的查询分块打分、建掩码、做注意力（`ABYSS_DSV41_CHUNK=N`），打分和掩码只在一块的时间里存在；19.2 万上下文时 GPU1 计算缓冲区 6.6 → 2.8 GB（N=512） |
-| `0022-alloc-trace.patch` | 0019 的跟踪部分 | `GGML_ALLOC_TRACE=1` 打印计算图分配器的每次分配和释放，配 `tools/eval/alloc_peak.py` |
-| `0023-candidate-mask-constants.patch` |  | 候选块掩码的常量从一个元素 repeat 出来，不再是从图开始占到结束的叶子（计算缓冲区 −832 MiB） |
-| **第 3 步：预填充的大批次** | | |
-| `0024-test-fixture-router-ramp.patch` |  | 0014 的小模型配置把路由偏置的斜坡改小，token 才会选不同的专家 |
-| `0025-weight-nowait.patch` | 0046 | 调度器把主机权重交给复制回调之前不先等这张卡（`ABYSS_WEIGHT_NOWAIT=1`） |
-| `0026-moe-big-split.patch` | 0014 重写 | 预填充的大批次里 token 少的专家交给 CPU 的紧凑批次，其余照常上传（`ABYSS_MOE_BIG_SPLIT=1`）；CPU 的那些位置在设备上改算一个反正要上传的专家，结果用掩码丢掉 |
-| **第 4 步：两卡流水线** | | |
-| `0027-prefill-overlap.patch` | 0044 重写 | 长提示词两卡流水线（`ABYSS_OVERLAP=1`，配 `CUDA_SCALE_LAUNCH_QUEUES=4x`）：计算缓冲区重排时只在缓冲区要变大才停设备，0 字节的输入不拷也不等 |
-| `0028-sync-trace.patch` | 0044 的跟踪部分 | `ABYSS_SYNC_TRACE=<ms>` 打印调度器里每次不短于这么久的等待 |
-| **对话提示词的编码（第 1 步里要重做的）** | | |
-| `0029-plain-request-text.patch` | 0018 | 对话提示词里来自请求的文字只按基础词表编码，只有模板自己写的控制 token 按 ID 编码（`ABYSS_PLAIN_INPUT=1`）；哪些文字来自请求用上游提示词 parts 的标记，补上 `tojson`、数组 `join` 的标记传递。`llama-abyss-chat-tokens` 只读词表，打印 chat 路径的提示词和 token |
-| `0030-v41-template-effort-levels.patch` |  | V4.1 的模板自己认 minimal、medium、xhigh 时，思考强度原样交给模板；上游为官方模板把它们换成 low、默认、max |
-| **解码：输出层分两卡、矩阵乘尾部、注意力和超连接的小内核** | | |
-| `0031-head-split.patch` | 0034 | 输出层的前 F 行另放一份到另一张卡，单个输出时两张卡各算一部分 logits（`ABYSS_HEAD_SPLIT=F`）。调度器加 `overlap_gpus`：GPU 的段接在另一张 GPU 的段后面时主机不等，跨卡输入的拷贝在 GPU 上等目标卡的事件 |
-| `0032-head-split-only.patch` | 0040 | 输出层不整张加载，两部分从文件直接读到两张卡（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`），每批最多每个序列一个输出；GPU1 少 631 MiB |
-| `0033-mmvq-tail.patch` | 0036 的矩阵乘部分 | 单列的量化矩阵乘在整块的 K 循环比单个 warp 多跨 25% 以上时也用每块多行的 `small_k`（`ABYSS_MMVQ_TAIL=1`）；`small_k` 下 MXFP4、Q8_0 每块行数加倍，MXFP4 从对齐的 32 位字取。`test-backend-ops` 加本模型解码的矩阵乘形状作性能用例 |
-| `0034-dsv41-window-rows.patch` | 0032 里注意力拼装的那部分，做法不同 | 单个 token 的注意力只读滑窗里的行（`ABYSS_DSV41_WINDOW_ROWS=1`）：上游的滑窗缓存有 n_swa + n_ubatch 行（128 + 2,048），解码时整块交给注意力、靠掩码挡掉，每层对 2,816 行算；改成给一份滑窗的行号表和对应的掩码，图里按表取行，每层 768 行 |
-| `0035-hc-gate-fuse.patch` | mx-llama.cpp 自带的融合 | 超连接的门 sigmoid(x·s + b)·scale + bias 由四个逐元素内核合成一个（`ABYSS_HC_GATE_FUSE=1`），数值逐位相同；每 token 少约 480 个内核 |
-| **预填充的大批次用缓存** | | |
-| `0036-moe-big-cache.patch` | 0023 重写 | 预填充的大批次里，缓存里已有的专家用槽位在缓存所在的卡上直接算（`ABYSS_MOE_BIG_CACHE=1`，配 `ABYSS_MOE_BIG_SPLIT=1`），只有缓存里没有的才上传或交给 CPU；不在缓存里的（token, 专家）对在那张卡上读全零槽位 |
+| # | 提交 | 对应 | 作用 |
+|---:|---|---|---|
+| | **第 1 步：能直接搬的** | | |
+| 1 | `5012ad8` ggml : reset the scheduler after the split in ggml_backend_sched_reserve_size | 0013 | 修 `ggml_backend_sched_reserve_size`：它在切分计算图之前重置调度器，清掉了构建计算图时手动指定的后端 |
+| 2 | `545da06` llama-bench : read the MoE cache size from LLAMA_ARG_MOE_CACHE_MIB | 0021 | `llama-bench` 从环境变量 `LLAMA_ARG_MOE_CACHE_MIB` 读专家缓存大小 |
+| 3 | `a553d2c` sampling : vectorize the dist sampler | 0029 | CPU 采样向量化（`ABYSS_DIST_VEC=1`） |
+| 4 | `5951dc1` sampling : sample from the logits when the chain is only dist or greedy | 0035 | 采样快路径：采样链只剩 dist 或贪心时直接在 logits 上抽（`ABYSS_SAMPLE_FAST=1`） |
+| 5 | `96d2d3c` llama : keep the drive of the Engram table awake while decoding | 0039 | 解码时每隔几毫秒读一次 Engram 表所在的盘，不让它进省电状态（`ABYSS_ENGRAM_KEEPALIVE_MS=N`） |
+| 6 | `c19a8c6` server : pick the cached prompt that serves the most tokens | 0012 | server 的 prompt 缓存按「能直接用上的 token 数」在槽位和内存缓存之间挑 |
+| 7 | `2de8f00` server : save a slot before a task that loses most of it | 0017 | 槽位被只共享开头一段的请求占用前先存进内存缓存（`ABYSS_SLOT_SAVE_LOST`）；检查点列表满时的删减间距（`ABYSS_CKPT_THIN_STEP`） |
+| 8 | `6f14dd4` server : make checkpoints inside the answer | 0041 | 生成过程中每 N 个 token 存一个检查点，回答被重新分词后还能从中间接着算（`ABYSS_GEN_CKPT=N`）；每个请求打印从哪里接着算。上游已经让 V4.1 从槽位末尾接着算，`ABYSS_CKPT_CONTINUE` 不再起作用 |
+| 9 | `9b76262` server : keep the tail of a prompt in one llama_decode call | 0015 的 server 部分 | 提示词最后 T 个 token 里不再拆调用（`ABYSS_CKPT_TAIL_MERGE=T`） |
+| 10 | `5b3d4eb` server : count the checkpoint a prompt batch makes at its start | 0045 | 按检查点步长拆调用时把这次调用开头的检查点算进去，不再多出几百 token 的小调用（`ABYSS_CKPT_COUNT_START=1`）；每个请求打印调用和检查点 |
+| 11 | `2699666` cuda : fold rms_norm into a split-K mul_mat for the hyper-connection mixes | 0027 | 超连接混合系数的 K 切分（`ABYSS_HC_KSPLIT=1`） |
+| 12 | `d8eaad8` server : adapt the checkpoint changes to shared-pointer checkpoints |  | 上面几个提交在上游上的修正：检查点列表在上游是 `shared_ptr`，也没有 fork 的无损存储标志 |
+| | **第 2 步：CED 预填充** | | |
+| 13 | `3bd98bf` llama : add a CED-aware prefill for DeepSeek V4.1 | 0003、0005、0015、0019 重写 | CED 感知预填充：解码器层只对后面还看得到的 token 算查询和 FFN（`ABYSS_CED_PREFILL=1`），一次调用的余数放进第一个 ubatch（`ABYSS_CED_ALIGN=1`），`ABYSS_CED_DEBUG=1` 打印每个 ubatch 各层留几个 token。每层保留的总是每个 ubatch 末尾的 token，图里直接取视图；只支持单序列 |
+| 14 | `6e390f7` tests : add a DeepSeek V4.1 fixture for the CED-aware prefill |  | `tests/test-llama-archs` 加一个适合测 CED 的 V4.1 小模型配置（`ABYSS_TEST_DSV41_CED=1`，`-o <目录>` 写出），`tools/eval/ced-tiny.sh` 用它 |
+| | **第 3 步：专家延后、准入门、解码统计** | | |
+| 15 | `8ff9692` llama : keep a fused op whose node runs on a sibling GPU |  | 层分到两张卡时，下一张卡第一层的 HC pre 被调度器放在上一张卡，上游因此把 HC pre 的内核融合对整个模型关掉；同类设备、支持这个算子就接受（mx-llama.cpp 里原有的判定） |
+| 16 | `b942e1c` llama : defer the experts computed on the CPU by one sublayer | 0025 重写 | 专家延后：单 token 解码时 CPU 算的专家晚一层加回残差（`ABYSS_MOE_DEFER=1`）；靠计算图的顺序和上游调度器已有的提前取回，不改调度器。`=2` 在本层就加回，用来检查接线 |
+| 17 | `5575c07` llama : log statistics of the single-token decodes | 0016 | 解码统计行（`ABYSS_DECODE_STATS=N`），计数接上游专家缓存的统计 |
+| 18 | `5d69b60` llama : log the ABYSS_CED_DEBUG lines at a level a server shows |  | `ABYSS_CED_DEBUG` 的行用 server 默认会显示的日志级别 |
+| 19 | `e861a45` moe-cache : add an admission gate | 0030 的准入门 | 专家缓存的准入门：要挤掉的专家不比未命中的冷，就把未命中交给 CPU（`ABYSS_MOE_ADMIT_GATE=1`，值是比较时的系数），接在上游的 ClassLRU 上 |
+| 20 | `d72f745` llama : accept a fused op on a sibling GPU only with ABYSS_FUSED_SIBLING=1 |  | 第 15 个提交的判定加开关（`ABYSS_FUSED_SIBLING=1`） |
+| | **第 3 步：计算缓冲区** | | |
+| 21 | `4349d1c` deepseek41 : score, mask and attend the queries of a layer in chunks | 0020 重写 | 一层的查询分块打分、建掩码、做注意力（`ABYSS_DSV41_CHUNK=N`），打分和掩码只在一块的时间里存在；19.2 万上下文时 GPU1 计算缓冲区 6.6 → 2.8 GB（N=512） |
+| 22 | `58d98d4` ggml : trace the graph allocator with GGML_ALLOC_TRACE=1 | 0019 的跟踪部分 | `GGML_ALLOC_TRACE=1` 打印计算图分配器的每次分配和释放，配 `tools/eval/alloc_peak.py` |
+| 23 | `b0bd81a` deepseek41 : repeat the candidate block masks from one element |  | 候选块掩码的常量从一个元素 repeat 出来，不再是从图开始占到结束的叶子（计算缓冲区 −832 MiB） |
+| | **第 3 步：预填充的大批次** | | |
+| 24 | `f235039` tests : keep the router bias ramp of the CED fixture small |  | 第 14 个提交的小模型配置把路由偏置的斜坡改小，token 才会选不同的专家 |
+| 25 | `7ddcb69` ggml : call the copy callback of a host weight before the wait for its backend | 0046 | 调度器把主机权重交给复制回调之前不先等这张卡（`ABYSS_WEIGHT_NOWAIT=1`） |
+| 26 | `2d002e1` moe-cache : split large batches between the uploads and the CPU | 0014 重写 | 预填充的大批次里 token 少的专家交给 CPU 的紧凑批次，其余照常上传（`ABYSS_MOE_BIG_SPLIT=1`）；CPU 的那些位置在设备上改算一个反正要上传的专家，结果用掩码丢掉 |
+| | **第 4 步：两卡流水线** | | |
+| 27 | `3a7e802` ggml : keep the devices computing across the ubatches of a long prompt | 0044 重写 | 长提示词两卡流水线（`ABYSS_OVERLAP=1`，配 `CUDA_SCALE_LAUNCH_QUEUES=4x`）：计算缓冲区重排时只在缓冲区要变大才停设备，0 字节的输入不拷也不等 |
+| 28 | `0cb5cf4` ggml : print the long waits of the scheduler with ABYSS_SYNC_TRACE=<ms> | 0044 的跟踪部分 | `ABYSS_SYNC_TRACE=<ms>` 打印调度器里每次不短于这么久的等待 |
+| | **对话提示词的编码（第 1 步里要重做的）** | | |
+| 29 | `abc55ee` chat : encode the text of the request with the base vocabulary alone | 0018 | 对话提示词里来自请求的文字只按基础词表编码，只有模板自己写的控制 token 按 ID 编码（`ABYSS_PLAIN_INPUT=1`）；哪些文字来自请求用上游提示词 parts 的标记，补上 `tojson`、数组 `join` 的标记传递。`llama-abyss-chat-tokens` 只读词表，打印 chat 路径的提示词和 token |
+| 30 | `a45e84d` chat : pass minimal, medium and xhigh to a V4.1 template that names them |  | V4.1 的模板自己认 minimal、medium、xhigh 时，思考强度原样交给模板；上游为官方模板把它们换成 low、默认、max |
+| | **解码：输出层分两卡、矩阵乘尾部、注意力和超连接的小内核** | | |
+| 31 | `5ba3b3b` llama : compute the logits of one output on two GPUs | 0034 | 输出层的前 F 行另放一份到另一张卡，单个输出时两张卡各算一部分 logits（`ABYSS_HEAD_SPLIT=F`）。调度器加 `overlap_gpus`：GPU 的段接在另一张 GPU 的段后面时主机不等，跨卡输入的拷贝在 GPU 上等目标卡的事件 |
+| 32 | `6e32865` llama : load the output head only as its two parts | 0040 | 输出层不整张加载，两部分从文件直接读到两张卡（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`），每批最多每个序列一个输出；GPU1 少 631 MiB |
+| 33 | `7541c27` cuda : take the small_k path of mul_mat_vec_q for a short last K iteration | 0036 的矩阵乘部分 | 单列的量化矩阵乘在整块的 K 循环比单个 warp 多跨 25% 以上时也用每块多行的 `small_k`（`ABYSS_MMVQ_TAIL=1`）；`small_k` 下 MXFP4、Q8_0 每块行数加倍，MXFP4 从对齐的 32 位字取。`test-backend-ops` 加本模型解码的矩阵乘形状作性能用例 |
+| 34 | `625f92b` deepseek41 : attend a single token over the rows of its window only | 0032 里注意力拼装的那部分，做法不同 | 单个 token 的注意力只读滑窗里的行（`ABYSS_DSV41_WINDOW_ROWS=1`）：上游的滑窗缓存有 n_swa + n_ubatch 行（128 + 2,048），解码时整块交给注意力、靠掩码挡掉，每层对 2,816 行算；改成给一份滑窗的行号表和对应的掩码，图里按表取行，每层 768 行 |
+| 35 | `767da04` cuda : fuse the gate of the DeepSeek V4 hyper-connections into one kernel | mx-llama.cpp 自带的融合 | 超连接的门 sigmoid(x·s + b)·scale + bias 由四个逐元素内核合成一个（`ABYSS_HC_GATE_FUSE=1`），数值逐位相同；每 token 少约 480 个内核 |
+| | **预填充的大批次用缓存** | | |
+| 36 | `2e4ccc9` moe-cache : compute the cached experts of a large batch from their slots | 0023 重写 | 预填充的大批次里，缓存里已有的专家用槽位在缓存所在的卡上直接算（`ABYSS_MOE_BIG_CACHE=1`，配 `ABYSS_MOE_BIG_SPLIT=1`），只有缓存里没有的才上传或交给 CPU；不在缓存里的（token, 专家）对在那张卡上读全零槽位 |
 
-mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0022（大批次统计）、0033（server 计时）。
+mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037；定了不搬的：0001、0026（专家统计，切换后不带 `ABYSS_EXPERT_STATS`）。还没搬的：0007（`llama-abyss-dump`）、0022（大批次统计）、0033（server 计时）。
 
 ## 安装
 
 ```bash
-git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout 2cbe0ec
-git am <abyss>/llama.cpp/0001-sched-reserve-size-reset.patch \
-  <abyss>/llama.cpp/0002-bench-moe-cache.patch \
-  <abyss>/llama.cpp/0003-dist-vec.patch \
-  <abyss>/llama.cpp/0004-sample-fast.patch \
-  <abyss>/llama.cpp/0005-engram-keepalive.patch \
-  <abyss>/llama.cpp/0006-prompt-cache-usable-tokens.patch \
-  <abyss>/llama.cpp/0007-slot-save-thin-checkpoints.patch \
-  <abyss>/llama.cpp/0008-continue-slot-end-gen-checkpoints.patch \
-  <abyss>/llama.cpp/0009-prefill-tail-one-pass-server.patch \
-  <abyss>/llama.cpp/0010-ckpt-count-start.patch \
-  <abyss>/llama.cpp/0011-hc-ksplit.patch \
-  <abyss>/llama.cpp/0012-shared-ptr-checkpoints.patch \
-  <abyss>/llama.cpp/0013-ced-prefill.patch \
-  <abyss>/llama.cpp/0014-ced-test-fixture.patch \
-  <abyss>/llama.cpp/0015-fused-op-sibling-gpu.patch \
-  <abyss>/llama.cpp/0016-moe-defer.patch \
-  <abyss>/llama.cpp/0017-decode-stats.patch \
-  <abyss>/llama.cpp/0018-ced-debug-log-level.patch \
-  <abyss>/llama.cpp/0019-moe-admit-gate.patch \
-  <abyss>/llama.cpp/0020-fused-op-sibling-switch.patch \
-  <abyss>/llama.cpp/0021-query-chunks.patch \
-  <abyss>/llama.cpp/0022-alloc-trace.patch \
-  <abyss>/llama.cpp/0023-candidate-mask-constants.patch \
-  <abyss>/llama.cpp/0024-test-fixture-router-ramp.patch \
-  <abyss>/llama.cpp/0025-weight-nowait.patch \
-  <abyss>/llama.cpp/0026-moe-big-split.patch \
-  <abyss>/llama.cpp/0027-prefill-overlap.patch \
-  <abyss>/llama.cpp/0028-sync-trace.patch \
-  <abyss>/llama.cpp/0029-plain-request-text.patch \
-  <abyss>/llama.cpp/0030-v41-template-effort-levels.patch \
-  <abyss>/llama.cpp/0031-head-split.patch \
-  <abyss>/llama.cpp/0032-head-split-only.patch \
-  <abyss>/llama.cpp/0033-mmvq-tail.patch \
-  <abyss>/llama.cpp/0034-dsv41-window-rows.patch \
-  <abyss>/llama.cpp/0035-hc-gate-fuse.patch \
-  <abyss>/llama.cpp/0036-moe-big-cache.patch
+git clone --single-branch -b llama-cpp <本仓库> llama.cpp-abyss && cd llama.cpp-abyss   # 或在本仓库里：git worktree add ../llama.cpp-abyss llama-cpp
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target test-llama-archs llama-fit-params   # tools/eval/ced-tiny.sh、fit-print.sh 用，可选
 ```
 
+要把这些提交放到带完整历史的上游克隆上，先导出成补丁再打上：
+
+```bash
+git format-patch -o /tmp/abyss-patches acf7981..llama-cpp          # 在本仓库里
+cd <上游的克隆> && git checkout 2cbe0ec && git am /tmp/abyss-patches/*.patch
+```
+
 ## 使用
 
-模型要先用 `tools/convert/to_upstream.py` 改成上游读 V4.1 的布局（权重逐位相同，只改名和重组）。对话模板开头要有一行含字面 `｜DSML｜ calls>` 的注释，上游才按 V4.1 的标签名解析（`tools/eval/upstream-bench.sh` 里有做法）。到这一步为止测试用的设置：
+模型要先用 `tools/convert/to_upstream.py` 改成上游读 V4.1 的布局（权重逐位相同，只改名和重组）。对话模板开头要有一行含字面 `｜DSML｜ calls>` 的注释，上游才按 V4.1 的标签名解析（`tools/restart-server-port.sh` 里有做法，它就是按下面的设置启动生产的脚本）：
 
 ```bash
 GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \

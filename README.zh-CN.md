@@ -56,7 +56,7 @@ BIOS 里的 IOMMU 要关：开着时两卡之间的直接拷贝会返回成功�
 | 位置 | 内容 |
 |---|---|
 | [mx-llama.cpp/](mx-llama.cpp/README.md) | 46 个补丁（`0001`–`0046`）、V4.1 的对话模板和两个小工具；README 里有每个补丁的作用、开关和打补丁的命令 |
-| [llama.cpp/](llama.cpp/README.md) | 把这些改动移到上游 llama.cpp 上的补丁（移植中，基于上游提交 `2cbe0ec`）；生产仍在 mx-llama.cpp 上 |
+| [llama.cpp/](llama.cpp/README.md) | 把这些改动移到上游 llama.cpp 上：代码在本仓库的 `llama-cpp` 分支（上游提交 `2cbe0ec` 的文件树，上面每项改动一个提交），这个目录里是提交的对照表和设置。2026-11-12 起生产在它上面试运行 |
 | [tools/convert/](tools/convert) | 从官方权重转换 GGUF（`v41convert.py`）、换一个张量的类型、改成上游 llama.cpp 的布局 |
 | [tools/eval/](tools/eval) | 对拍、测速和剖析脚本 |
 | [tools/restart-server.sh](tools/restart-server.sh) | 生产 server 的启动脚本，带全部开关 |
