@@ -2121,6 +2121,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // abyss: ABYSS_WEIGHT_NOWAIT=1. A host weight handed to the copy callback is not waited for first: the callback queues
+    // its copies on the split backend, after the work that still uses the destination, and synchronizes itself where it
+    // reads from the device. The host then goes on to the next split, a CPU one for instance, while the device uploads
+    static int weight_nowait = -1;
+    if (weight_nowait < 0) {
+        const char * e = getenv("ABYSS_WEIGHT_NOWAIT");
+        weight_nowait = e != NULL && atoi(e) != 0;
+    }
+    const bool weight_cb = sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input);
+    if (weight_cb && weight_nowait &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2128,7 +2142,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (weight_cb && !weight_nowait &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return;
     }
