@@ -2156,6 +2156,57 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    // abyss: ABYSS_HEAD_SPLIT=F copies the first F of the output head's rows to the first other GPU, when the head is on
+    // a GPU; the graph then computes the logits of a single output on both at once, those rows from the copy (deepseek41)
+    if (const char * e = getenv("ABYSS_HEAD_SPLIT"); e != nullptr && output != nullptr && output->buffer != nullptr &&
+            !ggml_backend_buffer_is_host(output->buffer)) {
+        const double frac = atof(e);
+        ggml_backend_dev_t dev_out = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
+        ggml_backend_dev_t dev_split = nullptr;
+        for (const auto & d : devices) {
+            if (!d.is_meta && d.dev != dev_out && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                dev_split = d.dev;
+                break;
+            }
+        }
+        const int64_t n_rows  = output->ne[1];
+        const int64_t n_split = std::clamp<int64_t>(llround(frac * n_rows), 0, n_rows);
+        if (dev_split != nullptr && n_split > 0 && n_split < n_rows && ggml_is_contiguous(output)) {
+            ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(ip));
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_split);
+            ggml_set_name(t, "output_split.weight");
+            // a view made in the graph has no buffer yet, and the scheduler would place its product by its neighbours
+            ggml_tensor * rest = ggml_view_2d(ctx.get(), output, output->ne[0], n_rows - n_split, output->nb[1],
+                    n_split*output->nb[1]);
+            ggml_set_name(rest, "output_rest.weight");
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_dev_buffer_type(dev_split)));
+            // the allocation also initialises the view, on the head's buffer
+            if (buf && rest->buffer == nullptr) {
+                ggml_backend_view_init(rest);
+            }
+            if (buf && rest->buffer == output->buffer) {
+                ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<uint8_t> rows(ggml_nbytes(t));
+                ggml_backend_tensor_get(output, rows.data(), 0, rows.size());
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size());
+                output_split = t;
+                output_rest  = rest;
+                std::vector<ggml_backend_buffer_ptr> bufs;
+                bufs.emplace_back(std::move(buf));
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+                // the server does not show info logs of the library
+                fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT=%s, rows 0-%lld of %lld of the output head (%.1f MiB) also on %s\n",
+                        e, (long long) n_split - 1, (long long) n_rows, ggml_nbytes(t) / 1048576.0, ggml_backend_dev_name(dev_split));
+            } else {
+                fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT=%s, could not allocate %.1f MiB on %s, the head is not split\n",
+                        e, ggml_nbytes(t) / 1048576.0, ggml_backend_dev_name(dev_split));
+            }
+        } else {
+            fprintf(stderr, "abyss: ABYSS_HEAD_SPLIT=%s, no other GPU or no rows to split, the head is not split\n", e);
+        }
+    }
+
     return true;
 }
 

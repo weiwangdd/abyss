@@ -393,6 +393,13 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    // abyss: with enabled, a GPU split without inputs that follows a split of another GPU does not make the host wait for
+    // that split: the two GPUs' buffers are apart, and what a split reads of the other GPU is one of its inputs. An input
+    // from another GPU is copied on that GPU's stream after the stream has waited, on the GPUs, for the work queued on
+    // the split's GPU, instead of the host waiting for it. The two GPUs can then compute at the same time (the split
+    // output head, ABYSS_HEAD_SPLIT)
+    GGML_API void                 ggml_backend_sched_set_overlap_gpus(ggml_backend_sched_t sched, bool enabled);
+
     //
     // Meta backend
     //

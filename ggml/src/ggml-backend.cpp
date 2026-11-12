@@ -1233,6 +1233,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
+    bool overlap_gpus; // abyss: see ggml_backend_sched_set_overlap_gpus
+    ggml_backend_event_t overlap_events[GGML_SCHED_MAX_BACKENDS]; // abyss: for overlap_gpus, made when first needed
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2187,8 +2190,24 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // abyss: with overlap_gpus and no events of the copies, an input from another GPU is copied on that GPU's stream (the
+    // async copy below) after the stream has waited, on the GPUs, for the work queued on the split backend, instead of
+    // the host waiting for that work
+    ggml_backend_event_t overlap_event = NULL;
+    if (sched->overlap_gpus && sched->events[split_backend_id][sched->cur_copy] == NULL && input_backend != split_backend &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (sched->overlap_events[split_backend_id] == NULL) {
+            sched->overlap_events[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+        }
+        overlap_event = sched->overlap_events[split_backend_id];
+    }
+
     // wait for the split backend to finish using the input before overwriting it
-    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+    if (overlap_event != NULL) {
+        ggml_backend_event_record(overlap_event, split_backend);
+        ggml_backend_event_wait(input_backend, overlap_event);
+    } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
         ggml_backend_sched_wait(split_backend, "input", input);
@@ -2281,7 +2300,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // abyss: with overlap_gpus a GPU split after one of another GPU starts while that one still runs
+        const bool gpu_goes_on = sched->overlap_gpus && prev_backend_id >= 0 &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[prev_backend_id])) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            ggml_backend_get_device(split_backend) != ggml_backend_get_device(sched->backends[prev_backend_id]);
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !gpu_goes_on) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -2439,6 +2463,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
         ggml_backend_event_free(sched->prefetch_events[b]);
+        ggml_backend_event_free(sched->overlap_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2576,6 +2601,11 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
     sched->callback_realloc_user_data = user_data;
+}
+
+void ggml_backend_sched_set_overlap_gpus(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->overlap_gpus = enabled;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

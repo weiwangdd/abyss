@@ -802,6 +802,8 @@ void llama_context::sched_new(const sched_params & params) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    // abyss: the two parts of the split output head run at the same time (ABYSS_HEAD_SPLIT)
+    ggml_backend_sched_set_overlap_gpus(sched.get(), model.output_split != nullptr);
 
     sched_params_cur = params;
 }
@@ -3469,6 +3471,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // abyss: the split head's logits are joined on the GPU with the head's first rows (ABYSS_HEAD_SPLIT)
+        if (il == -1 && cur->op == GGML_OP_CONCAT && model.output_split != nullptr && strcmp(name, "result_output") == 0) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.output_split->buffer));
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                }
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

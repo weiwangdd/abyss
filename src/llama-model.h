@@ -799,6 +799,10 @@ struct llama_model {
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+    // abyss: ABYSS_HEAD_SPLIT, a copy of the head's first rows on another GPU and a view of the other rows, bound to the
+    // head's buffer so that the scheduler keeps their product on the head's GPU (llama_model_base::load_tensors)
+    struct ggml_tensor * output_split    = nullptr;
+    struct ggml_tensor * output_rest     = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

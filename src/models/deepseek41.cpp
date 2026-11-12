@@ -1143,7 +1143,17 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    // abyss: ABYSS_HEAD_SPLIT (llama_model::output_split): a single output's logits are computed on two GPUs at once,
+    // the first rows from the copy on the other GPU and the rest on the head's own, and joined on the other GPU (the
+    // context's graph callback puts the concat there, so that neither GPU waits for the other before its own rows);
+    // each row is the same dot product as before
+    if (model.output_split != nullptr && n_outputs == 1) {
+        ggml_tensor * rows_split = ggml_mul_mat(ctx0, model.output_split, cur);
+        ggml_tensor * rows_rest  = ggml_mul_mat(ctx0, model.output_rest, cur);
+        cur = ggml_concat(ctx0, rows_split, rows_rest, 0);
+    } else {
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
