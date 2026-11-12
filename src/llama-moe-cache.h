@@ -35,6 +35,22 @@ public:
     // computed by the CPU
     void small_counts(size_t & hits, size_t & uploaded, size_t & cpu) const;
 
+    // abyss: ABYSS_MOE_BIG_SPLIT=1. A batch too large for the cache uploads the experts it uses from host memory; with
+    // the split, the CPU computes the ones with the fewest tokens meanwhile, as a compact batch of (token, expert) pairs.
+    // big_split: whether layer il splits a batch of n_tokens
+    bool big_split(int32_t il, int64_t n_tokens) const;
+    // the plan, computed on the host from the selected experts ids [n_expert_used*n_tokens]: I32 [n + 3*big_cpu_rows()]
+    //   [0, n)        the expert the device computes for each pair; for a pair of the CPU, an expert the device uploads
+    //                 anyway, whose result big_mask() drops
+    //   then m each:  the token of each pair of the CPU, its expert (-1 for padding), and its index among the n pairs
+    //                 (n for padding)
+    ggml_tensor * build_big_plan(ggml_context * ctx, int32_t il, ggml_tensor * ids) const;
+    // F32 [1, n_expert_used, n_tokens]: 1 for the pairs the device computes, 0 for the CPU's
+    ggml_tensor * build_big_mask(ggml_context * ctx, ggml_tensor * plan, int64_t n_expert_used, int64_t n_tokens) const;
+    int64_t big_cpu_rows() const;
+    // for the copy of host weight w that follows a plan of its layer: the experts the device computes
+    bool big_used(const ggml_tensor * w, std::vector<bool> & used) const;
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 

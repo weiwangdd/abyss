@@ -2599,7 +2599,69 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    // abyss: ABYSS_MOE_BIG_SPLIT. A batch too large for the cache splits its experts between the uploads and the CPU, see
+    // llama_moe_cache::build_big_plan(). The plan and the mask go into the graph first: they run on the host, from the
+    // selected experts, before the device starts on the uploads
+    ggml_tensor * big_plan = nullptr;
+    ggml_tensor * big_mask = nullptr;
+    const int64_t big_n = n_expert_used*n_tokens;
+    const int64_t big_m = moe_cache != nullptr ? moe_cache->big_cpu_rows() : 0;
+    if (cache.slots == nullptr && can_cpu_share && moe_cache != nullptr && moe_cache->big_split(il, n_tokens) &&
+            (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) && type_op == LLM_FFN_SILU && gate_exps != nullptr &&
+            gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+            up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr && post_exp_norm == nullptr &&
+            n_expert_used == (int64_t) hparams.n_expert_used(il)) {
+        ggml_tensor * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ids = ggml_reshape_1d(ctx0, ids, big_n);
+        big_plan = moe_cache->build_big_plan(ctx0, il, ids);
+        ggml_format_name(big_plan, "ffn_moe_big_plan-%d", il);
+        big_mask = moe_cache->build_big_mask(ctx0, big_plan, n_expert_used, n_tokens);
+        ggml_format_name(big_mask, "ffn_moe_big_mask-%d", il);
+        ggml_backend_sched_set_tensor_backend(sched, big_plan, backend_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, big_mask, backend_cpu);
+        ggml_build_forward_expand(gf, big_mask);
+    }
+
+    ggml_tensor * experts = nullptr;
+    if (big_plan != nullptr) {
+        const size_t es = ggml_element_size(big_plan);
+        ggml_tensor * dev_ids = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, big_plan, big_n, 0), n_expert_used, n_tokens);
+        ggml_tensor * big_tok = ggml_view_1d(ctx0, big_plan, big_m, big_n*es);
+        ggml_tensor * big_exp = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, big_plan, big_m, (big_n + big_m)*es), 1, big_m);
+        ggml_tensor * big_dst = ggml_view_1d(ctx0, big_plan, big_m, (big_n + 2*big_m)*es);
+
+        // the device's experts, from the host weights it uploads. In the graph before the CPU's, which then run while
+        // these are uploaded
+        experts = build_experts(cur, selected_experts, dev_ids, false);
+        ggml_build_forward_expand(gf, experts);
+
+        // the CPU's pairs: the rows of their tokens, each through one expert. Pinned to the CPU: a device would take a
+        // batch of this size from host weights, and upload them
+        // (the rows are gathered on the CPU too: gathered on the device that uploads, they would wait for the uploads)
+        ggml_tensor * rows_c = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), big_tok); // [n_embd, m]
+        ggml_tensor * x      = ggml_reshape_3d(ctx0, rows_c, n_embd, 1, big_m);
+        ggml_tensor * up_c   = ggml_mul_mat_id(ctx0, up_exps,   x, big_exp);
+        ggml_tensor * gate_c = ggml_mul_mat_id(ctx0, gate_exps, x, big_exp);
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        ggml_tensor * act_c  = limit > 1e-6f ? ggml_swiglu_clamp(ctx0, gate_c, up_c, limit) : ggml_swiglu_split(ctx0, gate_c, up_c);
+        ggml_tensor * down_c = ggml_mul_mat_id(ctx0, down_exps, act_c, big_exp); // [n_embd, 1, m]
+        for (ggml_tensor * t : { rows_c, up_c, gate_c, act_c, down_c }) {
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+        }
+        cb(down_c, "ffn_moe_down_cpu", il);
+        ggml_build_forward_expand(gf, down_c);
+
+        // each pair is computed on one side: the device's result for a pair of the CPU is masked out, and the CPU's rows
+        // are scattered into zeros, the padding to a spare row. The zeros are repeated from one element: a new tensor
+        // that is only filled would be a leaf of the graph, allocated before its first node and kept to its end
+        ggml_tensor * zeros = ggml_repeat_4d(ctx0, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 0.0f), n_embd, big_n + 1, 1, 1);
+        ggml_tensor * rows  = ggml_set_rows(ctx0, zeros, ggml_reshape_2d(ctx0, down_c, n_embd, big_m), big_dst);
+        experts = ggml_add(ctx0, ggml_mul(ctx0, experts, big_mask),
+                ggml_view_3d(ctx0, rows, n_embd, n_expert_used, n_tokens, rows->nb[1], n_expert_used*rows->nb[1], 0));
+        cb(experts, "ffn_moe_down_big", il);
+    } else {
+        experts = build_experts(cur, selected_experts, cache.slots, true);
+    }
     ggml_tensor * experts_cpu = nullptr; // abyss: the misses computed from the host experts, when the caller adds them later
     if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
