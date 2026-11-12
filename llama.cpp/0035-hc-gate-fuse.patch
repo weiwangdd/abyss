@@ -1,0 +1,173 @@
+From f0e3c8994a3bb1d22d9f0ea5b95c7e184eb21456 Mon Sep 17 00:00:00 2001
+From: abyss <abyss@localhost>
+Date: Thu, 12 Nov 2026 20:53:18 +0100
+Subject: [PATCH] abyss: ABYSS_HC_GATE_FUSE=1 computes a gate of the DeepSeek
+ V4 hyper-connections, sigmoid(x*s + b)*scale + bias, in one CUDA kernel
+ instead of four, the same values (the fusion of mx-llama.cpp's softcap.cu)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 45 +++++++++++++++++++++
+ ggml/src/ggml-cuda/softcap.cu   | 72 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/softcap.cuh  |  6 +++
+ 3 files changed, 123 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 65c59cb..09c1426 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4107,6 +4107,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return false;
+     }
+ 
++    // abyss: ABYSS_HC_GATE_FUSE=1, the gates of the DeepSeek V4 hyper-connections. The bias of the gate arrives through
++    // a VIEW node that the graph builder places between the MUL and the ADD
++    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_VIEW && ops.begin()[2] == GGML_OP_ADD &&
++            ops.begin()[3] == GGML_OP_UNARY && ops.begin()[4] == GGML_OP_SCALE &&
++            unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
++        static const bool gate_fuse = [] {
++            const char * e = getenv("ABYSS_HC_GATE_FUSE");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (!gate_fuse || node_idx + 4 >= cgraph->n_nodes) {
++            return false;
++        }
++        for (int j = 0; j < 5; ++j) {
++            if (cgraph->nodes[node_idx + j]->op != ops.begin()[j]) {
++                return false;
++            }
++        }
++        // the VIEW of the bias weight is left out of the fused set: it computes nothing, and its source is a weight
++        const int          gate_idxs[4] = { node_idx, node_idx + 2, node_idx + 3, node_idx + 4 };
++        const enum ggml_op gate_ops[4]  = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
++        const int          gate_out[1]  = { node_idx + 4 };
++        if (!ggml_can_fuse_subgraph_ext(cgraph, gate_idxs, 4, gate_ops, gate_out, 1)) {
++            return false;
++        }
++        if (ggml_get_unary_op(cgraph->nodes[node_idx + 3]) != GGML_UNARY_OP_SIGMOID) {
++            return false;
++        }
++        if (cgraph->nodes[node_idx + 2]->src[1] != cgraph->nodes[node_idx + 1]) {
++            return false;
++        }
++        if (!ggml_cuda_should_fuse_mul_add_sigmoid_scale(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 2],
++                                                         cgraph->nodes[node_idx + 3], cgraph->nodes[node_idx + 4])) {
++            return false;
++        }
++        int out_nodes[] = { node_idx + 4 };
++        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
++    }
++
+     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+         return false;
+     }
+@@ -5116,6 +5154,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    // abyss: the gates of the DeepSeek V4 hyper-connections, sigmoid(x*s + b)*scale + bias: four elementwise launches
++    // per gate, two gates per sub-layer (ABYSS_HC_GATE_FUSE)
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
++        ggml_cuda_op_mul_add_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
++        return 4;
++    }
++
+     return 0;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/softcap.cu b/ggml/src/ggml-cuda/softcap.cu
+index 9f0fa10..7f3f114 100644
+--- a/ggml/src/ggml-cuda/softcap.cu
++++ b/ggml/src/ggml-cuda/softcap.cu
+@@ -35,3 +35,75 @@ void ggml_cuda_op_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst, gg
+ 
+     softcap_f32_cuda(src0_d, dst_d, scale, softcap, ggml_nelements(src0), stream);
+ }
++
++// abyss: fused GGML_OP_MUL (scalar) + GGML_OP_ADD (per-column bias) + GGML_UNARY_OP_SIGMOID + GGML_OP_SCALE, as
++// mx-llama.cpp has it. The DeepSeek V4 hyper-connection gates are sigmoid(x * s + b[i0]) * scale + bias on a
++// [n, n_tokens] view. Each step is kept as its own rounded operation so the result matches the four separate kernels
++// bit for bit.
++static __global__ void mul_add_sigmoid_scale_f32(
++        const float * x, const float * s, const float * b, float * dst,
++        const float scale, const float bias,
++        const int ne0, const int64_t s0, const int64_t s1, const int64_t k) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t i1 = i / ne0;
++    const int64_t i0 = i - i1*ne0;
++
++    ggml_cuda_pdl_sync();
++    float v = __fmul_rn(x[i1*s1 + i0*s0], s[0]);
++    v = __fadd_rn(v, b[i0]);
++    v = 1.0f / (1.0f + expf(-v));
++    dst[i] = scale * v + bias;
++}
++
++bool ggml_cuda_should_fuse_mul_add_sigmoid_scale(
++        const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * sig, const ggml_tensor * scale) {
++    if (add->src[0] != mul || sig->src[0] != add || scale->src[0] != sig) {
++        return false;
++    }
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * s = mul->src[1];
++    const ggml_tensor * b = add->src[1];
++    if (x->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
++            mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || sig->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (ggml_nelements(s) != 1 || ggml_nelements(b) != x->ne[0] || b->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(scale) || !ggml_are_same_shape(x, scale)) {
++        return false;
++    }
++    return true;
++}
++
++void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * scale_node) {
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * s = mul->src[1];
++    const ggml_tensor * b = add->src[1];
++
++    float scale;
++    float bias;
++    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
++    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
++
++    const int64_t k   = ggml_nelements(scale_node);
++    const int     ne0 = (int) x->ne[0];
++    const int64_t s0  = x->nb[0] / sizeof(float);
++    const int64_t s1  = x->nb[1] / sizeof(float);
++
++    const int num_blocks = (int) ((k + CUDA_SOFTCAP_BLOCK_SIZE - 1) / CUDA_SOFTCAP_BLOCK_SIZE);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_SOFTCAP_BLOCK_SIZE, 0, ctx.stream());
++    ggml_cuda_kernel_launch(mul_add_sigmoid_scale_f32, launch_params,
++        (const float *) x->data, (const float *) s->data, (const float *) b->data, (float *) scale_node->data,
++        scale, bias, ne0, s0, s1, k);
++}
+diff --git a/ggml/src/ggml-cuda/softcap.cuh b/ggml/src/ggml-cuda/softcap.cuh
+index 6d34fb2..5865dd2 100644
+--- a/ggml/src/ggml-cuda/softcap.cuh
++++ b/ggml/src/ggml-cuda/softcap.cuh
+@@ -3,3 +3,9 @@
+ #define CUDA_SOFTCAP_BLOCK_SIZE 256
+ 
+ void ggml_cuda_op_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * src);
++
++// abyss: the gate of a DeepSeek V4 hyper-connection, sigmoid(x*s + b)*scale + bias, in one kernel (ABYSS_HC_GATE_FUSE)
++bool ggml_cuda_should_fuse_mul_add_sigmoid_scale(
++        const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * sig, const ggml_tensor * scale);
++void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * scale_node);
+-- 
+2.43.0
+

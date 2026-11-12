@@ -29,6 +29,13 @@ O=${OUT:-$HOME/abyss-eval/ced-tiny}
 PY=${PY:-$HOME/src/comfyui/.venv/bin/python}
 NGL=${1:-0}
 M=$O/models/deepseek41-moe.gguf
+# a CPU run must not open the GPUs at all (llama.cpp offloads some operations even with no layers on a device), and a
+# GPU run has to name its device: production leaves no room on GPU0 for a second process
+if [ "$NGL" = 0 ]; then
+  export CUDA_VISIBLE_DEVICES=
+elif [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  echo "set CUDA_VISIBLE_DEVICES (1 next to production; GGML_CUDA_DEVICES=2 makes two virtual devices of it)"; exit 1
+fi
 mkdir -p "$O/models"
 
 if [ ! -x "$O/ced_check" ] || [ "$E/ced_check.cpp" -nt "$O/ced_check" ] || [ "$SRC/build/bin/libllama.so" -nt "$O/ced_check" ]; then
