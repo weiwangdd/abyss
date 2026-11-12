@@ -37,8 +37,11 @@
 | `0024-test-fixture-router-ramp.patch` |  | 0014 的小模型配置把路由偏置的斜坡改小，token 才会选不同的专家 |
 | `0025-weight-nowait.patch` | 0046 | 调度器把主机权重交给复制回调之前不先等这张卡（`ABYSS_WEIGHT_NOWAIT=1`） |
 | `0026-moe-big-split.patch` | 0014 重写 | 预填充的大批次里 token 少的专家交给 CPU 的紧凑批次，其余照常上传（`ABYSS_MOE_BIG_SPLIT=1`）；CPU 的那些位置在设备上改算一个反正要上传的专家，结果用掩码丢掉 |
+| **第 4 步：两卡流水线** | | |
+| `0027-prefill-overlap.patch` | 0044 重写 | 长提示词两卡流水线（`ABYSS_OVERLAP=1`，配 `CUDA_SCALE_LAUNCH_QUEUES=4x`）：计算缓冲区重排时只在缓冲区要变大才停设备，0 字节的输入不拷也不等 |
+| `0028-sync-trace.patch` | 0044 的跟踪部分 | `ABYSS_SYNC_TRACE=<ms>` 打印调度器里每次不短于这么久的等待 |
 
-mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0018（请求文字里的控制 token）、0022（大批次统计）、0023（大批次用缓存）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）、0044（两卡流水线）。
+mx-llama.cpp 那边的补丁里，上游已经有、不用搬的：0002、0004、0006、0008–0011、0028、0038、0042、0043；用不上的：0024、0031、0037。还没搬的：0001、0026（专家统计）、0007（`llama-abyss-dump`）、0018（请求文字里的控制 token）、0022（大批次统计）、0023（大批次用缓存）、0032（小内核融合）、0033（server 计时）、0034、0040（输出层分两卡）、0036（矩阵乘尾部）。
 
 ## 安装
 
@@ -69,7 +72,9 @@ git am <abyss>/llama.cpp/0001-sched-reserve-size-reset.patch \
   <abyss>/llama.cpp/0023-candidate-mask-constants.patch \
   <abyss>/llama.cpp/0024-test-fixture-router-ramp.patch \
   <abyss>/llama.cpp/0025-weight-nowait.patch \
-  <abyss>/llama.cpp/0026-moe-big-split.patch
+  <abyss>/llama.cpp/0026-moe-big-split.patch \
+  <abyss>/llama.cpp/0027-prefill-overlap.patch \
+  <abyss>/llama.cpp/0028-sync-trace.patch
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
 cmake --build build -j --target llama-server
 cmake --build build -j --target test-llama-archs llama-fit-params   # tools/eval/ced-tiny.sh、fit-print.sh 用，可选
@@ -85,7 +90,7 @@ GGML_CUDA_MMQ_PREC=q8 GOMP_SPINCOUNT=100000000 \
   ABYSS_SAMPLE_FAST=1 ABYSS_DIST_VEC=1 ABYSS_HC_KSPLIT=1 ABYSS_ENGRAM_KEEPALIVE_MS=4 \
   ABYSS_CED_PREFILL=1 ABYSS_CED_ALIGN=1 \
   ABYSS_FUSED_SIBLING=1 ABYSS_MOE_DEFER=1 ABYSS_MOE_ADMIT_GATE=1 ABYSS_DECODE_STATS=100 ABYSS_DSV41_CHUNK=512 \
-  ABYSS_MOE_BIG_SPLIT=1 ABYSS_WEIGHT_NOWAIT=1 \
+  ABYSS_MOE_BIG_SPLIT=1 ABYSS_WEIGHT_NOWAIT=1 ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x \
   llama-server -m <上游布局的 GGUF> -ngl 99 -sm layer -ts 12/29 -fa 1 -lm dio -t 16 \
   -ot "blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0" \
   -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib 20300 --moe-cache-cpu-share 0.7 --checkpoint-min-step 32768 \
