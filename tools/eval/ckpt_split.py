@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Prompts split for checkpoints (ABYSS_CKPT_COUNT_START, mx-llama.cpp/0045) against a fresh server.
 
-    ckpt_split.py <corpus> run OUT --log LOG [--agent-tokens N]
+    ckpt_split.py <corpus> run OUT --log LOG [--agent-tokens N] [--many-repeat R]
                                                two long conversations with many messages, each from scratch, then with
                                                a user message at about 60% edited (the slot goes back to its checkpoint
                                                before the edit), then one more turn on the edited one; 32 greedy tokens
                                                each with top-20 logprobs. Prints each request's prefill with what the
                                                server log LOG says about it (where it continued from, the llama_decode()
                                                calls it took, the checkpoints they made) and saves it all to OUT. The
-                                               second conversation has about N tokens (default 110000)
+                                               second conversation has about N tokens (default 110000), the first
+                                               R copies of the corpus (default 6, about 96k tokens); smaller ones
+                                               with a smaller --checkpoint-min-step suit a server without the
+                                               CED-aware prefill
     ckpt_split.py <corpus> compare A B         two runs request by request: prefill, calls, checkpoints, identical
                                                tokens and top-20 KL
 """
@@ -31,9 +34,9 @@ def post(path, body):
         return json.load(r)
 
 
-def many(corpus):
+def many(corpus, repeat=6):
     # restart_prefill.py's conversation: about 96k tokens in 16 user messages of about 6k
-    text = corpus * 6
+    text = corpus * repeat
     n = 16
     step = len(text) // n
     messages = [{"role": "system", "content": "你是一个代码助手。"}]
@@ -113,7 +116,7 @@ def run(a):
     corpus = open(a.corpus, encoding="utf-8").read()
     chars_per_token = len(corpus) / len(post("/tokenize", {"content": corpus})["tokens"])
     recs = []
-    for conv, messages in (("many", many(corpus)), ("agent", agent(corpus, chars_per_token, a.agent_tokens))):
+    for conv, messages in (("many", many(corpus, a.many_repeat)), ("agent", agent(corpus, chars_per_token, a.agent_tokens))):
         recs.append(ask(f"{conv} fresh", messages, a.log))
         messages = edited(messages)
         recs.append(ask(f"{conv} edit", messages, a.log))
@@ -162,6 +165,7 @@ def main():
     r.add_argument("out")
     r.add_argument("--log", required=True)
     r.add_argument("--agent-tokens", type=int, default=110000)
+    r.add_argument("--many-repeat", type=int, default=6)
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")

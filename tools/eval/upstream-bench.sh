@@ -7,14 +7,17 @@
 # reference is W4A8) and the template with the V4.1 tag literal upstream detects. Settings: CACHE=<MiB>
 # (--moe-cache-mib, default 21100 for fork, UP_CACHE for up), SHARE=<f> (--moe-cache-cpu-share, up only, default
 # UP_SHARE), T=<n> CPU threads, BIN=<dir>, MODEL=<gguf>, TS=<split> (-ts, default 12/29), OT=<overrides> (-ot, default
-# production's two, ';' standing for ','), ARGS=<arguments> (added to that entry's command line, ';' standing for ' ');
+# production's two, ';' standing for ','), ARGS=<arguments> (added to that entry's command line, ';' standing for ' '),
+# STEP=<n> (--checkpoint-min-step, default 32768), TESTS=<tests> (this entry's tests instead of TESTS, ';' standing
+# for ' ');
 # other VAR=VALUE go to the environment. TESTS, in order:
 # template (the prompt and tokens of fixed requests, upstream_template.py), greedy (greedy_kl.py on PROMPTS corpus
 # slices), same (the 96k prompt of ctx_size.py, its prefill and 32 greedy tokens), session (decode_modes.py: REPEAT
 # corpus copies, ROUNDS turns per mode, SEED), agent (agent_turns.py: AGENT_TURNS turns of AGENT_TOKENS tokens on
 # AGENT_REPEAT copies), fill (ctx_size.py fill FILL, default 196608), split (ckpt_split.py: two conversations with many
 # messages from scratch, edited at about 60% and one more turn, with the llama_decode() calls and checkpoints the
-# server log shows for each, from mx-llama.cpp/0045 on), short (one greedy completion of 8 tokens on a short prompt,
+# server log shows for each, from mx-llama.cpp/0045 on; SPLIT_ARGS goes to its command line, e.g. smaller
+# conversations for a server without the CED-aware prefill), short (one greedy completion of 8 tokens on a short prompt,
 # to log a few decode steps). Each entry prints its load time, both GPUs' memory
 # after loading and at the peak (sampled every 0.5 s), what its log says about buffers and the MoE cache, and the
 # tests' results; greedy, same, template and split are compared with the first entry. FORK_ARGS and UP_ARGS add arguments to
@@ -75,9 +78,11 @@ for c in $CONFIGS; do
   extra_env=()
   [ -n "$settings" ] && IFS=, read -r -a extra_env <<< "$settings"
   threads=16
+  step=32768
   share=${UP_SHARE:-0}
   ts=12/29
   entry_args=()
+  tests=$TESTS
   ot='blk\.(2[2-9]|3[0-9])\.ffn_(gate|up|down)_exps\.=CPU,blk\.12\.ffn_(gate|up)_exps\.=CUDA0'
   if [ "$kind" = fork ]; then
     bin=$FORK_BIN model=$FORK_MODEL cache=21100 tmpl=$HOME/abyss-stats/tmpl/v41.jinja
@@ -104,6 +109,8 @@ for c in $CONFIGS; do
       SHARE=*) share=${extra_env[$k]#SHARE=}; unset 'extra_env[k]' ;;
       TS=*) ts=${extra_env[$k]#TS=}; unset 'extra_env[k]' ;;
       OT=*) ot=${extra_env[$k]#OT=}; ot=${ot//;/,}; unset 'extra_env[k]' ;;
+      STEP=*) step=${extra_env[$k]#STEP=}; unset 'extra_env[k]' ;;
+      TESTS=*) tests=${extra_env[$k]#TESTS=}; tests=${tests//;/ }; unset 'extra_env[k]' ;;
       ARGS=*) a=${extra_env[$k]#ARGS=}; read -r -a entry_args <<< "${a//;/ }"; unset 'extra_env[k]' ;;
     esac
   done
@@ -121,7 +128,7 @@ for p in sys.argv[1:]:
   t0=$SECONDS
   env "${base_env[@]}" "${extra_env[@]}" \
     "$bin/llama-server" -m "$model" -ngl 99 -sm layer -ts "$ts" -fa 1 -lm dio -t "$threads" -ot "$ot" \
-    -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib "$cache" "${kind_args[@]}" --checkpoint-min-step 32768 \
+    -c 196608 -b 65536 -ub 2048 -np 1 --moe-cache-mib "$cache" "${kind_args[@]}" --checkpoint-min-step "$step" \
     --jinja --chat-template-file "$tmpl" --no-reasoning-preserve \
     --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0 --host 127.0.0.1 --port "$PORT" > "$log" 2>&1 &
   spid=$!
@@ -132,7 +139,7 @@ for p in sys.argv[1:]:
   done
   if [ $up = 1 ]; then
     echo "  loaded in $((SECONDS - t0)) s; memory used after loading (MiB): $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr '\n' ' ')"
-    for t in $TESTS; do
+    for t in $tests; do
       case $t in
         template) TMPL_URL=http://127.0.0.1:$PORT python3 -I "$E/upstream_template.py" dump "$O/template-$name.json" | sed 's/^/  template /' ;;
         greedy) GREEDY_URL=http://127.0.0.1:$PORT python3 -I "$E/greedy_kl.py" run "$E/corpus.txt" "$O/greedy-$name.json" \
@@ -147,7 +154,7 @@ for p in sys.argv[1:]:
             echo "  agent_turns.py failed, see $O/agent-$name.txt"
           sed 's/^/  agent /' "$O/agent-$name.txt" ;;
         fill) CTX_URL=http://127.0.0.1:$PORT python3 -I "$E/ctx_size.py" "$E/corpus.txt" fill "${FILL:-196608}" "$O/fill-$name.json" | sed 's/^/  /' ;;
-        split) CKPT_URL=http://127.0.0.1:$PORT python3 -I "$E/ckpt_split.py" "$E/corpus.txt" run "$O/split-$name.json" --log "$log" |
+        split) CKPT_URL=http://127.0.0.1:$PORT python3 -I "$E/ckpt_split.py" "$E/corpus.txt" run "$O/split-$name.json" --log "$log" ${SPLIT_ARGS:-} |
             sed 's/^/  split /' ;;
         short) curl -s -m 300 "http://127.0.0.1:$PORT/completion" -H "Content-Type: application/json" \
             -d '{"prompt": "The capital of France is", "n_predict": 8, "temperature": 0, "cache_prompt": false}' |
@@ -173,7 +180,7 @@ for p in sys.argv[1:]:
       match($0, /hit rate [0-9.]+%/); h += substr($0, RSTART + 9, RLENGTH - 10) + 0 }
     END { if (n) printf "  decode stats: %d windows, %.1f ms/token, hit rate %.1f%%\n", n, t / n, h / n }' "$log"
   if [ -n "$first" ]; then
-    for t in $TESTS; do
+    for t in $tests; do
       case $t in
         template) [ -s "$O/template-$first.json" ] && [ -s "$O/template-$name.json" ] &&
           python3 -I "$E/upstream_template.py" compare "$O/template-$first.json" "$O/template-$name.json" | sed "s/^/  $first vs $name, template /" ;;
