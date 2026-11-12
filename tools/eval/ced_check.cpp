@@ -7,6 +7,7 @@
 //                  [--outputs k]        mark every k-th token of a call as an output too (their logits are not saved)
 //                  [--host-experts L]   keep the experts of layers L and up in host memory
 //                  [--moe-cache MiB]    device cache for those experts, [--cpu-share f] share of its misses left to the CPU
+//                  [--ts a,b]           the shares of the layers on each device, like -ts
 #include "llama.h"
 #include "ggml-backend.h"
 
@@ -36,6 +37,7 @@ int main(int argc, char ** argv) {
     int host_from = -1;
     int moe_cache = 0;
     float cpu_share = 0.0f;
+    std::vector<float> tensor_split;
 
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
@@ -68,6 +70,15 @@ int main(int argc, char ** argv) {
             moe_cache = atoi(v);
         } else if (a == "--cpu-share") {
             cpu_share = (float) atof(v);
+        } else if (a == "--ts") {
+            for (const char * p = v; *p != 0;) {
+                tensor_split.push_back((float) atof(p));
+                p = strchr(p, ',');
+                if (p == nullptr) {
+                    break;
+                }
+                ++p;
+            }
         } else {
             fprintf(stderr, "unknown option %s\n", a.c_str());
             return 1;
@@ -78,6 +89,10 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    if (!tensor_split.empty()) {
+        tensor_split.resize(llama_max_devices(), 0.0f);
+        mparams.tensor_split = tensor_split.data();
+    }
 
     // the experts of layers host_from and up stay in host memory, like -ot "blk\.(..)\.ffn_(gate|up|down)_exps\.=CPU"
     std::string host_pattern;

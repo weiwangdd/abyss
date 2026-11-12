@@ -10,7 +10,8 @@
 #
 # The backends are initialized, about 0.5 GiB on each visible GPU while an entry runs: with production up, run it with
 # CUDA_VISIBLE_DEVICES=1 only, which simulates one device holding every layer (its compute buffer is close to GPU1's,
-# the device of the host-resident layers); for the split over both GPUs stop production first.
+# the device of the host-resident layers). Adding GGML_CUDA_DEVICES=2 makes two virtual devices of that one GPU
+# (upstream's emulation of several GPUs), which simulates the split over both GPUs without touching GPU0.
 set -u
 E=$(cd "$(dirname "$0")" && pwd)
 BIN=${BIN:-$HOME/src/llama.cpp-abyss/build/bin}
@@ -18,6 +19,7 @@ MODEL=${MODEL:-$HOME/models/DeepSeek-V4.1-Flash-1017-GGUF-upstream/DeepSeek-V4.1
 CONFIGS=${CONFIGS:-"plain chunk:ABYSS_DSV41_CHUNK=1024"}
 n_gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)
 [ -n "${CUDA_VISIBLE_DEVICES+x}" ] && n_gpus=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)
+[ -n "${GGML_CUDA_DEVICES:-}" ] && n_gpus=$GGML_CUDA_DEVICES
 
 for c in $CONFIGS; do
   IFS=: read -r name settings <<< "$c"
