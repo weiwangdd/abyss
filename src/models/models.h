@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <tuple>
 
 class llama_memory_hybrid_idx_context;
 
@@ -1469,6 +1470,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+
+        // abyss: views of rows of the graph inputs, shared by the layers, see build_attention41()
+        std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> row_views;
+        ggml_tensor * row_view(ggml_tensor * t, int64_t r0, int64_t n);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
