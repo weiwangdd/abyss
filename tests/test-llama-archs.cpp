@@ -125,8 +125,10 @@ static void fill_resid_gate(std::vector<float> & dst, const char * name, const t
 
 // a random router bias can tie within the noise between the backends, a ramp keeps the top-k selection the same
 static void fill_exp_probs_b(std::vector<float> & dst, const char *, const tensor_data_params &) {
+    // abyss: the fixture of ABYSS_TEST_DSV41_CED keeps the ramp small, so that the tokens select different experts
+    static const bool spread = getenv("ABYSS_TEST_DSV41_CED") != nullptr;
     for (size_t i = 0; i < dst.size(); i++) {
-        dst[i] = 2.0f*i;
+        dst[i] = (spread ? 0.05f : 2.0f)*i;
     }
 }
 
