@@ -47,6 +47,14 @@ P = {
     26: ("moe-big-split", "0014 重写", "预填充的大批次里 token 少的专家交给 CPU 的紧凑批次，其余照常上传（`ABYSS_MOE_BIG_SPLIT=1`）；CPU 的那些位置在设备上改算一个反正要上传的专家，结果用掩码丢掉"),
     27: ("prefill-overlap", "0044 重写", "长提示词两卡流水线（`ABYSS_OVERLAP=1`，配 `CUDA_SCALE_LAUNCH_QUEUES=4x`）：计算缓冲区重排时只在缓冲区要变大才停设备，0 字节的输入不拷也不等"),
     28: ("sync-trace", "0044 的跟踪部分", "`ABYSS_SYNC_TRACE=<ms>` 打印调度器里每次不短于这么久的等待"),
+    29: ("plain-request-text", "0018", "对话提示词里来自请求的文字只按基础词表编码，只有模板自己写的控制 token 按 ID 编码（`ABYSS_PLAIN_INPUT=1`）；哪些文字来自请求用上游提示词 parts 的标记，补上 `tojson`、数组 `join` 的标记传递。`llama-abyss-chat-tokens` 只读词表，打印 chat 路径的提示词和 token"),
+    30: ("v41-template-effort-levels", "", "V4.1 的模板自己认 minimal、medium、xhigh 时，思考强度原样交给模板；上游为官方模板把它们换成 low、默认、max"),
+    31: ("head-split", "0034", "输出层的前 F 行另放一份到另一张卡，单个输出时两张卡各算一部分 logits（`ABYSS_HEAD_SPLIT=F`）。调度器加 `overlap_gpus`：GPU 的段接在另一张 GPU 的段后面时主机不等，跨卡输入的拷贝在 GPU 上等目标卡的事件"),
+    32: ("head-split-only", "0040", "输出层不整张加载，两部分从文件直接读到两张卡（`ABYSS_HEAD_SPLIT_ONLY=1`，配 `ABYSS_HEAD_SPLIT=F`），每批最多每个序列一个输出；GPU1 少 631 MiB"),
+    33: ("mmvq-tail", "0036 的矩阵乘部分", "单列的量化矩阵乘在整块的 K 循环比单个 warp 多跨 25% 以上时也用每块多行的 `small_k`（`ABYSS_MMVQ_TAIL=1`）；`small_k` 下 MXFP4、Q8_0 每块行数加倍，MXFP4 从对齐的 32 位字取。`test-backend-ops` 加本模型解码的矩阵乘形状作性能用例"),
+    34: ("dsv41-window-rows", "0032 里注意力拼装的那部分，做法不同", "单个 token 的注意力只读滑窗里的行（`ABYSS_DSV41_WINDOW_ROWS=1`）：上游的滑窗缓存有 n_swa + n_ubatch 行（128 + 2,048），解码时整块交给注意力、靠掩码挡掉，每层对 2,816 行算；改成给一份滑窗的行号表和对应的掩码，图里按表取行，每层 768 行"),
+    35: ("hc-gate-fuse", "mx-llama.cpp 自带的融合", "超连接的门 sigmoid(x·s + b)·scale + bias 由四个逐元素内核合成一个（`ABYSS_HC_GATE_FUSE=1`），数值逐位相同；每 token 少约 480 个内核"),
+    36: ("moe-big-cache", "0023 重写", "预填充的大批次里，缓存里已有的专家用槽位在缓存所在的卡上直接算（`ABYSS_MOE_BIG_CACHE=1`，配 `ABYSS_MOE_BIG_SPLIT=1`），只有缓存里没有的才上传或交给 CPU；不在缓存里的（token, 专家）对在那张卡上读全零槽位"),
 }
 
 STEPS = [
@@ -56,6 +64,9 @@ STEPS = [
     (23, "第 3 步：计算缓冲区"),
     (26, "第 3 步：预填充的大批次"),
     (28, "第 4 步：两卡流水线"),
+    (30, "对话提示词的编码（第 1 步里要重做的）"),
+    (35, "解码：输出层分两卡、矩阵乘尾部、注意力和超连接的小内核"),
+    (36, "预填充的大批次用缓存"),
 ]
 
 out = os.path.join(repo, 'llama.cpp')
@@ -88,9 +99,14 @@ settings = {
     23: " ABYSS_DSV41_CHUNK=512",
     26: " \\\n  ABYSS_MOE_BIG_SPLIT=1 ABYSS_WEIGHT_NOWAIT=1",
     28: " ABYSS_OVERLAP=1 CUDA_SCALE_LAUNCH_QUEUES=4x",
+    30: " \\\n  ABYSS_PLAIN_INPUT=1",
+    32: " ABYSS_HEAD_SPLIT=0.5 ABYSS_HEAD_SPLIT_ONLY=1",
+    33: " ABYSS_MMVQ_TAIL=1",
+    35: " \\\n  ABYSS_DSV41_WINDOW_ROWS=1 ABYSS_HC_GATE_FUSE=1",
+    36: " ABYSS_MOE_BIG_CACHE=1",
 }
 env = ''.join(v for k, v in sorted(settings.items()) if k <= last)
-cache = 20300 if last >= 23 else 16000
+cache = 20900 if last >= 32 else 20300 if last >= 23 else 16000
 
 apply = ' \\\n  '.join('<abyss>/llama.cpp/' + n for n in names)
 
@@ -101,16 +117,16 @@ TODO = [
     ("0007", "`llama-abyss-dump`", None),
     ("0014", "大批次分流", 26),
     ("0016", "解码统计", 17),
-    ("0018", "请求文字里的控制 token", None),
+    ("0018", "请求文字里的控制 token", 29),
     ("0019、0020", "计算图显存和查询分块", 21),
     ("0022", "大批次统计", None),
-    ("0023", "大批次用缓存", None),
+    ("0023", "大批次用缓存", 36),
     ("0025", "专家延后", 16),
     ("0030", "准入门", 19),
-    ("0032", "小内核融合", None),
+    ("0032", "小内核融合（门控和注意力的行已做，其余没搬）", 35),
     ("0033", "server 计时", None),
-    ("0034、0040", "输出层分两卡", None),
-    ("0036", "矩阵乘尾部", None),
+    ("0034、0040", "输出层分两卡", 31),
+    ("0036", "矩阵乘尾部", 33),
     ("0044", "两卡流水线", 27),
     ("0046", "主机权重不先等", 25),
 ]
